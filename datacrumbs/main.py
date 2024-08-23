@@ -1,12 +1,12 @@
 # External Imports
-import hydra
-from omegaconf import DictConfig
 import logging
 
-# Internal Imports
-from datacrumbs.dfbcc.dfbcc import BCCMain
+import hydra
+from omegaconf import DictConfig
+
 from datacrumbs.common.status import ProfilerStatus
 from datacrumbs.configs.configuration_manager import ConfigurationManager
+from datacrumbs.dfbcc.dfbcc import BCCMain, StopExecution
 
 
 class Datacrumbs:
@@ -34,8 +34,12 @@ def main(cfg: DictConfig) -> int:
     """
     profiler = Datacrumbs(cfg["module"])
     profiler.initialize()
-    profiler.run()
-    profiler.finalize()
+    try:
+        profiler.run()
+    except StopExecution:
+        logging.info("Stopping execution...")
+    finally:
+        profiler.finalize()
     return ProfilerStatus.SUCCESS
 
 

@@ -1,22 +1,19 @@
-# Python Native Imports
-from typing import *
-import os
-import pathlib
 import logging
+import os
+from pathlib import Path
+from typing import Any, Dict
 
-# External Imports
 from omegaconf import DictConfig
 
-# Internal Imports
 from datacrumbs.common.utils import convert_or_fail
 
 
 class ConfigurationManager:
     # singleton instance
     __instance = None
-    project_root: str
+    project_root: str | Path
     # Configuration variables
-    user_libraries: Dict[str, str] = {}
+    user_libraries: Dict[str, str | Dict[str, Any]] = {}
     interval_sec: float
     module: str
     install_dir: str
@@ -30,7 +27,7 @@ class ConfigurationManager:
         return ConfigurationManager.__instance
 
     def __init__(self):
-        self.project_root = pathlib.Path(__file__).parent.parent.parent.resolve()
+        self.project_root = Path(__file__).parent.parent.parent.resolve()
         log_file = "datacrumbs.log"
         try:
             os.remove(log_file)
@@ -60,9 +57,7 @@ class ConfigurationManager:
                 self.user_libraries[obj["name"]] = obj
         if "profile" in config:
             if "interval_sec" in config["profile"]:
-                status, self.interval_sec = convert_or_fail(
-                    float, config["profile"]["interval_sec"]
-                )
+                status, self.interval_sec = convert_or_fail(float, config["profile"]["interval_sec"])
                 if status.failed():
                     exit(status)
         return self

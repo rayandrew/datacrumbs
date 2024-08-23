@@ -1,0 +1,80 @@
+[tool.black]
+line-length = 160
+target-version = ['py311']
+include = '\.pyi?$'
+extend-exclude = '''
+# A regex preceded with ^/ will apply only to files and directories
+# in the root of the project.
+^/foo.py  # exclude a file named foo.py in the root of the project (in addition to the defaults)
+'''
+
+[tool.isort]
+profile = "black"
+atomic = true
+group_by_package = true
+py_version = 310
+skip = [".gitignore", ".dockerignore"]
+line_length = 160
+sections = [
+  'FUTURE',
+  'STDLIB',
+  'CONFIG',
+  'DATASCIENCE',
+  'PLOT',
+  'FIRSTPARTY',
+  'THIRDPARTY',
+  'INTERNAL',
+  'DATACRUMBS',
+  'LOCALFOLDER',
+]
+known_config = [
+  'hydra',
+  'omegaconf'
+]
+known_datascience = [
+  'sklearn',
+  'pandas',
+  'numpy',
+]
+known_plot = [
+  'matplotlib',
+  'seaborn',
+]
+known_internal = [ ]
+known_datacrumbs = ['datacrumbs']
+
+[tool.mypy]
+python_version = "3.11"
+files = ["datacrumbs", "*.py"]
+# exclude = 'wandb|tests|OLD_FILES|src/utils/summary.py|src/dataset/google/.*\.py'
+exclude = [
+  '^wandb',
+  '^tests',
+  '^OLD_FILES',
+]
+plugins = [
+  "pydantic.mypy"
+]
+ignore_missing_imports = true
+disable_error_code = "no-redef"
+
+[tool.pydantic-mypy]
+init_forbid_extra = true
+init_typed = true
+warn_required_dynamic_aliases = true
+warn_untyped_fields = true
+
+[tool.pyright]
+include = ["datacrumbs", "*.py"]
+exclude = [
+  "**/node_modules",
+  "**/__pycache__",
+  "**/.mypy_cache",
+  "**/.pytest_cache",
+  "**/.git",
+  "**/.vscode",
+  "**/OLD_FILES",
+  "**/wandb",
+  "**/.ipynb_checkpoints",
+]
+ignore = []

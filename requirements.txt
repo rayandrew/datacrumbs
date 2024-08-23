@@ -1,2 +1,5 @@
 hydra-core>=1.2.0
 psutil>=6.0.0
+# dev
+black
+isort

@@ -54,7 +54,7 @@
         
         int trace_datacrumbs_start(struct pt_regs *ctx) {
             u64 id = bpf_get_current_pid_tgid();
-            u32 pid = 10;
+            u32 pid = 0;
             u64* start_ts = pid_map.lookup(&pid);
             u64 tsp = bpf_ktime_get_ns();
             if (start_ts != 0)                                      
@@ -62,14 +62,14 @@
             else
                 pid_map.update(&pid, &tsp);
             pid = id;
-            bpf_trace_printk("Tracing PID \%d",pid);
+            bpf_trace_printk("Tracing PID %d",pid);
             pid_map.update(&pid, &tsp);
             return 0;
         }
         int trace_datacrumbs_stop(struct pt_regs *ctx) {
             u64 id = bpf_get_current_pid_tgid();
             u32 pid = id;
-            bpf_trace_printk("Stop tracing PID \%d",pid);
+            bpf_trace_printk("Stop tracing PID %d",pid);
             pid_map.delete(&pid);
             return 0;
         }
@@ -90,7 +90,7 @@
                         int len = bpf_probe_read_user_str(&fname_i.fname, sizeof(fname_i.fname), filename);
                         //fname_i.fname[len-1] = '\0';
                         u32 filehash = get_hash(id);
-                        bpf_trace_printk("Hash value is %d for filename \%s",filename,filehash);
+                        bpf_trace_printk("Hash value is %d for filename %s", filename, filehash);
                         file_hash.update(&filehash, &fname_i);
                         latest_hash.update(&id, &filehash);
                         
@@ -187,8 +187,8 @@
             stats->time += bpf_ktime_get_ns() - fn->ts;
             stats->freq++;
             
-                                 stats->size_sum += PT_REGS_RC(ctx);
-                                 
+                        stats->size_sum += PT_REGS_RC(ctx);
+                        
             return 0;
         }
         

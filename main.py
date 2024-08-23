@@ -1,32 +1,16 @@
 from __future__ import print_function
-import os
-from collections import defaultdict
-from datetime import datetime, timedelta
+
 import argparse
-import pathlib
-import logging
-import json
 import ctypes
+import json
+import logging
+import os
+import pathlib
+from time import sleep
 
-from bcc import ArgString, BPF, USDT
-from bcc.utils import printb
-from time import sleep, strftime
+from bcc import BPF, USDT
 
-examples = """examples:
-"""
-parser = argparse.ArgumentParser(
-    description="Profile io calls in given interval",
-    formatter_class=argparse.RawDescriptionHelpFormatter,
-    epilog=examples,
-)
-parser.add_argument(
-    "-d", "--interval", default=1, help="Profiling interval for trace in seconds"
-)
-args = parser.parse_args()
-
-TASK_COMM_LEN = 16
-INTERVAL_RANGE = int(args.interval * 1e9)
-bpf_text = """
+BPF_TEXT = r"""
 #include <linux/sched.h>
 #include <uapi/linux/limits.h>
 #include <uapi/linux/ptrace.h>
@@ -57,14 +41,14 @@ int trace_dftracer_get_pid(struct pt_regs *ctx) {
     u64 id = bpf_get_current_pid_tgid();
     u32 pid = id;
     u64 tsp = bpf_ktime_get_ns();
-    bpf_trace_printk(\"Tracing PID \%d\",pid);
+    bpf_trace_printk("Tracing PID %d",pid);
     pid_map.update(&pid, &tsp);
     return 0;
 }
 int trace_dftracer_remove_pid(struct pt_regs *ctx) {
     u64 id = bpf_get_current_pid_tgid();
     u32 pid = id;
-    bpf_trace_printk(\"Stop tracing PID \%d\",pid);
+    bpf_trace_printk("Stop tracing PID %d",pid);
     pid_map.delete(&pid);
     struct stats_key_t key = {};
     key.id = 0;
@@ -114,12 +98,13 @@ int do_count_exit(struct pt_regs *ctx) {
     return 0;
 }
 """
-so_dict = {
+
+SO_DICT = {
     "mpi": "/usr/lib/aarch64-linux-gnu/openmpi/lib/libmpi.so",
     "user": "/Users/hariharandev1/Library/CloudStorage/OneDrive-LLNL/projects/ebpf-hpc/dftracer-ebpf/build/test",
 }
 
-functions = {
+FUNCTIONS = {
     "sys": [
         ("openat"),
         ("read"),
@@ -238,91 +223,113 @@ functions = {
         ("free"),
     ],
 }
-# load BPF program
 
-bpf_text = bpf_text.replace("INTERVAL_RANGE", str(INTERVAL_RANGE))
 
-dir = pathlib.Path(__file__).parent.resolve()
-usdt_ctx = USDT(path=f"{dir}/build/libdatacrumbs.so")
-f = open("profile.c", "w")
-f.write(bpf_text)
-f.close()
-b = BPF(text=bpf_text, usdt_contexts=[usdt_ctx])
-b.attach_uprobe(
-    name=f"{dir}/build/libdatacrumbs.so",
-    sym="dftracer_get_pid",
-    fn_name="trace_dftracer_get_pid",
-)
-b.attach_uprobe(
-    name=f"{dir}/build/libdatacrumbs.so",
-    sym="dftracer_remove_pid",
-    fn_name="trace_dftracer_remove_pid",
-)
+def get_args():
+    examples = """examples:
+    """
+    parser = argparse.ArgumentParser(
+        description="Profile io calls in given interval",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=examples,
+    )
+    parser.add_argument("-d", "--interval", default=1, help="Profiling interval for trace in seconds")
+    return parser.parse_args()
 
-for cat, fns in functions.items():
-    for fn in fns:
-        if "sys" in cat:
-            fnname = b.get_syscall_prefix().decode() + fn
-            b.attach_kprobe(event_re=fnname, fn_name=f"do_count_entry")
-            b.attach_kretprobe(event_re=fnname, fn_name=f"do_count_exit")
-        elif cat in ["os_cache", "ext4", "vfs"]:
-            b.attach_kprobe(event_re=fn, fn_name=f"do_count_entry")
-            b.attach_kretprobe(event_re=fn, fn_name=f"do_count_exit")
-        elif cat in ["c"]:
-            library = cat
-            if cat in so_dict:
-                library = so_dict[cat]
-            b.attach_uprobe(name=library, sym=fn, fn_name=f"do_count_entry")
-            b.attach_uretprobe(name=library, sym=fn, fn_name=f"do_count_exit")
 
-try:
-    os.remove("profile.pfw")
-except OSError:
-    pass
-logging.basicConfig(
-    level=logging.INFO,
-    handlers=[
-        logging.FileHandler("profile.pfw", mode="a", encoding="utf-8"),
-    ],
-    format="%(message)s",
-)
-logging.info("[")
-count = 0
-exiting = False
-print("Ready to run code")
-while True:
-    has_events = False
+def main():
+    args = get_args()
+
+    # TASK_COMM_LEN = 16
+    interval_range = int(args.interval * 1e9)
+
+    # load BPF program
+    bpf_text = BPF_TEXT.replace("INTERVAL_RANGE", str(interval_range))
+
+    dir = pathlib.Path(__file__).parent.resolve()
+    usdt_ctx = USDT(path=f"{dir}/build/libdatacrumbs.so")
+    f = open("profile.c", "w")
+    f.write(bpf_text)
+    f.close()
+    b = BPF(text=bpf_text, usdt_contexts=[usdt_ctx])
+    b.attach_uprobe(
+        name=f"{dir}/build/libdatacrumbs.so".encode(),
+        sym="dftracer_get_pid".encode(),
+        fn_name="trace_dftracer_get_pid".encode(),
+    )
+    b.attach_uprobe(
+        name=f"{dir}/build/libdatacrumbs.so".encode(),
+        sym="dftracer_remove_pid".encode(),
+        fn_name="trace_dftracer_remove_pid".encode(),
+    )
+
+    for cat, fns in FUNCTIONS.items():
+        for fn in fns:
+            if "sys" in cat:
+                fnname = b.get_syscall_prefix().decode() + fn
+                b.attach_kprobe(event_re=fnname.encode(), fn_name=b"do_count_entry")
+                b.attach_kretprobe(event_re=fnname.encode(), fn_name=b"do_count_exit")
+            elif cat in ["os_cache", "ext4", "vfs"]:
+                b.attach_kprobe(event_re=fn.encode(), fn_name=b"do_count_entry")
+                b.attach_kretprobe(event_re=fn.encode(), fn_name=b"do_count_exit")
+            elif cat in ["c"]:
+                library = cat
+                if cat in SO_DICT:
+                    library = SO_DICT[cat]
+                b.attach_uprobe(name=library.encode(), sym=fn.encode(), fn_name=b"do_count_entry")
+                b.attach_uretprobe(name=library.encode(), sym=fn.encode(), fn_name=b"do_count_exit")
+
     try:
-        sleep(args.interval)
-    except KeyboardInterrupt:
-        exiting = True
-    counts = b.get_table("fn_map")
-
-    for k, v in reversed(sorted(counts.items_lookup_and_delete_batch(),
-                                key=lambda counts: counts[1].time)):
-        pid = ctypes.c_uint32(k.id).value
-        tid = ctypes.c_uint32(k.id >> 32).value
-        if pid == 0 and k.trange == 0 and k.ip == 0 and v.count == 1000:
+        os.remove("profile.pfw")
+    except OSError:
+        pass
+    logging.basicConfig(
+        level=logging.INFO,
+        handlers=[
+            logging.FileHandler("profile.pfw", mode="a", encoding="utf-8"),
+        ],
+        format="%(message)s",
+    )
+    logging.info("[")
+    count = 0
+    exiting = False
+    print("Ready to run code")
+    while True:
+        has_events = False
+        try:
+            sleep(args.interval)
+        except KeyboardInterrupt:
             exiting = True
-            continue
-        fname = b.sym(k.ip, pid, show_module=True).decode()
-        if "unknown" in fname:
-            fname = b.ksym(k.ip, show_module=True).decode()
-        if "unknown" in fname:
-            cat = "unknown"
-        else:
-            cat = fname.split(" ")[1]
-        obj = {
-            "pid": pid,
-            "tid": tid,
-            "name": fname,
-            "cat": cat,
-            "ph": "C",
-            "ts": k.trange,
-            "args": {"count": v.count, "time": v.time},
-        }
-        logging.info(json.dumps(obj))
-    count += 1
-    if exiting:
-        print("Detaching...")
-        exit()
+        counts = b.get_table("fn_map")
+
+        for k, v in reversed(sorted(counts.items_lookup_and_delete_batch(), key=lambda counts: counts[1].time)):  # type: ignore
+            pid = ctypes.c_uint32(k.id).value
+            tid = ctypes.c_uint32(k.id >> 32).value
+            if pid == 0 and k.trange == 0 and k.ip == 0 and v.count == 1000:
+                exiting = True
+                continue
+            fname = b.sym(k.ip, pid, show_module=True).decode()
+            if "unknown" in fname:
+                fname = b.ksym(k.ip, show_module=True).decode()
+            if "unknown" in fname:
+                cat = "unknown"
+            else:
+                cat = fname.split(" ")[1]
+            obj = {
+                "pid": pid,
+                "tid": tid,
+                "name": fname,
+                "cat": cat,
+                "ph": "C",
+                "ts": k.trange,
+                "args": {"count": v.count, "time": v.time},
+            }
+            logging.info(json.dumps(obj))
+        count += 1
+        if exiting:
+            print("Detaching...")
+            exit()
+
+
+if __name__ == "__main__":
+    main()

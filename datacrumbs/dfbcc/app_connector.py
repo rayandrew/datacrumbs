@@ -19,14 +19,14 @@ class BCCApplicationConnector:
             else
                 pid_map.update(&pid, &tsp);
             pid = id;
-            bpf_trace_printk(\"Tracing PID \%d\",pid);
+            bpf_trace_printk("Tracing PID %d",pid);
             pid_map.update(&pid, &tsp);
             return 0;
         }
         int trace_datacrumbs_stop(struct pt_regs *ctx) {
             u64 id = bpf_get_current_pid_tgid();
             u32 pid = id;
-            bpf_trace_printk(\"Stop tracing PID \%d\",pid);
+            bpf_trace_printk("Stop tracing PID %d",pid);
             pid_map.delete(&pid);
             return 0;
         }
@@ -36,15 +36,14 @@ class BCCApplicationConnector:
         return self.functions
 
     def attach_probe(self, bpf: BPF) -> None:
-
         bpf.add_module(f"{self.config.install_dir}/libdatacrumbs.so")
         bpf.attach_uprobe(
-            name=f"{self.config.install_dir}/libdatacrumbs.so",
-            sym="datacrumbs_start",
-            fn_name="trace_datacrumbs_start",
+            name=f"{self.config.install_dir}/libdatacrumbs.so".encode(),
+            sym=b"datacrumbs_start",
+            fn_name=b"trace_datacrumbs_start",
         )
         bpf.attach_uprobe(
-            name=f"{self.config.install_dir}/libdatacrumbs.so",
-            sym="datacrumbs_stop",
-            fn_name="trace_datacrumbs_stop",
+            name=f"{self.config.install_dir}/libdatacrumbs.so".encode(),
+            sym=b"datacrumbs_stop",
+            fn_name=b"trace_datacrumbs_stop",
         )

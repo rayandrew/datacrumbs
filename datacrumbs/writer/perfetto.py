@@ -1,9 +1,10 @@
-import logging
-import json
-import os
 import gzip
+import json
+import logging
+import os
 import shutil
 import socket
+
 from datacrumbs.common.data_structure import DFEvent
 from datacrumbs.configs.configuration_manager import ConfigurationManager
 

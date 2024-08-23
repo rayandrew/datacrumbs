@@ -1,5 +1,5 @@
 import ctypes
-from typing import *
+from typing import Any, Dict
 
 
 class DFEvent:
@@ -7,8 +7,8 @@ class DFEvent:
     tid: int
     name: str
     cat: str
-    ts: int
-    args: Dict
+    ts: float
+    args: Dict[str, Any]
 
 
 class Filename(ctypes.Structure):

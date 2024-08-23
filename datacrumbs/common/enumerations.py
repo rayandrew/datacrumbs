@@ -1,10 +1,7 @@
-from enum import Enum
+from enum import IntEnum
 
 
-class ProbeType(Enum):
+class ProbeType(IntEnum):
     SYSTEM = 0
     KERNEL = 1
     USER = 2
-
-    def __str__(self):
-        return self.value

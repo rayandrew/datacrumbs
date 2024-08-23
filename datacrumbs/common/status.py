@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import IntEnum
 
 
-class ProfilerStatus(Enum):
+class ProfilerStatus(IntEnum):
     """
     Different status codes for the profiler.
     """
@@ -9,9 +9,6 @@ class ProfilerStatus(Enum):
     SUCCESS = 0
     SYSTEM_FAIL = -1
     CONVERT_ERROR = 1000
-
-    def __str__(self):
-        return self.value
 
     def success(self):
         return self.value == ProfilerStatus.SUCCESS.value

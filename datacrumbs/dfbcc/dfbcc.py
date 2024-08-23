@@ -1,23 +1,23 @@
+import ctypes
 import logging
 from time import sleep
-import ctypes
-from typing import *
-import threading
+from typing import Any, cast
+
 import psutil
-
-# External Imports
 from bcc import BPF
-from bcc.utils import printb
+from bcc.table import HashTable
 
-# Internal Imports
+from datacrumbs.common.data_structure import DFEvent
+from datacrumbs.configs.configuration_manager import ConfigurationManager
 from datacrumbs.dfbcc.app_connector import BCCApplicationConnector
 from datacrumbs.dfbcc.collector import BCCCollector
 from datacrumbs.dfbcc.header import BCCHeader
 from datacrumbs.dfbcc.io_probes import IOProbes
 from datacrumbs.dfbcc.user_probes import UserProbes
-from datacrumbs.configs.configuration_manager import ConfigurationManager
-from datacrumbs.common.data_structure import DFEvent, Filename
 from datacrumbs.writer.perfetto import PerfettoWriter
+
+
+class StopExecution(Exception): ...
 
 
 class BCCMain:
@@ -28,9 +28,8 @@ class BCCMain:
         self.category_fn_map = {}
         self.writer = PerfettoWriter()
         self.run_thread_counter = True
-        pass
 
-    def load(self) -> any:
+    def load(self) -> Any:
         app_connector = BCCApplicationConnector()
         collector = BCCCollector()
         bpf_text = ""
@@ -38,19 +37,13 @@ class BCCMain:
         bpf_text += str(app_connector)
         io_probes = IOProbes()
         count = 0
-        probe_text, self.category_fn_map, count = io_probes.collector_fn(
-            collector, self.category_fn_map, count
-        )
+        probe_text, self.category_fn_map, count = io_probes.collector_fn(collector, self.category_fn_map, count)
         bpf_text += probe_text
         user_probes = UserProbes()
-        probe_text, self.category_fn_map, count = user_probes.collector_fn(
-            collector, self.category_fn_map, count
-        )
+        probe_text, self.category_fn_map, count = user_probes.collector_fn(collector, self.category_fn_map, count)
         bpf_text += probe_text
         # bpf_text += str(collector)
-        bpf_text = bpf_text.replace(
-            "INTERVAL_RANGE", str(int(self.config.interval_sec * 1e9))
-        )
+        bpf_text = bpf_text.replace("INTERVAL_RANGE", str(int(self.config.interval_sec * 1e9)))
         logging.debug(f"Compiled Program is \n{bpf_text}")
         f = open("profile.c", "w")
         f.write(bpf_text)
@@ -173,16 +166,16 @@ class BCCMain:
     def stop(self):
         self.run_thread_counter = False
         logging.info("Stopping all threads")
-        '''self.memory_loop.join()
+        """self.memory_loop.join()
         self.cpu_loop.join()
         self.disk_loop.join()
         self.network_loop.join()
-        '''
+        """
         self.writer.finalize()
 
     def run(self) -> None:
         logging.info("Ready to run code")
-        '''self.memory_loop = threading.Thread(target=self.run_memory_loop)
+        """self.memory_loop = threading.Thread(target=self.run_memory_loop)
         self.memory_loop.start()
         self.cpu_loop = threading.Thread(target=self.run_cpu_loop)
         self.cpu_loop.start()
@@ -190,31 +183,29 @@ class BCCMain:
         self.disk_loop.start()
         self.network_loop = threading.Thread(target=self.run_network_usage)
         self.network_loop.start()
-        '''
+        """
         no_event_count = 0
         has_events = False
         last_processed_ts = -1
         sleep_sec = self.config.interval_sec * 5
         wait_for = 30 / (sleep_sec)
         filename_map = {0: None}
+        stop = False
         try:
-            while True:
-                counts = self.bpf.get_table("fn_map")
-                filenames = self.bpf.get_table("file_hash")
+            while stop:
+                counts = cast(HashTable, self.bpf.get_table("fn_map"))
+                filenames = cast(HashTable, self.bpf.get_table("file_hash"))
                 try:
-                    logging.debug(
-                        f"sleeping for {sleep_sec} secs with last ts {last_processed_ts}"
-                    )
+                    logging.debug(f"sleeping for {sleep_sec} secs with last ts {last_processed_ts}")
                     sleep(sleep_sec)
                     if has_events and no_event_count > wait_for:
-                        logging.info(
-                            f"No events for {no_event_count * sleep_sec} seconds. Quiting Profiler Now."
-                        )
+                        logging.info(f"No events for {no_event_count * sleep_sec} seconds. Quiting Profiler Now.")
                         filenames.clear()
-                        self.stop()
-                        break
+                        stop = True
+                        raise StopExecution()
                 except KeyboardInterrupt:
-                    break
+                    stop = True
+                    raise StopExecution()
                 for k, v in filenames.items():
 
                     if k.value not in filename_map:
@@ -234,9 +225,7 @@ class BCCMain:
                     has_events = True
                     processed += 1
                     if big_ts == k.trange and big_ts > last_processed_ts + 1:
-                        logging.debug(
-                            f"Previous loop had {last_processed_ts} ts and now is {big_ts} ts"
-                        )
+                        logging.debug(f"Previous loop had {last_processed_ts} ts and now is {big_ts} ts")
                         continue
                     event.tid = ctypes.c_uint32(k.id >> 32).value
                     event_tuple = self.category_fn_map[k.event_id]
@@ -250,11 +239,7 @@ class BCCMain:
                         event.name = function_probe.name
                     event.ts = k.trange
                     event.args = {}
-                    event.args["fname"] = (
-                        filename_map[k.file_hash]
-                        if k.file_hash in filename_map
-                        else None
-                    )
+                    event.args["fname"] = filename_map[k.file_hash] if k.file_hash in filename_map else None
                     event.args["freq"] = v.freq
                     event.args["time"] = v.time / 1e9
                     event.args["size_sum"] = v.size_sum if v.size_sum > 0 else None
@@ -267,5 +252,5 @@ class BCCMain:
                     no_event_count = 0
                 if has_events:
                     no_event_count += 1
-        except KeyboardInterrupt:
-            pass
+        except StopExecution:
+            self.stop()

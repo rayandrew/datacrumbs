@@ -1,11 +1,11 @@
-from datacrumbs.common.enumerations import ProbeType
+from typing import List, Optional
 
-from typing import *
+from datacrumbs.common.enumerations import ProbeType
 
 
 class BCCFunctions:
     name: str
-    regex: str
+    regex: Optional[str]
     entry_cmd: str
     exit_cmd_stats: str
     exit_cmd_key: str
@@ -14,7 +14,7 @@ class BCCFunctions:
     def __init__(
         self,
         name: str,
-        regex: str = None,
+        regex: Optional[str] = None,
         entry_args: str = "",
         entry_cmd: str = "",
         exit_cmd_stats: str = "",
@@ -33,9 +33,10 @@ class BCCProbes:
     category: str
     functions: List[BCCFunctions]
 
-    def __init__(
-        self, type: ProbeType, category: str, functions: List[BCCFunctions]
-    ) -> None:
+    def __init__(self, type: ProbeType, category: str, functions: List[BCCFunctions]) -> None:
         self.type = type
         self.category = category
         self.functions = functions
+
+
+__all__ = ["BCCFunctions", "BCCProbes"]

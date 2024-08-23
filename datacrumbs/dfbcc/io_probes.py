@@ -1,10 +1,12 @@
-from typing import *
 import logging
+from typing import List
+
 from bcc import BPF
-from datacrumbs.dfbcc.collector import BCCCollector
-from datacrumbs.dfbcc.probes import BCCFunctions, BCCProbes
+
 from datacrumbs.common.enumerations import ProbeType
 from datacrumbs.configs.configuration_manager import ConfigurationManager
+from datacrumbs.dfbcc.collector import BCCCollector
+from datacrumbs.dfbcc.probes import BCCFunctions, BCCProbes
 
 
 class IOProbes:
@@ -22,12 +24,12 @@ class IOProbes:
                     BCCFunctions(
                         "openat",
                         entry_args=", int dfd, const char *filename, int flags",
-                        entry_cmd="""
+                        entry_cmd=r"""
                         struct filename_t fname_i;
                         int len = bpf_probe_read_user_str(&fname_i.fname, sizeof(fname_i.fname), filename);
-                        //fname_i.fname[len-1] = '\\0';
+                        //fname_i.fname[len-1] = '\0';
                         u32 filehash = get_hash(id);
-                        bpf_trace_printk(\"Hash value is %d for filename \%s\",filename,filehash);
+                        bpf_trace_printk("Hash value is %d for filename %s", filename, filehash);
                         file_hash.update(&filehash, &fname_i);
                         latest_hash.update(&id, &filehash);
                         """,
@@ -56,8 +58,8 @@ class IOProbes:
                         latest_fd.update(&id,&fd);
                         """,
                         exit_cmd_stats="""
-                                 stats->size_sum += PT_REGS_RC(ctx);
-                                 """,
+                        stats->size_sum += PT_REGS_RC(ctx);
+                        """,
                         exit_cmd_key="""
                         int* fd_ptr = latest_fd.lookup(&id);
                         if (fd_ptr != 0 ) {
@@ -214,32 +216,33 @@ class IOProbes:
             BCCProbes(
                 ProbeType.KERNEL,
                 "vfs",
-                [BCCFunctions("vfs", ".*vfs.*"), 
-                 BCCFunctions("generic", ".*generic.*"), 
-                 BCCFunctions("remote", ".*remote.*"), 
-                 BCCFunctions("llseek", ".*llseek.*"), 
-                 BCCFunctions("do_sync_read"), 
-                 BCCFunctions("vfs_read"), 
-                 BCCFunctions("do_sync_write"), 
-                 BCCFunctions("vfs_write"), 
-                 BCCFunctions("file", ".*file.*"), 
-                 BCCFunctions("do_readv_writev"),
-                 BCCFunctions("vfs_readv"),
-                 BCCFunctions("vfs_writev"),
-                 BCCFunctions("do_sendfile"),
-                 BCCFunctions("rw_verify_area"),
-                 BCCFunctions("wait_on_page_bit"),
-                 BCCFunctions("find_or_create_page"),
-                 BCCFunctions("find_get_pages"),
-                 BCCFunctions("find_get_pages_contig"),
-                 BCCFunctions("grab_cache_page_nowait"),
-                 BCCFunctions("wake_up_page"),
-                 BCCFunctions("do_readahead"),
-                 BCCFunctions("read_cache_page"),
-                 BCCFunctions("fdatawrite"), 
-                 #BCCFunctions("filename", ".*filename.*"), 
-                 #BCCFunctions("sync", ".*sync.*"), 
-                 #BCCFunctions("eio", ".*eio.*"), 
+                [
+                    BCCFunctions("vfs", ".*vfs.*"),
+                    BCCFunctions("generic", ".*generic.*"),
+                    BCCFunctions("remote", ".*remote.*"),
+                    BCCFunctions("llseek", ".*llseek.*"),
+                    BCCFunctions("do_sync_read"),
+                    BCCFunctions("vfs_read"),
+                    BCCFunctions("do_sync_write"),
+                    BCCFunctions("vfs_write"),
+                    BCCFunctions("file", ".*file.*"),
+                    BCCFunctions("do_readv_writev"),
+                    BCCFunctions("vfs_readv"),
+                    BCCFunctions("vfs_writev"),
+                    BCCFunctions("do_sendfile"),
+                    BCCFunctions("rw_verify_area"),
+                    BCCFunctions("wait_on_page_bit"),
+                    BCCFunctions("find_or_create_page"),
+                    BCCFunctions("find_get_pages"),
+                    BCCFunctions("find_get_pages_contig"),
+                    BCCFunctions("grab_cache_page_nowait"),
+                    BCCFunctions("wake_up_page"),
+                    BCCFunctions("do_readahead"),
+                    BCCFunctions("read_cache_page"),
+                    BCCFunctions("fdatawrite"),
+                    # BCCFunctions("filename", ".*filename.*"),
+                    # BCCFunctions("sync", ".*sync.*"),
+                    # BCCFunctions("eio", ".*eio.*"),
                 ],
             )
         )
@@ -294,7 +297,7 @@ class IOProbes:
                     BCCFunctions("pvalloc"),
                     BCCFunctions("aligned_alloc"),
                     BCCFunctions("free"),
-                    BCCFunctions("aio", ".*aio.*"), 
+                    BCCFunctions("aio", ".*aio.*"),
                 ],
             )
         )
@@ -344,33 +347,33 @@ class IOProbes:
                         #     f"attaching name {fnname} with {fn.name} for cat {probe.category}"
                         # )
                         bpf.attach_kprobe(
-                            event=fnname,
-                            fn_name=f"syscall__trace_entry_{fn.name}",
+                            event=fnname.encode(),
+                            fn_name=f"syscall__trace_entry_{fn.name}".encode(),
                         )
                         bpf.attach_kretprobe(
-                            event=fnname,
-                            fn_name=f"sys__trace_exit_{fn.name}",
+                            event=fnname.encode(),
+                            fn_name=f"sys__trace_exit_{fn.name}".encode(),
                         )
                     elif ProbeType.KERNEL == probe.type:
                         fname = fn.name
                         if fn.regex:
                             fname = fn.regex
                             bpf.attach_kprobe(
-                                event_re=fname,
-                                fn_name=f"trace_{probe.category}_{fn.name}_entry",
+                                event_re=fname.encode(),
+                                fn_name=f"trace_{probe.category}_{fn.name}_entry".encode(),
                             )
                             bpf.attach_kretprobe(
-                                event_re=fname,
-                                fn_name=f"trace_{probe.category}_{fn.name}_exit",
+                                event_re=fname.encode(),
+                                fn_name=f"trace_{probe.category}_{fn.name}_exit".encode(),
                             )
                         else:
                             bpf.attach_kprobe(
-                                event=fname,
-                                fn_name=f"trace_{probe.category}_{fn.name}_entry",
+                                event=fname.encode(),
+                                fn_name=f"trace_{probe.category}_{fn.name}_entry".encode(),
                             )
                             bpf.attach_kretprobe(
-                                event=fname,
-                                fn_name=f"trace_{probe.category}_{fn.name}_exit",
+                                event=fname.encode(),
+                                fn_name=f"trace_{probe.category}_{fn.name}_exit".encode(),
                             )
                     elif ProbeType.USER == probe.type:
                         library = probe.category
@@ -380,32 +383,30 @@ class IOProbes:
                             is_regex = True
                             fname = fn.regex
                         if probe.category in self.config.user_libraries:
-                            library = self.config.user_libraries[probe.category]["link"]
+                            library = self.config.user_libraries[probe.category]["link"]  # type: ignore
                             bpf.add_module(library)
 
                         if is_regex:
                             bpf.attach_uprobe(
-                                name=library,
-                                sym_re=fname,
-                                fn_name=f"trace_{probe.category}_{fn.name}_entry",
+                                name=library.encode(),
+                                sym_re=fname.encode(),
+                                fn_name=f"trace_{probe.category}_{fn.name}_entry".encode(),
                             )
                             bpf.attach_uretprobe(
-                                name=library,
-                                sym_re=fname,
-                                fn_name=f"trace_{probe.category}_{fn.name}_exit",
+                                name=library.encode(),
+                                sym_re=fname.encode(),
+                                fn_name=f"trace_{probe.category}_{fn.name}_exit".encode(),
                             )
                         else:
                             bpf.attach_uprobe(
-                                name=library,
-                                sym=fname,
-                                fn_name=f"trace_{probe.category}_{fn.name}_entry",
+                                name=library.encode(),
+                                sym=fname.encode(),
+                                fn_name=f"trace_{probe.category}_{fn.name}_entry".encode(),
                             )
                             bpf.attach_uretprobe(
-                                name=library,
-                                sym=fname,
-                                fn_name=f"trace_{probe.category}_{fn.name}_exit",
+                                name=library.encode(),
+                                sym=fname.encode(),
+                                fn_name=f"trace_{probe.category}_{fn.name}_exit".encode(),
                             )
                 except Exception as e:
-                    logging.warn(
-                        f"Unable attach probe  {probe.category} to io function {fn.name} due to {e}"
-                    )
+                    logging.warning(f"Unable attach probe  {probe.category} to io function {fn.name} due to {e}")

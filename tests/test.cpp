@@ -1,14 +1,11 @@
-#include <assert.h>
+#include <cassert>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
 #include <mpi.h>
-#include <stdio.h>
-#include <string.h>
 #include <string>
 #include <unistd.h>
-#include <vector>
 
 class Timer {
 public:
@@ -25,6 +22,7 @@ private:
   std::chrono::high_resolution_clock::time_point t1;
   double elapsed_time;
 };
+
 std::string gen_random(const int len) {
   static const char alphanum[] = "0123456789"
                                  "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -67,8 +65,8 @@ int main(int argc, char *argv[]) {
       fd = open(filename.c_str(), O_RDONLY, 0777);
     else
       fd = open(filename.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0777);
-    
-qq    assert(fd != -1);
+
+    assert(fd != -1);
     open_timer.pauseTime();
     for (int op_idx = 0; op_idx < ops; ++op_idx) {
       if (test_flag == 0 || test_flag == 2) {

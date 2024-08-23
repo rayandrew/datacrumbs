@@ -1,7 +1,6 @@
 # DataCrumbs
 A multi-level dataflow profiler to capture I/O calls from workflows.
 
-
 ## Dependency installation
 
 ### Requirements
@@ -20,7 +19,6 @@ A multi-level dataflow profiler to capture I/O calls from workflows.
 
 We have a Image that can be used to do development on Chameleon called HARI-UBUNTU-22.04.04-BCC.
 
-
 ## Compiling the code
 
 ### Clone the repo
@@ -30,6 +28,7 @@ git clone https://github.com/hariharan-devarajan/datacrumbs.git
 
 cd datacrumbs
 mkdir build
+cd build
 cmake ..
 make -j
 ```
@@ -80,7 +79,7 @@ cd tests/scripts
 The profiler output is created in the directory where the profiler runs.
 
 ```bash
-cc@ebpf:~/datacrumbs$ head -n 5 profile.pfw 
+cc@ebpf:~/datacrumbs$ head -n 5 profile.pfw
 [
 {"pid": 30545, "tid": 30545, "name": "__libc_malloc [libc.so.6]", "cat": "[libc.so.6]", "ph": "C", "ts": 0.0, "args": {"count": 21, "time": 0.000198116}}
 {"pid": 30545, "tid": 30545, "name": "cfree [libc.so.6]", "cat": "[libc.so.6]", "ph": "C", "ts": 0.0, "args": {"count": 2, "time": 1.9788e-05}}
@@ -97,4 +96,3 @@ The output format used is Chrome Tracing format and can be viewed using [perfett
 ## Analyzing counters using queries
 
 The profiler output can be analyzed using Dask distributed analysis. Please refer to the [notebook](analysis/analysis.ipynb).
-
