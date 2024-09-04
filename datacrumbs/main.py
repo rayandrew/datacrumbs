@@ -1,4 +1,3 @@
-# External Imports
 import logging
 
 import hydra

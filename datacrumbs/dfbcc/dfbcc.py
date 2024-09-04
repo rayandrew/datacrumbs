@@ -44,7 +44,7 @@ class BCCMain:
         bpf_text += probe_text
         # bpf_text += str(collector)
         bpf_text = bpf_text.replace("INTERVAL_RANGE", str(int(self.config.interval_sec * 1e9)))
-        logging.debug(f"Compiled Program is \n{bpf_text}")
+        # logging.debug(f"Compiled Program is \n{bpf_text}")
         f = open("profile.c", "w")
         f.write(bpf_text)
         f.close()
