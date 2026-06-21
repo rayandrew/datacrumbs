@@ -176,6 +176,18 @@ std::string serialize_any_value(const std::any& value) {
     return "\"" + json_escape(std::any_cast<std::string>(value)) + "\"";
   } else if (value.type() == typeid(CapturedArgumentValue)) {
     return serialize_captured_argument(std::any_cast<CapturedArgumentValue>(value));
+  } else if (value.type() == typeid(DataCrumbsArgs)) {
+    // Nested object, e.g. args.hw = { counter: delta, ... }
+    const auto& nested = std::any_cast<const DataCrumbsArgs&>(value);
+    std::string out = "{";
+    bool first = true;
+    for (const auto& [k, v] : nested) {
+      if (!first) out += ",";
+      out += "\"" + json_escape(k) + "\":" + serialize_any_value(v);
+      first = false;
+    }
+    out += "}";
+    return out;
   }
   return "\"<unsupported>\"";
 }

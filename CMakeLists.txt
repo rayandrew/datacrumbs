@@ -67,6 +67,12 @@ option(DATACRUMBS_BPFTIME_COMPATIBLE "Enable compatibility with bpftime" OFF)
 option(DATACRUMBS_ENABLE_OPT "Enable tracing" ON)
 option(DATACRUMBS_TRACE_ALL_PROCESSES_OPT "Trace all processes" OFF)
 option(DATACRUMBS_BPF_PRINT_ENABLE "Enable BPF print" OFF)
+# Hardware PMU counters (cache/cpu) captured in-band per traced call. OFF by
+# default so libpfm4 stays an OPTIONAL dependency. SLOTS is the compile-time
+# capacity of the event record; the runtime config decides how many (<= SLOTS,
+# and <= the CPU's physical counter budget) are actually read.
+option(DATACRUMBS_ENABLE_HW_COUNTERS_OPT "Enable in-band hardware PMU counters (requires libpfm4)" OFF)
+set(DATACRUMBS_HW_COUNTER_SLOTS "6" CACHE STRING "Hardware PMU counter slots compiled into the event record (capacity)")
 set(DATACRUMBS_MODE_STR "TRACE" CACHE STRING "Mode for datacrumbs (TRACE or PROFILE)")
 set_property(CACHE DATACRUMBS_MODE_STR PROPERTY STRINGS TRACE PROFILE)
 
@@ -200,6 +206,7 @@ message(STATUS "             - DATACRUMBS_LOG_LEVEL: ${DATACRUMBS_LOG_LEVEL}")
 message(STATUS "             - DATACRUMBS_BPFTIME_COMPATIBLE: ${DATACRUMBS_BPFTIME_COMPATIBLE}")
 message(STATUS "             - DATACRUMBS_MODE: ${DATACRUMBS_MODE}")
 message(STATUS "             - DATACRUMBS_ENABLE: ${DATACRUMBS_ENABLE}")
+message(STATUS "             - DATACRUMBS_ENABLE_HW_COUNTERS: ${DATACRUMBS_ENABLE_HW_COUNTERS} (slots: ${DATACRUMBS_HW_COUNTER_SLOTS})")
 message(STATUS "             - DATACRUMBS_SKIP_SMALL_EVENTS_THRESHOLD_NS: ${DATACRUMBS_SKIP_SMALL_EVENTS_THRESHOLD_NS}")
 message(STATUS "             - DATACRUMBS_MAX_RUNTIME_FUNCTIONS: ${DATACRUMBS_MAX_RUNTIME_FUNCTIONS}")
 message(STATUS "             - DATACRUMBS_TRACE_ALL_PROCESSES: ${DATACRUMBS_TRACE_ALL_PROCESSES}")

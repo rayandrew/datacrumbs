@@ -28,6 +28,15 @@ struct generic_event_t {
   unsigned int arg_data_len[DATACRUMBS_MAX_CAPTURE_ARGS];
   unsigned int arg_data_status[DATACRUMBS_MAX_CAPTURE_ARGS];
   unsigned char arg_data[DATACRUMBS_MAX_CAPTURE_ARGS][DATACRUMBS_MAX_CAPTURE_BYTES];
+#if defined(DATACRUMBS_ENABLE_HW_COUNTERS) && (DATACRUMBS_ENABLE_HW_COUNTERS == 1)
+  // Per-call hardware PMU counter deltas (exit - entry), one slot per configured
+  // counter. enabled/running deltas allow scaling if the counter was multiplexed.
+  unsigned long long hwc_delta[DATACRUMBS_HW_COUNTER_SLOTS];
+  unsigned long long hwc_enabled_delta[DATACRUMBS_HW_COUNTER_SLOTS];
+  unsigned long long hwc_running_delta[DATACRUMBS_HW_COUNTER_SLOTS];
+  unsigned int hwc_valid_mask;  // bit i set => hwc_delta[i] is trustworthy
+  unsigned int hwc_migrated;    // 1 => thread changed cpu entry->exit (deltas suspect)
+#endif
 };
 typedef struct generic_event_t general_event_t;
 struct usdt_event_t {
@@ -52,6 +61,15 @@ struct fn_value_t {
   unsigned int arg_data_len[DATACRUMBS_MAX_CAPTURE_ARGS];
   unsigned int arg_data_status[DATACRUMBS_MAX_CAPTURE_ARGS];
   unsigned char arg_data[DATACRUMBS_MAX_CAPTURE_ARGS][DATACRUMBS_MAX_CAPTURE_BYTES];
+#if defined(DATACRUMBS_ENABLE_HW_COUNTERS) && (DATACRUMBS_ENABLE_HW_COUNTERS == 1)
+  // Hardware PMU counter snapshots taken at function entry, keyed alongside ts in
+  // fn_pid_map so the exit handler can compute the per-call delta.
+  unsigned long long hwc_ctr[DATACRUMBS_HW_COUNTER_SLOTS];
+  unsigned long long hwc_enabled[DATACRUMBS_HW_COUNTER_SLOTS];
+  unsigned long long hwc_running[DATACRUMBS_HW_COUNTER_SLOTS];
+  unsigned int hwc_entry_cpu;         // cpu id at entry (migration detection)
+  unsigned int hwc_entry_valid_mask;  // bit i set => entry read of slot i succeeded
+#endif
 };
 
 struct runtime_event_config_t {

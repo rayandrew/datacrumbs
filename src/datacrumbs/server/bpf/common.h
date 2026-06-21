@@ -33,6 +33,20 @@ DATACRUMBS_MAP_EXTERN(latest_interval, int, unsigned long long, 128);
 #endif
 DATACRUMBS_MAP_EXTERN(file_map, char[MAX_STR_READ_LEN], u32, 1024);
 
+#if defined(DATACRUMBS_ENABLE_HW_COUNTERS) && (DATACRUMBS_ENABLE_HW_COUNTERS == 1)
+extern struct {
+  __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+  __uint(key_size, sizeof(int));
+  __uint(value_size, sizeof(int));
+} hwc_pmu SEC(".maps");
+extern struct {
+  __uint(type, BPF_MAP_TYPE_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, u32);
+  __type(value, u32);
+} hwc_ctl SEC(".maps");
+#endif
+
 #if defined(DATACRUMBS_ENABLE_INCLUSION_PATH) && (DATACRUMBS_ENABLE_INCLUSION_PATH == 1)
 DATACRUMBS_TRIE_EXTERN(inclusion_path_trie, struct string_t, struct string_t);
 #endif
@@ -146,6 +160,72 @@ static inline __attribute__((always_inline)) struct fn_value_t* get_scratch_fn_v
   u32 key = 0;
   return (struct fn_value_t*)bpf_map_lookup_elem(&scratch_fn_value_map, &key);
 }
+
+#if defined(DATACRUMBS_ENABLE_HW_COUNTERS) && (DATACRUMBS_ENABLE_HW_COUNTERS == 1)
+static inline __attribute__((always_inline)) u32 hwc_active_count(void) {
+  u32 key = 0;
+  u32* v = (u32*)bpf_map_lookup_elem(&hwc_ctl, &key);
+  if (v == NULL) return 0;
+  u32 n = *v;
+  return n > DATACRUMBS_HW_COUNTER_SLOTS ? DATACRUMBS_HW_COUNTER_SLOTS : n;
+}
+
+// Snapshot the active counters at function entry into the per-call fn state.
+static inline __attribute__((always_inline)) void hwc_read_entry(struct fn_value_t* fn) {
+  const u32 active = hwc_active_count();
+  const u32 cpu = bpf_get_smp_processor_id();
+  fn->hwc_entry_cpu = cpu;
+  fn->hwc_entry_valid_mask = 0;
+#pragma unroll
+  for (int s = 0; s < DATACRUMBS_HW_COUNTER_SLOTS; ++s) {
+    if ((u32)s >= active) break;
+    struct bpf_perf_event_value val = {};
+    u64 idx = (u64)cpu * DATACRUMBS_HW_COUNTER_SLOTS + (u32)s;
+    if (bpf_perf_event_read_value(&hwc_pmu, idx, &val, sizeof(val)) == 0) {
+      fn->hwc_ctr[s] = val.counter;
+      fn->hwc_enabled[s] = val.enabled;
+      fn->hwc_running[s] = val.running;
+      fn->hwc_entry_valid_mask |= (1u << s);
+    }
+  }
+}
+
+// Read the active counters at exit, compute per-call deltas into the event.
+// Flags the sample if the thread migrated cpus (entry/exit reads on different
+// cpus make the delta meaningless).
+static inline __attribute__((always_inline)) void hwc_fill_exit(const struct fn_value_t* fn,
+                                                                struct generic_event_t* event) {
+  const u32 active = hwc_active_count();
+  const u32 cpu = bpf_get_smp_processor_id();
+  event->hwc_migrated = (cpu != fn->hwc_entry_cpu) ? 1 : 0;
+  event->hwc_valid_mask = 0;
+#pragma unroll
+  for (int s = 0; s < DATACRUMBS_HW_COUNTER_SLOTS; ++s) {
+    event->hwc_delta[s] = 0;
+    event->hwc_enabled_delta[s] = 0;
+    event->hwc_running_delta[s] = 0;
+    if ((u32)s >= active) continue;
+    if (event->hwc_migrated || !(fn->hwc_entry_valid_mask & (1u << s))) continue;
+    struct bpf_perf_event_value val = {};
+    u64 idx = (u64)cpu * DATACRUMBS_HW_COUNTER_SLOTS + (u32)s;
+    if (bpf_perf_event_read_value(&hwc_pmu, idx, &val, sizeof(val)) == 0) {
+      event->hwc_delta[s] = val.counter - fn->hwc_ctr[s];
+      event->hwc_enabled_delta[s] = val.enabled - fn->hwc_enabled[s];
+      event->hwc_running_delta[s] = val.running - fn->hwc_running[s];
+      event->hwc_valid_mask |= (1u << s);
+    }
+  }
+}
+#else
+static inline __attribute__((always_inline)) void hwc_read_entry(struct fn_value_t* fn) {
+  (void)fn;
+}
+static inline __attribute__((always_inline)) void hwc_fill_exit(const struct fn_value_t* fn,
+                                                                struct generic_event_t* event) {
+  (void)fn;
+  (void)event;
+}
+#endif
 
 static inline __attribute__((always_inline)) int mark_current_pid_traced(void) {
   const u64 tsp = bpf_ktime_get_ns();
@@ -358,6 +438,7 @@ static inline __attribute__((always_inline)) int generic_entry(struct pt_regs* c
   __builtin_memset(fn, 0, sizeof(*fn));
   fn->ts = bpf_ktime_get_ns();
   capture_runtime_args(ctx, config, fn);
+  hwc_read_entry(fn);
   bpf_map_update_elem(&fn_pid_map, &key, fn, BPF_ANY);
   DBG_PRINTK("Pushed pid:%d, event_id:%llu to map\n", (u32)key.id, event_id);
   return 0;
@@ -414,6 +495,7 @@ static inline __attribute__((always_inline)) int generic_exit(struct pt_regs* ct
   event->event_id = event_id;
   DATACRUMBS_COLLECT_TIME(event);
   copy_captured_args_to_event(fn, event);
+  hwc_fill_exit(fn, event);
   DATACRUMBS_EVENT_SUBMIT(event, key.id, event_id);
   return 0;
 }
@@ -483,6 +565,7 @@ static inline __attribute__((always_inline)) int generic_syscall_entry(
   __builtin_memset(fn, 0, sizeof(*fn));
   fn->ts = bpf_ktime_get_ns();
   capture_runtime_raw_args(config, fn, arg0, arg1, arg2, arg3, arg4, true);
+  hwc_read_entry(fn);
   bpf_map_update_elem(&fn_pid_map, &key, fn, BPF_ANY);
   DBG_PRINTK("Pushed syscall pid:%d, event_id:%llu to map\n", (u32)key.id, event_id);
   return 0;
@@ -519,6 +602,7 @@ static inline __attribute__((always_inline)) int usdt_entry(struct pt_regs* ctx,
   __builtin_memset(fn, 0, sizeof(*fn));
   fn->ts = bpf_ktime_get_ns();
   capture_runtime_usdt_args(ctx, config, fn);
+  hwc_read_entry(fn);
   bpf_map_update_elem(&fn_pid_map, &key, fn, BPF_ANY);
   DBG_PRINTK("USDT  Pushed pid:%d, event_id:%llu to map\n", (u32)key.id, event_id);
   return 0;
@@ -555,6 +639,7 @@ static inline __attribute__((always_inline)) int usdt_exit(struct pt_regs* ctx, 
   event->event_id = event_id;
   DATACRUMBS_COLLECT_TIME(event);
   copy_captured_args_to_event(fn, event);
+  hwc_fill_exit(fn, event);
   DATACRUMBS_EVENT_SUBMIT(event, key.id, event_id);
   return 0;
 }

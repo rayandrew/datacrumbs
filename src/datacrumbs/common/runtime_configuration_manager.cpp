@@ -542,6 +542,29 @@ void RuntimeConfigurationManager::derive_configurations() {
   runtime_probe_state_db_path =
       data_dir / ("probes-runtime-status-" + lookup_file_suffix + ".sqlite");
   server_ready_file = server_run_dir / ("datacrumbs-" + run_id + ".ready");
+
+  // Hardware PMU counters to capture in-band per call (ordered). Source:
+  // DATACRUMBS_HW_COUNTERS env, comma-separated libpfm4 event names, e.g.
+  // "cache-misses,instructions". Only honored when the build enables HW counters.
+  hw_counter_events.clear();
+  const char* hwc = std::getenv("DATACRUMBS_HW_COUNTERS");
+  if (hwc != nullptr) {
+    std::stringstream hwc_ss(hwc);
+    std::string ev;
+    while (std::getline(hwc_ss, ev, ',')) {
+      const auto begin = ev.find_first_not_of(" \t");
+      const auto end = ev.find_last_not_of(" \t");
+      if (begin != std::string::npos)
+        hw_counter_events.push_back(ev.substr(begin, end - begin + 1));
+    }
+  }
+#if defined(DATACRUMBS_ENABLE_HW_COUNTERS) && (DATACRUMBS_ENABLE_HW_COUNTERS == 1)
+  else {
+    // DATACRUMBS_HW_COUNTERS unset on a HW-counter-enabled build: default to a
+    // small set. Set the env to "" to disable, or to a custom list to override.
+    hw_counter_events.push_back("cache-misses");
+  }
+#endif
 }
 
 void RuntimeConfigurationManager::load_runtime_system_configuration() {

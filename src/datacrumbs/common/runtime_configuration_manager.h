@@ -45,6 +45,10 @@ class RuntimeConfigurationManager {
   std::string run_id;
   std::string trace_dir_pattern;
   std::string inclusion_paths;
+  // Ordered hardware PMU counter event names to capture in-band per call.
+  // Slot i in the event record corresponds to hw_counter_events[i]. Empty =
+  // feature inactive. Resolved to perf encodings by libpfm4 at server startup.
+  std::vector<std::string> hw_counter_events;
 
   std::vector<std::shared_ptr<Probe>> runtime_probes;
   std::unordered_map<uint64_t, std::pair<std::string, std::string>> category_map;

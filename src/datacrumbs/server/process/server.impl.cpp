@@ -13,6 +13,18 @@
 #include <sstream>
 #include <string>
 
+#if defined(DATACRUMBS_ENABLE_HW_COUNTERS) && (DATACRUMBS_ENABLE_HW_COUNTERS == 1)
+#include <errno.h>
+#include <linux/perf_event.h>
+#include <perfmon/pfmlib.h>
+#include <perfmon/pfmlib_perf_event.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+#include <vector>
+#endif
+
 static int libbpf_print_fn(enum libbpf_print_level level, const char* format, va_list args) {
   if (level >= LIBBPF_DEBUG) return 0;
   return vfprintf(stderr, format, args);
@@ -342,6 +354,112 @@ static int attach_runtime_probes(datacrumbs::EventProcessor* event_processor,
   return 0;
 }
 
+#if defined(DATACRUMBS_ENABLE_HW_COUNTERS) && (DATACRUMBS_ENABLE_HW_COUNTERS == 1)
+// Encode the configured PMU events via libpfm4, open one perf event per (cpu,
+// slot), insert the fds into hwc_pmu at index cpu*SLOTS+slot, and record the
+// active counter count in hwc_ctl. Returns 0 on success (including "no counters
+// configured"); negative on a hard error.
+static int setup_hw_counters(struct datacrumbs_bpf* skel, const std::vector<std::string>& events) {
+  if (events.empty()) {
+    DC_LOG_INFO("HW counters: none configured");
+    return 0;
+  }
+  std::vector<std::string> active_events = events;
+  if (active_events.size() > DATACRUMBS_HW_COUNTER_SLOTS) {
+    DC_LOG_WARN("HW counters: %zu requested but only %d slots compiled in; truncating",
+                active_events.size(), (int)DATACRUMBS_HW_COUNTER_SLOTS);
+    active_events.resize(DATACRUMBS_HW_COUNTER_SLOTS);
+  }
+
+  if (pfm_initialize() != PFM_SUCCESS) {
+    DC_LOG_ERROR("HW counters: pfm_initialize() failed");
+    return -1;
+  }
+
+  int ncpu = libbpf_num_possible_cpus();
+  if (ncpu < 1) ncpu = 1;
+
+  // One perf fd per (cpu, counter): can exceed the default RLIMIT_NOFILE (1024)
+  // on many-core nodes, so raise it to cover the fds plus headroom for libbpf links.
+  {
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
+      const rlim_t need = (rlim_t)ncpu * active_events.size() + 4096;
+      if (rl.rlim_cur < need) {
+        rl.rlim_cur = (rl.rlim_max == RLIM_INFINITY || rl.rlim_max > need) ? need : rl.rlim_max;
+        if (setrlimit(RLIMIT_NOFILE, &rl) != 0) {
+          DC_LOG_WARN("HW counters: could not raise RLIMIT_NOFILE to %llu (may hit EMFILE)",
+                      (unsigned long long)need);
+        }
+      }
+    }
+  }
+
+  const int pmu_fd = bpf_map__fd(skel->maps.hwc_pmu);
+  const int ctl_fd = bpf_map__fd(skel->maps.hwc_ctl);
+  if (pmu_fd < 0 || ctl_fd < 0) {
+    DC_LOG_ERROR("HW counters: failed to get hwc map fds (pmu=%d ctl=%d)", pmu_fd, ctl_fd);
+    return -1;
+  }
+
+  unsigned int active = 0;
+  for (const auto& name : active_events) {
+    struct perf_event_attr attr;
+    memset(&attr, 0, sizeof(attr));
+    attr.size = sizeof(attr);
+    pfm_perf_encode_arg_t arg;
+    memset(&arg, 0, sizeof(arg));
+    arg.attr = &attr;
+    arg.size = sizeof(arg);
+    int ret = pfm_get_os_event_encoding(name.c_str(), PFM_PLM0 | PFM_PLM3, PFM_OS_PERF_EVENT, &arg);
+    if (ret != PFM_SUCCESS) {
+      DC_LOG_ERROR("HW counter '%s' not recognized by libpfm4: %s", name.c_str(),
+                   pfm_strerror(ret));
+      return -1;
+    }
+    attr.disabled = 0;  // count immediately
+    attr.inherit = 0;   // per-cpu events cannot inherit
+
+    int opened = 0;
+    for (int cpu = 0; cpu < ncpu; ++cpu) {
+      int fd = syscall(__NR_perf_event_open, &attr, /*pid=*/-1, cpu, /*group_fd=*/-1, /*flags=*/0);
+      if (fd < 0) {
+        if (cpu == 0) {
+          DC_LOG_ERROR(
+              "HW counter '%s': perf_event_open(cpu=0) failed: %s. Check "
+              "/proc/sys/kernel/perf_event_paranoid (needs <=0, or CAP_PERFMON/root) and that the "
+              "PMU exposes this event.",
+              name.c_str(), strerror(errno));
+          return -1;
+        }
+        continue;  // offline cpu etc.
+      }
+      unsigned int idx = (unsigned int)cpu * DATACRUMBS_HW_COUNTER_SLOTS + active;
+      if (bpf_map_update_elem(pmu_fd, &idx, &fd, BPF_ANY) != 0) {
+        DC_LOG_ERROR("HW counter '%s': hwc_pmu update failed at cpu=%d: %s", name.c_str(), cpu,
+                     strerror(errno));
+        close(fd);
+        return -1;
+      }
+      // fd intentionally kept open for the lifetime of the server (closing it
+      // would stop the counter); the process exit reclaims it.
+      ++opened;
+    }
+    DC_LOG_INFO("HW counter[%u] '%s' opened on %d/%d cpus", active, name.c_str(), opened, ncpu);
+    ++active;
+  }
+
+  unsigned int key0 = 0;
+  if (bpf_map_update_elem(ctl_fd, &key0, &active, BPF_ANY) != 0) {
+    DC_LOG_ERROR("HW counters: failed to set active count in hwc_ctl");
+    return -1;
+  }
+  DC_LOG_PRINT("HW counters active: %u (compiled slots: %d)", active,
+               (int)DATACRUMBS_HW_COUNTER_SLOTS);
+  return 0;
+}
+#endif  // DATACRUMBS_ENABLE_HW_COUNTERS
+
 static int main_process(datacrumbs::EventProcessor* event_processor) {
   DC_LOG_TRACE("main: start");
   datacrumbs::utils::Timer timer;
@@ -352,9 +470,27 @@ static int main_process(datacrumbs::EventProcessor* event_processor) {
   int err = 0;
   libbpf_set_print(libbpf_print_fn);
 
-  skel = datacrumbs_bpf__open_and_load();
+  skel = datacrumbs_bpf__open();
   if (!skel) {
     DC_LOG_ERROR("Failed to open BPF object");
+    return 1;
+  }
+#if defined(DATACRUMBS_ENABLE_HW_COUNTERS) && (DATACRUMBS_ENABLE_HW_COUNTERS == 1)
+  // Size the perf-event-array to ncpu*SLOTS before load (one perf fd per cpu/slot).
+  {
+    int ncpu = libbpf_num_possible_cpus();
+    if (ncpu < 1) ncpu = 1;
+    if (bpf_map__set_max_entries(skel->maps.hwc_pmu,
+                                 (unsigned int)ncpu * DATACRUMBS_HW_COUNTER_SLOTS) != 0) {
+      DC_LOG_ERROR("Failed to size hwc_pmu map");
+      datacrumbs_bpf__destroy(skel);
+      return 1;
+    }
+  }
+#endif
+  if (datacrumbs_bpf__load(skel)) {
+    DC_LOG_ERROR("Failed to load BPF object");
+    datacrumbs_bpf__destroy(skel);
     return 1;
   }
 
@@ -370,6 +506,14 @@ static int main_process(datacrumbs::EventProcessor* event_processor) {
     datacrumbs_bpf__destroy(skel);
     return 1;
   }
+
+#if defined(DATACRUMBS_ENABLE_HW_COUNTERS) && (DATACRUMBS_ENABLE_HW_COUNTERS == 1)
+  if (setup_hw_counters(skel, event_processor->configManager_->hw_counter_events) != 0) {
+    DC_LOG_ERROR("Failed to set up hardware counters");
+    datacrumbs_bpf__destroy(skel);
+    return 1;
+  }
+#endif
 
 #if !(defined(DATACRUMBS_ENABLE) && (DATACRUMBS_ENABLE == 1))
   DC_LOG_WARN("DATACRUMBS_ENABLE_OPT is OFF. Nothing will be captured");

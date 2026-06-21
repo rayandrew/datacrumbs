@@ -30,6 +30,7 @@ The current split is:
    usage
    integration
    run
+   hardware_counters
 
 .. toctree::
    :maxdepth: 2

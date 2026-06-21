@@ -161,6 +161,28 @@ macro(include_dependencies)
     message(FATAL_ERROR "-- [${UPPER_PROJECT_NAME}] zlib is needed for ${PROJECT_NAME} build")
   endif()
 
+  # Optional: libpfm4 for hardware PMU counter support (PAPI-grade event naming).
+  # Only required when DATACRUMBS_ENABLE_HW_COUNTERS_OPT is ON, keeping libpfm4 an
+  # optional dependency.
+  if(DATACRUMBS_ENABLE_HW_COUNTERS_OPT)
+    find_path(PFM_INCLUDE_DIR perfmon/pfmlib.h)
+    find_library(PFM_LIBRARY pfm)
+    if(PFM_INCLUDE_DIR AND PFM_LIBRARY)
+      include_directories(${PFM_INCLUDE_DIR})
+      get_filename_component(PFM_LIBRARY_DIR "${PFM_LIBRARY}" DIRECTORY)
+      list(APPEND DEPENDENCY_LIBRARY_DIRS ${PFM_LIBRARY_DIR})
+      set(DEPENDENCY_LIB ${DEPENDENCY_LIB} -L${PFM_LIBRARY_DIR} -lpfm)
+      message(STATUS "             - Found libpfm4 at lib:${PFM_LIBRARY} include:${PFM_INCLUDE_DIR}")
+    else()
+      message(
+        FATAL_ERROR
+          "[${UPPER_PROJECT_NAME}] DATACRUMBS_ENABLE_HW_COUNTERS_OPT=ON but libpfm4 was not found. "
+          "Install libpfm4 (perfmon/pfmlib.h + libpfm) or add its prefix to CMAKE_PREFIX_PATH, "
+          "or build with -DDATACRUMBS_ENABLE_HW_COUNTERS_OPT=OFF."
+      )
+    endif()
+  endif()
+
   list(APPEND DEPENDENCY_LIBRARY_DIRS ${DATACRUMBS_INSTALL_LIB_DIR})
   list(REMOVE_DUPLICATES DEPENDENCY_LIBRARY_DIRS)
 
@@ -222,6 +244,12 @@ macro(derive_configurations)
     set(DATACRUMBS_MODE 1)
   else()
     set(DATACRUMBS_MODE 2)
+  endif()
+
+  if(DATACRUMBS_ENABLE_HW_COUNTERS_OPT)
+    set(DATACRUMBS_ENABLE_HW_COUNTERS 1)
+  else()
+    set(DATACRUMBS_ENABLE_HW_COUNTERS 0)
   endif()
 
   if(DATACRUMBS_TRACE_ALL_PROCESSES_OPT AND DATACRUMBS_TRACE_ALL_PROCESSES_OPT STREQUAL "ON")
