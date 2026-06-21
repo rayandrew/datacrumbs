@@ -28,6 +28,7 @@ struct ProbeArgCaptureSpec {
   bool is_pointer = false;
   std::string label;
   std::string c_type;
+  std::string group;  // optional: nest this arg under args.<group> (e.g. "nic")
 
   json_object* toJson() const {
     json_object* j = json_object_new_object();
@@ -36,6 +37,7 @@ struct ProbeArgCaptureSpec {
     json_object_object_add(j, "is_pointer", json_object_new_boolean(is_pointer));
     json_object_object_add(j, "label", json_object_new_string(label.c_str()));
     json_object_object_add(j, "c_type", json_object_new_string(c_type.c_str()));
+    if (!group.empty()) json_object_object_add(j, "group", json_object_new_string(group.c_str()));
     return j;
   }
 
@@ -51,6 +53,8 @@ struct ProbeArgCaptureSpec {
       spec.label = json_object_get_string(obj);
     if (json_object_object_get_ex(j, "c_type", &obj) && obj)
       spec.c_type = json_object_get_string(obj);
+    if (json_object_object_get_ex(j, "group", &obj) && obj)
+      spec.group = json_object_get_string(obj);
     return spec;
   }
 };

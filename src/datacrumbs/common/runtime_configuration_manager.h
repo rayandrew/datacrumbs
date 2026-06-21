@@ -2,6 +2,7 @@
 #define DATACRUMBS_COMMON_RUNTIME_CONFIGURATION_MANAGER_H__
 
 #include <datacrumbs/common/data_structures.h>
+#include <datacrumbs/common/telemetry_types.h>
 #include <datacrumbs/datacrumbs_config.h>
 
 #include <filesystem>
@@ -50,6 +51,12 @@ class RuntimeConfigurationManager {
   // feature inactive. Resolved to perf encodings by libpfm4 at server startup.
   std::vector<std::string> hw_counter_events;
 
+  // Device-telemetry counter tracks sampled in userspace (generic; NIC sysfs is
+  // the first source). Populated from DATACRUMBS_NIC_DEVICES; event ids assigned
+  // in load_runtime_probe_file() since it clears category_map after derive.
+  std::vector<TelemetrySource> telemetry_sources;
+  unsigned int telemetry_interval_ms = 100;
+
   std::vector<std::shared_ptr<Probe>> runtime_probes;
   std::unordered_map<uint64_t, std::pair<std::string, std::string>> category_map;
   std::unordered_map<std::string, uint64_t> runtime_event_ids;
@@ -67,6 +74,8 @@ class RuntimeConfigurationManager {
 
  private:
   void derive_configurations();
+  void derive_telemetry_sources();
+  void register_telemetry_categories(uint64_t event_id_base);
   void load_runtime_system_configuration();
   void load_runtime_probe_file();
   void load_runtime_probe_state();

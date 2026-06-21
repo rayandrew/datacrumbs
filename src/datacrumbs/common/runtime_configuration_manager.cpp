@@ -565,6 +565,47 @@ void RuntimeConfigurationManager::derive_configurations() {
     hw_counter_events.push_back("cache-misses");
   }
 #endif
+
+  derive_telemetry_sources();
+}
+
+// DATACRUMBS_NIC_DEVICES = comma list of "<ibdev>[:port]" (port default 1), e.g.
+// "mlx5_0,mlx5_1:2". Each becomes a counter track reading IB sysfs byte/packet
+// counters. DATACRUMBS_TELEMETRY_INTERVAL_MS sets the sample period.
+void RuntimeConfigurationManager::derive_telemetry_sources() {
+  telemetry_sources.clear();
+  if (const char* ms = std::getenv("DATACRUMBS_TELEMETRY_INTERVAL_MS")) {
+    const long v = std::strtol(ms, nullptr, 10);
+    if (v > 0) telemetry_interval_ms = static_cast<unsigned int>(v);
+  }
+  const char* devs = std::getenv("DATACRUMBS_NIC_DEVICES");
+  if (devs == nullptr || *devs == '\0') return;
+
+  std::stringstream ss(devs);
+  std::string token;
+  while (std::getline(ss, token, ',')) {
+    const auto begin = token.find_first_not_of(" \t");
+    if (begin == std::string::npos) continue;
+    const auto end = token.find_last_not_of(" \t");
+    token = token.substr(begin, end - begin + 1);
+    std::string dev = token;
+    std::string port = "1";
+    if (const auto colon = token.find(':'); colon != std::string::npos) {
+      dev = token.substr(0, colon);
+      port = token.substr(colon + 1);
+    }
+    const std::string base = "/sys/class/infiniband/" + dev + "/ports/" + port;
+    TelemetrySource src;
+    src.cat = "nic";
+    src.name = dev;
+    // IB data counters are in 4-octet units -> *4 for bytes.
+    src.counters.push_back({"rx_bytes", base + "/counters/port_rcv_data", 4.0});
+    src.counters.push_back({"tx_bytes", base + "/counters/port_xmit_data", 4.0});
+    src.counters.push_back({"rx_packets", base + "/counters/port_rcv_packets", 1.0});
+    src.counters.push_back({"tx_packets", base + "/counters/port_xmit_packets", 1.0});
+    src.counters.push_back({"out_of_buffer", base + "/hw_counters/out_of_buffer", 1.0});
+    telemetry_sources.push_back(std::move(src));
+  }
 }
 
 void RuntimeConfigurationManager::load_runtime_system_configuration() {
@@ -694,6 +735,16 @@ void RuntimeConfigurationManager::load_runtime_probe_file() {
                              std::to_string(DATACRUMBS_MAX_RUNTIME_FUNCTIONS) +
                              " functions per run. Regenerate the probes file with fewer "
                              "selected functions.");
+  }
+
+  // High base keeps telemetry ids clear of probe ids (which start at 1000).
+  register_telemetry_categories(0xE000000000000000ULL);
+}
+
+void RuntimeConfigurationManager::register_telemetry_categories(uint64_t event_id_base) {
+  for (auto& src : telemetry_sources) {
+    src.event_id = event_id_base++;
+    category_map[src.event_id] = std::make_pair(src.cat, src.name);
   }
 }
 

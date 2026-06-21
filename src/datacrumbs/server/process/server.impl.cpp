@@ -3,6 +3,7 @@
 #include <datacrumbs/common/runtime_configuration_manager.h>
 #include <datacrumbs/common/singleton.h>
 #include <datacrumbs/server/process/event_processor.h>
+#include <datacrumbs/server/process/telemetry/telemetry_sampler.h>
 
 // std headers
 #include <algorithm>
@@ -647,6 +648,11 @@ static int main_process(datacrumbs::EventProcessor* event_processor) {
               event_processor->configManager_->run_id.c_str(),
               event_processor->configManager_->trace_file_path.c_str());
 
+  datacrumbs::TelemetrySampler telemetry_sampler(
+      event_processor->writer_, event_processor->configManager_->telemetry_sources,
+      event_processor->configManager_->telemetry_interval_ms, &event_processor->event_index);
+  telemetry_sampler.start();
+
   signal(SIGINT, sig_handler);
   unsigned int batch_size = 1024;
 #if defined(DATACRUMBS_BPFTIME_COMPATIBLE_FLAG) && (DATACRUMBS_BPFTIME_COMPATIBLE_FLAG == 0)
@@ -801,6 +807,7 @@ static int main_process(datacrumbs::EventProcessor* event_processor) {
   if (stop) {
     DC_LOG_INFO("Received SIGINT (Ctrl-C), exiting gracefully");
   }
+  telemetry_sampler.stop();
   timer.resumeTime();
   event_processor->finalize();
   {

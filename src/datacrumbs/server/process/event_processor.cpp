@@ -58,6 +58,7 @@ std::unique_ptr<DataCrumbsArgs> build_runtime_args(
   }
 
   auto args = std::make_unique<DataCrumbsArgs>();
+  std::unordered_map<std::string, DataCrumbsArgs> groups;  // spec.group -> nested object
   const unsigned int arg_count =
       std::min<unsigned int>(event->arg_count, metadata->arg_specs.size());
   for (unsigned int index = 0; index < arg_count; ++index) {
@@ -73,8 +74,13 @@ std::unique_ptr<DataCrumbsArgs> build_runtime_args(
     value.bytes.assign(event->arg_data[index], event->arg_data[index] + data_len);
 
     std::string label = spec.label.empty() ? ("arg" + std::to_string(index + 1)) : spec.label;
-    args->emplace(std::move(label), std::move(value));
+    if (spec.group.empty()) {
+      args->emplace(std::move(label), std::move(value));
+    } else {
+      groups[spec.group].emplace(std::move(label), std::move(value));
+    }
   }
+  for (auto& [group, nested] : groups) args->emplace(group, std::move(nested));
   return args;
 }
 

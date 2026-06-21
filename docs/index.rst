@@ -31,6 +31,7 @@ The current split is:
    integration
    run
    hardware_counters
+   nic_telemetry
 
 .. toctree::
    :maxdepth: 2
