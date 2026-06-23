@@ -204,10 +204,15 @@ bool validate_function_arguments(json_object* function_arguments, const std::str
         continue;
       }
       if (!validate_exact_keys(arg_spec, {"index", "num_bytes", "is_pointer", "label", "c_type"},
-                               {}, arg_context, errors)) {
+                               {"group"}, arg_context, errors)) {
         ok = false;
       }
       json_object* value = nullptr;
+      if (json_object_object_get_ex(arg_spec, "group", &value) &&
+          json_object_get_type(value) != json_type_string) {
+        errors->push_back(arg_context + ": 'group' must be a string");
+        ok = false;
+      }
       if (!json_object_object_get_ex(arg_spec, "index", &value) ||
           json_object_get_type(value) != json_type_int) {
         errors->push_back(arg_context + ": 'index' must be an integer");
