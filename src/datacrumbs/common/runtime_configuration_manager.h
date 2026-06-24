@@ -56,6 +56,11 @@ class RuntimeConfigurationManager {
   enum class HwScope { CPU, TASK, BOTH };
   HwScope hw_scope = HwScope::TASK;
 
+  // System-wide (uncore) PMU events sampled on an interval as a counter track
+  // (DATACRUMBS_UNCORE_EVENTS, comma-separated libpfm4 names). Become a perf
+  // TelemetrySource in derive_telemetry_sources(). Resolved by libpfm4 at start.
+  std::vector<std::string> uncore_events;
+
   // Device-telemetry counter tracks sampled in userspace (generic; NIC sysfs is
   // the first source). Populated from DATACRUMBS_NIC_DEVICES; event ids assigned
   // in load_runtime_probe_file() since it clears category_map after derive.

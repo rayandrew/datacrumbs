@@ -578,6 +578,17 @@ void RuntimeConfigurationManager::derive_configurations() {
       hw_scope = HwScope::TASK;
   }
 
+  uncore_events.clear();
+  if (const char* ue = std::getenv("DATACRUMBS_UNCORE_EVENTS")) {
+    std::stringstream ss(ue);
+    std::string ev;
+    while (std::getline(ss, ev, ',')) {
+      const auto b = ev.find_first_not_of(" \t");
+      const auto e = ev.find_last_not_of(" \t");
+      if (b != std::string::npos) uncore_events.push_back(ev.substr(b, e - b + 1));
+    }
+  }
+
   derive_telemetry_sources();
 }
 
@@ -590,6 +601,23 @@ void RuntimeConfigurationManager::derive_telemetry_sources() {
     const long v = std::strtol(ms, nullptr, 10);
     if (v > 0) telemetry_interval_ms = static_cast<unsigned int>(v);
   }
+
+#if defined(DATACRUMBS_ENABLE_HW_COUNTERS) && (DATACRUMBS_ENABLE_HW_COUNTERS == 1)
+  // Uncore PMU events sampled system-wide as one perf-backed track.
+  if (!uncore_events.empty()) {
+    TelemetrySource src;
+    src.cat = "uncore";
+    src.name = "uncore";
+    for (const auto& ev : uncore_events) {
+      TelemetryCounter c;
+      c.label = ev;
+      c.perf_event = ev;
+      src.counters.push_back(std::move(c));
+    }
+    telemetry_sources.push_back(std::move(src));
+  }
+#endif
+
   const char* devs = std::getenv("DATACRUMBS_NIC_DEVICES");
   if (devs == nullptr || *devs == '\0') return;
 

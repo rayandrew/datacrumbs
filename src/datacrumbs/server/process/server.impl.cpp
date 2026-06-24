@@ -3,6 +3,7 @@
 #include <datacrumbs/common/runtime_configuration_manager.h>
 #include <datacrumbs/common/singleton.h>
 #include <datacrumbs/server/process/event_processor.h>
+#include <datacrumbs/server/process/telemetry/perf_telemetry_sampler.h>
 #include <datacrumbs/server/process/telemetry/telemetry_sampler.h>
 
 // std headers
@@ -768,10 +769,33 @@ static int main_process(datacrumbs::EventProcessor* event_processor) {
               event_processor->configManager_->run_id.c_str(),
               event_processor->configManager_->trace_file_path.c_str());
 
-  datacrumbs::TelemetrySampler telemetry_sampler(
-      event_processor->writer_, event_processor->configManager_->telemetry_sources,
-      event_processor->configManager_->telemetry_interval_ms, &event_processor->event_index);
-  telemetry_sampler.start();
+  // Split telemetry tracks by read mechanism: sysfs counters vs perf (uncore).
+  std::vector<datacrumbs::TelemetrySource> sysfs_sources;
+#if defined(DATACRUMBS_ENABLE_HW_COUNTERS) && (DATACRUMBS_ENABLE_HW_COUNTERS == 1)
+  std::vector<datacrumbs::TelemetrySource> perf_sources;
+#endif
+  for (const auto& src : event_processor->configManager_->telemetry_sources) {
+    const bool is_perf = !src.counters.empty() && !src.counters[0].perf_event.empty();
+#if defined(DATACRUMBS_ENABLE_HW_COUNTERS) && (DATACRUMBS_ENABLE_HW_COUNTERS == 1)
+    if (is_perf) {
+      perf_sources.push_back(src);
+      continue;
+    }
+#else
+    (void)is_perf;
+#endif
+    sysfs_sources.push_back(src);
+  }
+  const unsigned int telemetry_interval = event_processor->configManager_->telemetry_interval_ms;
+  datacrumbs::SysfsTelemetrySampler sysfs_sampler(event_processor->writer_,
+                                                  std::move(sysfs_sources), telemetry_interval,
+                                                  &event_processor->event_index);
+  sysfs_sampler.start();
+#if defined(DATACRUMBS_ENABLE_HW_COUNTERS) && (DATACRUMBS_ENABLE_HW_COUNTERS == 1)
+  datacrumbs::PerfTelemetrySampler perf_sampler(event_processor->writer_, std::move(perf_sources),
+                                                telemetry_interval, &event_processor->event_index);
+  perf_sampler.start();
+#endif
 
   signal(SIGINT, sig_handler);
   unsigned int batch_size = 1024;
@@ -927,7 +951,10 @@ static int main_process(datacrumbs::EventProcessor* event_processor) {
   if (stop) {
     DC_LOG_INFO("Received SIGINT (Ctrl-C), exiting gracefully");
   }
-  telemetry_sampler.stop();
+  sysfs_sampler.stop();
+#if defined(DATACRUMBS_ENABLE_HW_COUNTERS) && (DATACRUMBS_ENABLE_HW_COUNTERS == 1)
+  perf_sampler.stop();
+#endif
   timer.resumeTime();
   event_processor->finalize();
   {

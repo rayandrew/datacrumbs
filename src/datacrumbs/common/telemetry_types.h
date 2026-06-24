@@ -7,13 +7,15 @@
 
 namespace datacrumbs {
 
-// One sampled sysfs counter -> one series of a Chrome counter track. The sampler
-// reads `path` each interval and emits the per-interval delta * scale as `label`.
-// scale != 1 handles unit conversion (IB *_data counters are in 4-octet units).
+// One sampled counter -> one series of a Chrome counter track. The sampler emits
+// the per-interval delta * scale as `label`. A counter reads either a sysfs file
+// (`path`) or, when `perf_event` is set, a system-wide perf event by libpfm4 name
+// (uncore PMUs). scale != 1 handles unit conversion (IB *_data are 4-octet units).
 struct TelemetryCounter {
   std::string label;
   std::string path;
   double scale = 1.0;
+  std::string perf_event;
 };
 
 // One telemetry source -> one Chrome counter track (cat/name). event_id is a
