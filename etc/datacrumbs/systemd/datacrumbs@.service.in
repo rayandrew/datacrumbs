@@ -4,7 +4,8 @@ After=network.target
 
 [Service]
 Type=simple
-User=root
+User=@DATACRUMBS_SERVICE_USER@
+@DATACRUMBS_SERVICE_CAP_DIRECTIVES@
 EnvironmentFile=-@DATACRUMBS_SERVER_RUN_DIR@/datacrumbs-%i.env
 ExecStartPre=/usr/bin/rm -f @DATACRUMBS_SERVER_RUN_DIR@/datacrumbs-%i.ready
 ExecStartPre=/bin/sh -c 'mkdir -p "${DATACRUMBS_LOG_DIR}"'

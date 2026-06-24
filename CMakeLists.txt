@@ -87,6 +87,17 @@ set(DATACRUMBS_KERNEL_HEADERS_PATH "" CACHE PATH "Override path to the kernel he
 set(DATACRUMBS_HOST "NONE" CACHE STRING "Host name for datacrumbs")
 set(DATACRUMBS_USER "$ENV{USER}" CACHE STRING "User name for datacrumbs")
 set(DATACRUMBS_INSTALL_USER "$ENV{USER}" CACHE STRING "Installation user name for datacrumbs")
+set(DATACRUMBS_SERVICE_USER "root" CACHE STRING "User the datacrumbs systemd services run as")
+set(DATACRUMBS_SERVICE_CAPS
+    "CAP_BPF CAP_PERFMON CAP_SYS_ADMIN CAP_SYS_RESOURCE CAP_NET_ADMIN CAP_SYSLOG"
+    CACHE STRING "Capabilities granted to a non-root datacrumbs service user")
+if(DATACRUMBS_SERVICE_USER STREQUAL "root")
+  set(DATACRUMBS_SERVICE_CAP_DIRECTIVES "")
+else()
+  set(DATACRUMBS_SERVICE_CAP_DIRECTIVES
+"AmbientCapabilities=${DATACRUMBS_SERVICE_CAPS}
+CapabilityBoundingSet=${DATACRUMBS_SERVICE_CAPS}")
+endif()
 set(DATACRUMBS_SCHEDULER_TYPE "FLUX" CACHE STRING "Scheduler type for datacrumbs")
 set_property(CACHE DATACRUMBS_SCHEDULER_TYPE PROPERTY STRINGS FLUX SLURM OPENMPI NONE)
 set(DATACRUMBS_SCHEDULER_JOBID_ENV_VAR "NONE" CACHE STRING "Scheduler job ID environment variable name")

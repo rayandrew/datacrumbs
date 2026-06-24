@@ -4,7 +4,7 @@ After=network.target
 
 [Service]
 Type=simple
-User=root
+User=@DATACRUMBS_SERVICE_USER@
 ExecStart=@DATACRUMBS_INSTALL_SBINARYDIR@/datacrumbs_probe_manager
 Restart=on-failure
 RestartSec=2s
