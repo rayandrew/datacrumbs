@@ -208,60 +208,117 @@ static inline __attribute__((always_inline)) void hwc_notify_pid(u32 tid, u32 op
   bpf_ringbuf_submit(n, 0);
 }
 
-// Snapshot the active counters at function entry. The primary snapshot is
-// task-scoped for TASK/BOTH and per-cpu for CPU; BOTH also snapshots per-cpu.
+#define DC_STRINGIFY_(x) #x
+#define DC_STRINGIFY(x) DC_STRINGIFY_(x)
+#define DC_UNROLL_HW_SLOTS \
+  _Pragma(DC_STRINGIFY(clang loop unroll_count(DATACRUMBS_HW_COUNTER_SLOTS)))
+
+// Snapshot `active` counters from a perf array (base = first slot index) into
+// the ctr/ena/run arrays; returns a mask of the slots read.
+static inline __attribute__((always_inline)) u32 hwc_read_full(void* map, u64 base, u32 active,
+                                                               u64* ctr, u64* ena, u64* run) {
+  u32 mask = 0;
+  DC_UNROLL_HW_SLOTS
+  for (int s = 0; s < DATACRUMBS_HW_COUNTER_SLOTS; ++s) {
+    if ((u32)s >= active) break;
+    struct bpf_perf_event_value val = {};
+    if (bpf_perf_event_read_value(map, base + (u32)s, &val, sizeof(val)) == 0) {
+      ctr[s] = val.counter;
+      ena[s] = val.enabled;
+      run[s] = val.running;
+      mask |= (1u << s);
+    }
+  }
+  return mask;
+}
+
+// As hwc_read_full but only the counter value (the per-cpu snapshot in BOTH).
+static inline __attribute__((always_inline)) u32 hwc_read_ctr(void* map, u64 base, u32 active,
+                                                              u64* ctr) {
+  u32 mask = 0;
+  DC_UNROLL_HW_SLOTS
+  for (int s = 0; s < DATACRUMBS_HW_COUNTER_SLOTS; ++s) {
+    if ((u32)s >= active) break;
+    struct bpf_perf_event_value val = {};
+    if (bpf_perf_event_read_value(map, base + (u32)s, &val, sizeof(val)) == 0) {
+      ctr[s] = val.counter;
+      mask |= (1u << s);
+    }
+  }
+  return mask;
+}
+
+// Read at exit and write per-slot deltas vs the entry snapshot (only slots set
+// in entry_mask); returns a mask of the slots written.
+static inline __attribute__((always_inline)) u32 hwc_delta_full(void* map, u64 base, u32 active,
+                                                                u32 entry_mask, const u64* ectr,
+                                                                const u64* eena, const u64* erun,
+                                                                u64* dctr, u64* dena, u64* drun) {
+  u32 mask = 0;
+  DC_UNROLL_HW_SLOTS
+  for (int s = 0; s < DATACRUMBS_HW_COUNTER_SLOTS; ++s) {
+    if ((u32)s >= active) break;
+    struct bpf_perf_event_value val = {};
+    if ((entry_mask & (1u << s)) &&
+        bpf_perf_event_read_value(map, base + (u32)s, &val, sizeof(val)) == 0) {
+      dctr[s] = val.counter - ectr[s];
+      dena[s] = val.enabled - eena[s];
+      drun[s] = val.running - erun[s];
+      mask |= (1u << s);
+    }
+  }
+  return mask;
+}
+
+// As hwc_delta_full but only the counter delta (the per-cpu delta in BOTH).
+static inline __attribute__((always_inline)) u32 hwc_delta_ctr(void* map, u64 base, u32 active,
+                                                               u32 entry_mask, const u64* ectr,
+                                                               u64* dctr) {
+  u32 mask = 0;
+  DC_UNROLL_HW_SLOTS
+  for (int s = 0; s < DATACRUMBS_HW_COUNTER_SLOTS; ++s) {
+    if ((u32)s >= active) break;
+    struct bpf_perf_event_value val = {};
+    if ((entry_mask & (1u << s)) &&
+        bpf_perf_event_read_value(map, base + (u32)s, &val, sizeof(val)) == 0) {
+      dctr[s] = val.counter - ectr[s];
+      mask |= (1u << s);
+    }
+  }
+  return mask;
+}
+
+// Snapshot the active counters at function entry.
 static inline __attribute__((always_inline)) void hwc_read_entry(struct fn_value_t* fn) {
   const u32 active = hwc_active_count();
   const u32 scope = hwc_scope();
   const u32 cpu = bpf_get_smp_processor_id();
+  const u64 cpu_base = (u64)cpu * DATACRUMBS_HW_COUNTER_SLOTS;
   fn->hwc_entry_cpu = cpu;
   fn->hwc_entry_valid_mask = 0;
   fn->hwc_cpu_entry_valid_mask = 0;
   if (scope != 0) {  // task or both: primary is the task counter
-    const u32 tid = (u32)bpf_get_current_pid_tgid();
-    const int slot = hwc_task_slot_of(tid);
-    if (slot >= 0) {
-#pragma unroll
-      for (int s = 0; s < DATACRUMBS_HW_COUNTER_SLOTS; ++s) {
-        if ((u32)s >= active) break;
-        struct bpf_perf_event_value val = {};
-        u64 idx = (u64)slot * DATACRUMBS_HW_COUNTER_SLOTS + (u32)s;
-        if (bpf_perf_event_read_value(&hwc_pmu_task, idx, &val, sizeof(val)) == 0) {
-          fn->hwc_ctr[s] = val.counter;
-          fn->hwc_enabled[s] = val.enabled;
-          fn->hwc_running[s] = val.running;
-          fn->hwc_entry_valid_mask |= (1u << s);
-        }
-      }
-    }
+    const int slot = hwc_task_slot_of((u32)bpf_get_current_pid_tgid());
+    if (slot >= 0)
+      fn->hwc_entry_valid_mask =
+          hwc_read_full(&hwc_pmu_task, (u64)slot * DATACRUMBS_HW_COUNTER_SLOTS, active, fn->hwc_ctr,
+                        fn->hwc_enabled, fn->hwc_running);
   }
-  if (scope != 1) {  // cpu or both: per-cpu into primary (cpu) or cpu fields (both)
-#pragma unroll
-    for (int s = 0; s < DATACRUMBS_HW_COUNTER_SLOTS; ++s) {
-      if ((u32)s >= active) break;
-      struct bpf_perf_event_value val = {};
-      u64 idx = (u64)cpu * DATACRUMBS_HW_COUNTER_SLOTS + (u32)s;
-      if (bpf_perf_event_read_value(&hwc_pmu, idx, &val, sizeof(val)) != 0) continue;
-      if (scope == 0) {
-        fn->hwc_ctr[s] = val.counter;
-        fn->hwc_enabled[s] = val.enabled;
-        fn->hwc_running[s] = val.running;
-        fn->hwc_entry_valid_mask |= (1u << s);
-      } else {
-        fn->hwc_cpu_ctr[s] = val.counter;
-        fn->hwc_cpu_entry_valid_mask |= (1u << s);
-      }
-    }
+  if (scope == 0) {  // cpu: primary is the per-cpu counter
+    fn->hwc_entry_valid_mask =
+        hwc_read_full(&hwc_pmu, cpu_base, active, fn->hwc_ctr, fn->hwc_enabled, fn->hwc_running);
+  } else if (scope == 2) {  // both: also snapshot per-cpu into the cpu fields
+    fn->hwc_cpu_entry_valid_mask = hwc_read_ctr(&hwc_pmu, cpu_base, active, fn->hwc_cpu_ctr);
   }
 }
 
-// Compute per-call deltas at exit. Per-cpu reads are invalidated on cpu
-// migration; task reads follow the thread and are not.
+// Compute per-call deltas at exit.
 static inline __attribute__((always_inline)) void hwc_fill_exit(const struct fn_value_t* fn,
                                                                 struct generic_event_t* event) {
   const u32 active = hwc_active_count();
   const u32 scope = hwc_scope();
   const u32 cpu = bpf_get_smp_processor_id();
+  const u64 cpu_base = (u64)cpu * DATACRUMBS_HW_COUNTER_SLOTS;
   event->hwc_migrated = (cpu != fn->hwc_entry_cpu) ? 1 : 0;
   event->hwc_valid_mask = 0;
   event->hwc_cpu_valid_mask = 0;
@@ -273,46 +330,22 @@ static inline __attribute__((always_inline)) void hwc_fill_exit(const struct fn_
     event->hwc_cpu_delta[s] = 0;
   }
   if (scope != 0) {  // task or both: primary is the task counter
-    const u32 tid = (u32)bpf_get_current_pid_tgid();
-    const int slot = hwc_task_slot_of(tid);
-    if (slot >= 0) {
-#pragma unroll
-      for (int s = 0; s < DATACRUMBS_HW_COUNTER_SLOTS; ++s) {
-        if ((u32)s >= active) break;
-        if (!(fn->hwc_entry_valid_mask & (1u << s))) continue;
-        struct bpf_perf_event_value val = {};
-        u64 idx = (u64)slot * DATACRUMBS_HW_COUNTER_SLOTS + (u32)s;
-        if (bpf_perf_event_read_value(&hwc_pmu_task, idx, &val, sizeof(val)) == 0) {
-          event->hwc_delta[s] = val.counter - fn->hwc_ctr[s];
-          event->hwc_enabled_delta[s] = val.enabled - fn->hwc_enabled[s];
-          event->hwc_running_delta[s] = val.running - fn->hwc_running[s];
-          event->hwc_valid_mask |= (1u << s);
-        }
-      }
-    }
+    const int slot = hwc_task_slot_of((u32)bpf_get_current_pid_tgid());
+    if (slot >= 0)
+      event->hwc_valid_mask =
+          hwc_delta_full(&hwc_pmu_task, (u64)slot * DATACRUMBS_HW_COUNTER_SLOTS, active,
+                         fn->hwc_entry_valid_mask, fn->hwc_ctr, fn->hwc_enabled, fn->hwc_running,
+                         event->hwc_delta, event->hwc_enabled_delta, event->hwc_running_delta);
   }
-  if (scope != 1 && !event->hwc_migrated) {  // cpu or both
-#pragma unroll
-    for (int s = 0; s < DATACRUMBS_HW_COUNTER_SLOTS; ++s) {
-      if ((u32)s >= active) break;
-      struct bpf_perf_event_value val = {};
-      u64 idx = (u64)cpu * DATACRUMBS_HW_COUNTER_SLOTS + (u32)s;
-      if (scope == 0) {  // primary is the per-cpu counter
-        if (!(fn->hwc_entry_valid_mask & (1u << s))) continue;
-        if (bpf_perf_event_read_value(&hwc_pmu, idx, &val, sizeof(val)) == 0) {
-          event->hwc_delta[s] = val.counter - fn->hwc_ctr[s];
-          event->hwc_enabled_delta[s] = val.enabled - fn->hwc_enabled[s];
-          event->hwc_running_delta[s] = val.running - fn->hwc_running[s];
-          event->hwc_valid_mask |= (1u << s);
-        }
-      } else {  // both: per-cpu into the cpu fields
-        if (!(fn->hwc_cpu_entry_valid_mask & (1u << s))) continue;
-        if (bpf_perf_event_read_value(&hwc_pmu, idx, &val, sizeof(val)) == 0) {
-          event->hwc_cpu_delta[s] = val.counter - fn->hwc_cpu_ctr[s];
-          event->hwc_cpu_valid_mask |= (1u << s);
-        }
-      }
-    }
+  if (event->hwc_migrated) return;  // per-cpu deltas are meaningless across migration
+  if (scope == 0) {                 // cpu: primary is the per-cpu counter
+    event->hwc_valid_mask = hwc_delta_full(
+        &hwc_pmu, cpu_base, active, fn->hwc_entry_valid_mask, fn->hwc_ctr, fn->hwc_enabled,
+        fn->hwc_running, event->hwc_delta, event->hwc_enabled_delta, event->hwc_running_delta);
+  } else if (scope == 2) {  // both: per-cpu delta into the cpu fields
+    event->hwc_cpu_valid_mask =
+        hwc_delta_ctr(&hwc_pmu, cpu_base, active, fn->hwc_cpu_entry_valid_mask, fn->hwc_cpu_ctr,
+                      event->hwc_cpu_delta);
   }
 }
 #else
