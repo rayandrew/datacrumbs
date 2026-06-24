@@ -724,6 +724,7 @@ bool ProbeManagerService::validate_signing_payload(const std::string& signing_pa
           errors->push_back(context + ".functions must not be empty");
           ok = false;
         }
+        json_object* valid_functions = json_object_new_array();
         for (int fidx = 0; fidx < function_count; ++fidx) {
           json_object* function_obj = json_object_array_get_idx(functions_obj, fidx);
           const std::string function_context = context + ".functions[" + std::to_string(fidx) + "]";
@@ -736,10 +737,18 @@ bool ProbeManagerService::validate_signing_payload(const std::string& signing_pa
           const std::string function_name = json_object_get_string(function_obj);
           if (!kernel_symbols.empty() &&
               !is_valid_kernel_function(kernel_symbols, probe_type, function_name)) {
-            errors->push_back(function_context + " kernel symbol not found in /proc/kallsyms: '" +
-                              function_name + "'");
-            ok = false;
+            DC_LOG_WARN("[ProbeManager] %s dropping kernel symbol not in /proc/kallsyms: '%s'",
+                        function_context.c_str(), function_name.c_str());
+            continue;
           }
+          json_object_array_add(valid_functions, json_object_get(function_obj));
+        }
+        if (function_count > 0 && json_object_array_length(valid_functions) == 0) {
+          errors->push_back(context + ".functions has no valid kernel symbols (all dropped)");
+          ok = false;
+          json_object_put(valid_functions);
+        } else {
+          json_object_object_add(probe, "functions", valid_functions);
         }
       }
 
