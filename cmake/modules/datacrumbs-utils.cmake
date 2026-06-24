@@ -101,9 +101,10 @@ macro(include_dependencies)
 
   if(LLVM_FOUND)
     include_directories(${LLVM_INCLUDE_DIRS})
-    link_directories(${LLVM_LIBRARY_DIRS})
-    list(APPEND DEPENDENCY_LIBRARY_DIRS ${LLVM_LIBRARY_DIRS})
-    set(DEPENDENCY_LIB ${DEPENDENCY_LIB} ${LLVM_LIBRARIES} -lclang)
+    # Only the clang executable is needed (to compile the BPF object); the core
+    # links no LLVM/libclang API, so it is not added to DEPENDENCY_LIB. This keeps
+    # the server free of an unused libclang runtime dependency and lets it cross-
+    # compile without a target-arch LLVM.
     set(CLANG_EXECUTABLE ${LLVM_TOOLS_BINARY_DIR}/clang)
 
     if(NOT EXISTS ${CLANG_EXECUTABLE})
