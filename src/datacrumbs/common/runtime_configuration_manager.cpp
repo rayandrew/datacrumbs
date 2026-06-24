@@ -566,6 +566,18 @@ void RuntimeConfigurationManager::derive_configurations() {
   }
 #endif
 
+  hw_scope = HwScope::TASK;
+  if (const char* scope = std::getenv("DATACRUMBS_HW_SCOPE")) {
+    std::string s(scope);
+    for (auto& c : s) c = std::tolower(c);
+    if (s == "cpu")
+      hw_scope = HwScope::CPU;
+    else if (s == "both")
+      hw_scope = HwScope::BOTH;
+    else
+      hw_scope = HwScope::TASK;
+  }
+
   derive_telemetry_sources();
 }
 

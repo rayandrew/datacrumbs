@@ -10,6 +10,16 @@ static int DATACRUMBS_FAILED_EVENTS_KEY = 2;
 #define DATACRUMBS_MAX_CAPTURE_ARGS 5
 #define DATACRUMBS_MAX_CAPTURE_BYTES 64
 
+#if defined(DATACRUMBS_ENABLE_HW_COUNTERS) && (DATACRUMBS_ENABLE_HW_COUNTERS == 1)
+// Max concurrently traced threads holding per-task counter events (TASK/BOTH).
+#define DATACRUMBS_HW_TASK_SLOTS 64
+// BPF -> userspace notice to open/close per-task counter events for a tid.
+struct hwc_pid_notify_t {
+  unsigned int op;  // 1 = add (open events), 0 = remove (close events)
+  unsigned int tid;
+};
+#endif
+
 enum datacrumbs_runtime_probe_kind_t {
   DATACRUMBS_RUNTIME_PROBE_KIND_KPROBE = 1,
   DATACRUMBS_RUNTIME_PROBE_KIND_UPROBE = 2,
@@ -29,13 +39,16 @@ struct generic_event_t {
   unsigned int arg_data_status[DATACRUMBS_MAX_CAPTURE_ARGS];
   unsigned char arg_data[DATACRUMBS_MAX_CAPTURE_ARGS][DATACRUMBS_MAX_CAPTURE_BYTES];
 #if defined(DATACRUMBS_ENABLE_HW_COUNTERS) && (DATACRUMBS_ENABLE_HW_COUNTERS == 1)
-  // Per-call hardware PMU counter deltas (exit - entry), one slot per configured
-  // counter. enabled/running deltas allow scaling if the counter was multiplexed.
+  // Primary per-call counter deltas (exit - entry): task-scoped for TASK/BOTH,
+  // per-cpu for CPU. enabled/running deltas allow scaling if multiplexed.
   unsigned long long hwc_delta[DATACRUMBS_HW_COUNTER_SLOTS];
   unsigned long long hwc_enabled_delta[DATACRUMBS_HW_COUNTER_SLOTS];
   unsigned long long hwc_running_delta[DATACRUMBS_HW_COUNTER_SLOTS];
   unsigned int hwc_valid_mask;  // bit i set => hwc_delta[i] is trustworthy
-  unsigned int hwc_migrated;    // 1 => thread changed cpu entry->exit (deltas suspect)
+  unsigned int hwc_migrated;    // 1 => thread changed cpu entry->exit (cpu read suspect)
+  // Per-cpu deltas, populated only in BOTH so interference = cpu - primary.
+  unsigned long long hwc_cpu_delta[DATACRUMBS_HW_COUNTER_SLOTS];
+  unsigned int hwc_cpu_valid_mask;
 #endif
 };
 typedef struct generic_event_t general_event_t;
@@ -69,6 +82,9 @@ struct fn_value_t {
   unsigned long long hwc_running[DATACRUMBS_HW_COUNTER_SLOTS];
   unsigned int hwc_entry_cpu;         // cpu id at entry (migration detection)
   unsigned int hwc_entry_valid_mask;  // bit i set => entry read of slot i succeeded
+  // Per-cpu entry snapshot, used only in BOTH (primary holds the task snapshot).
+  unsigned long long hwc_cpu_ctr[DATACRUMBS_HW_COUNTER_SLOTS];
+  unsigned int hwc_cpu_entry_valid_mask;
 #endif
 };
 

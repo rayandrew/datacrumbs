@@ -85,34 +85,42 @@ std::unique_ptr<DataCrumbsArgs> build_runtime_args(
 }
 
 #if defined(DATACRUMBS_ENABLE_HW_COUNTERS) && (DATACRUMBS_ENABLE_HW_COUNTERS == 1)
-// Append per-call hardware counter deltas to the event args, labeled by their
-// configured event name (slot i -> names[i]). Only valid slots are emitted; a
-// cpu migration between entry and exit is flagged so analysis can discard it.
+// Append per-call counter deltas, labeled by event name (slot i -> names[i]).
+// Primary deltas go under args.hw (task-scoped for TASK/BOTH) or args.hwcpu
+// (per-cpu for CPU). BOTH also emits args.hwcpu so interference = hwcpu - hw.
+// enabled/running are exposed only when a counter was multiplexed (so it can be
+// scaled), which should not happen within the PMU's physical counter budget.
 void append_hw_counter_args(DataCrumbsArgs* args, const generic_event_t* event,
-                            const std::vector<std::string>& names) {
+                            const std::vector<std::string>& names,
+                            RuntimeConfigurationManager::HwScope scope) {
   if (args == nullptr || event == nullptr) return;
-  // Group all hardware-counter data under a nested "hw" object so it never
-  // collides with captured function arguments: args.hw = { "<event>": delta, ... }
-  DataCrumbsArgs hw;
-  if (event->hwc_migrated) {
-    hw.emplace("migrated", static_cast<unsigned int>(1));
-  }
+  using HwScope = RuntimeConfigurationManager::HwScope;
   const unsigned int n = std::min<unsigned int>(names.size(), DATACRUMBS_HW_COUNTER_SLOTS);
+  const bool cpu_primary = scope == HwScope::CPU;
+
+  DataCrumbsArgs primary;
+  if (cpu_primary && event->hwc_migrated) primary.emplace("migrated", static_cast<unsigned int>(1));
   for (unsigned int i = 0; i < n; ++i) {
     if (!(event->hwc_valid_mask & (1u << i))) continue;
-    hw.emplace(names[i], static_cast<unsigned long long>(event->hwc_delta[i]));
-    // If the counter was multiplexed during the call (ran for less than it was
-    // enabled), expose enabled/running so the value can be scaled. With <= the
-    // PMU's physical counter budget this should not happen.
     const unsigned long long ena = event->hwc_enabled_delta[i];
     const unsigned long long run = event->hwc_running_delta[i];
+    if (ena > 0 && run == 0) continue;  // fully multiplexed out: delta is unreliable
+    primary.emplace(names[i], static_cast<unsigned long long>(event->hwc_delta[i]));
     if (run > 0 && run < ena) {
-      hw.emplace(names[i] + ".enabled", ena);
-      hw.emplace(names[i] + ".running", run);
+      primary.emplace(names[i] + ".enabled", ena);
+      primary.emplace(names[i] + ".running", run);
     }
   }
-  if (!hw.empty()) {
-    args->emplace("hw", std::move(hw));
+  if (!primary.empty()) args->emplace(cpu_primary ? "hwcpu" : "hw", std::move(primary));
+
+  if (scope == HwScope::BOTH) {
+    DataCrumbsArgs cpu;
+    if (event->hwc_migrated) cpu.emplace("migrated", static_cast<unsigned int>(1));
+    for (unsigned int i = 0; i < n; ++i) {
+      if (!(event->hwc_cpu_valid_mask & (1u << i))) continue;
+      cpu.emplace(names[i], static_cast<unsigned long long>(event->hwc_cpu_delta[i]));
+    }
+    if (!cpu.empty()) args->emplace("hwcpu", std::move(cpu));
   }
 }
 #endif
@@ -161,7 +169,8 @@ int EventProcessor::handle_event(void* data, size_t data_sz) {
 #if defined(DATACRUMBS_ENABLE_HW_COUNTERS) && (DATACRUMBS_ENABLE_HW_COUNTERS == 1)
     if (!configManager_->hw_counter_events.empty()) {
       if (!runtime_args) runtime_args = std::make_unique<DataCrumbsArgs>();
-      append_hw_counter_args(runtime_args.get(), event, configManager_->hw_counter_events);
+      append_hw_counter_args(runtime_args.get(), event, configManager_->hw_counter_events,
+                             configManager_->hw_scope);
     }
 #endif
     auto write_event =

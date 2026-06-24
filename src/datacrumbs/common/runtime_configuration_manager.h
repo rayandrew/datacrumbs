@@ -51,6 +51,11 @@ class RuntimeConfigurationManager {
   // feature inactive. Resolved to perf encodings by libpfm4 at server startup.
   std::vector<std::string> hw_counter_events;
 
+  // In-band counter scope (DATACRUMBS_HW_SCOPE): CPU per-core, TASK per-thread
+  // (default), BOTH emits both so interference = cpu - task is per-call visible.
+  enum class HwScope { CPU, TASK, BOTH };
+  HwScope hw_scope = HwScope::TASK;
+
   // Device-telemetry counter tracks sampled in userspace (generic; NIC sysfs is
   // the first source). Populated from DATACRUMBS_NIC_DEVICES; event ids assigned
   // in load_runtime_probe_file() since it clears category_map after derive.

@@ -356,11 +356,12 @@ static int attach_runtime_probes(datacrumbs::EventProcessor* event_processor,
 }
 
 #if defined(DATACRUMBS_ENABLE_HW_COUNTERS) && (DATACRUMBS_ENABLE_HW_COUNTERS == 1)
-// Encode the configured PMU events via libpfm4, open one perf event per (cpu,
-// slot), insert the fds into hwc_pmu at index cpu*SLOTS+slot, and record the
-// active counter count in hwc_ctl. Returns 0 on success (including "no counters
-// configured"); negative on a hard error.
-static int setup_hw_counters(struct datacrumbs_bpf* skel, const std::vector<std::string>& events) {
+// Encode the configured PMU events via libpfm4 and record them in hwc_ctl
+// ([0]=count, [1]=scope). For CPU/BOTH, open one per-cpu event per (cpu, slot)
+// into hwc_pmu. The encoded attrs are returned in out_attrs so per-task events
+// can be opened lazily per traced tid (TASK/BOTH). 0 on success (incl. none).
+static int setup_hw_counters(struct datacrumbs_bpf* skel, const std::vector<std::string>& events,
+                             int scope, std::vector<struct perf_event_attr>* out_attrs) {
   if (events.empty()) {
     DC_LOG_INFO("HW counters: none configured");
     return 0;
@@ -419,44 +420,135 @@ static int setup_hw_counters(struct datacrumbs_bpf* skel, const std::vector<std:
       return -1;
     }
     attr.disabled = 0;  // count immediately
-    attr.inherit = 0;   // per-cpu events cannot inherit
+    attr.inherit = 0;
+    if (out_attrs) out_attrs->push_back(attr);  // for per-task reopening (TASK/BOTH)
 
-    int opened = 0;
-    for (int cpu = 0; cpu < ncpu; ++cpu) {
-      int fd = syscall(__NR_perf_event_open, &attr, /*pid=*/-1, cpu, /*group_fd=*/-1, /*flags=*/0);
-      if (fd < 0) {
-        if (cpu == 0) {
-          DC_LOG_ERROR(
-              "HW counter '%s': perf_event_open(cpu=0) failed: %s. Check "
-              "/proc/sys/kernel/perf_event_paranoid (needs <=0, or CAP_PERFMON/root) and that the "
-              "PMU exposes this event.",
-              name.c_str(), strerror(errno));
+    if (scope != 1) {  // CPU or BOTH: open one per-cpu event per cpu
+      int opened = 0;
+      for (int cpu = 0; cpu < ncpu; ++cpu) {
+        int fd =
+            syscall(__NR_perf_event_open, &attr, /*pid=*/-1, cpu, /*group_fd=*/-1, /*flags=*/0);
+        if (fd < 0) {
+          if (cpu == 0) {
+            DC_LOG_ERROR(
+                "HW counter '%s': perf_event_open(cpu=0) failed: %s. Check "
+                "/proc/sys/kernel/perf_event_paranoid (needs <=0, or CAP_PERFMON/root) and that "
+                "the "
+                "PMU exposes this event.",
+                name.c_str(), strerror(errno));
+            return -1;
+          }
+          continue;  // offline cpu etc.
+        }
+        unsigned int idx = (unsigned int)cpu * DATACRUMBS_HW_COUNTER_SLOTS + active;
+        if (bpf_map_update_elem(pmu_fd, &idx, &fd, BPF_ANY) != 0) {
+          DC_LOG_ERROR("HW counter '%s': hwc_pmu update failed at cpu=%d: %s", name.c_str(), cpu,
+                       strerror(errno));
+          close(fd);
           return -1;
         }
-        continue;  // offline cpu etc.
+        // fd kept open for the server's lifetime (closing it stops the counter).
+        ++opened;
       }
-      unsigned int idx = (unsigned int)cpu * DATACRUMBS_HW_COUNTER_SLOTS + active;
-      if (bpf_map_update_elem(pmu_fd, &idx, &fd, BPF_ANY) != 0) {
-        DC_LOG_ERROR("HW counter '%s': hwc_pmu update failed at cpu=%d: %s", name.c_str(), cpu,
-                     strerror(errno));
-        close(fd);
-        return -1;
-      }
-      // fd intentionally kept open for the lifetime of the server (closing it
-      // would stop the counter); the process exit reclaims it.
-      ++opened;
+      DC_LOG_INFO("HW counter[%u] '%s' opened on %d/%d cpus", active, name.c_str(), opened, ncpu);
     }
-    DC_LOG_INFO("HW counter[%u] '%s' opened on %d/%d cpus", active, name.c_str(), opened, ncpu);
     ++active;
   }
 
-  unsigned int key0 = 0;
-  if (bpf_map_update_elem(ctl_fd, &key0, &active, BPF_ANY) != 0) {
-    DC_LOG_ERROR("HW counters: failed to set active count in hwc_ctl");
+  unsigned int key0 = 0, key1 = 1, scope_u = (unsigned int)scope;
+  if (bpf_map_update_elem(ctl_fd, &key0, &active, BPF_ANY) != 0 ||
+      bpf_map_update_elem(ctl_fd, &key1, &scope_u, BPF_ANY) != 0) {
+    DC_LOG_ERROR("HW counters: failed to set hwc_ctl");
     return -1;
   }
-  DC_LOG_PRINT("HW counters active: %u (compiled slots: %d)", active,
+  const char* scope_name = scope == 0 ? "cpu" : (scope == 1 ? "task" : "both");
+  DC_LOG_PRINT("HW counters active: %u (scope=%s, compiled slots: %d)", active, scope_name,
                (int)DATACRUMBS_HW_COUNTER_SLOTS);
+  return 0;
+}
+
+// Opens per-task counter events on demand for TASK/BOTH. On a BPF notice it
+// opens one event per active counter for the tid (pid=tid, cpu=-1) into
+// hwc_pmu_task[slot*SLOTS+s], then publishes tid->slot so BPF starts reading.
+struct HwTaskManager {
+  int pmu_task_fd = -1;
+  int slot_map_fd = -1;
+  std::vector<struct perf_event_attr> attrs;
+  std::vector<bool> slot_used;
+  std::unordered_map<unsigned int, std::pair<unsigned int, std::vector<int>>> open;
+
+  void init(struct datacrumbs_bpf* skel, std::vector<struct perf_event_attr> a) {
+    pmu_task_fd = bpf_map__fd(skel->maps.hwc_pmu_task);
+    slot_map_fd = bpf_map__fd(skel->maps.hwc_task_slot);
+    attrs = std::move(a);
+    slot_used.assign(DATACRUMBS_HW_TASK_SLOTS, false);
+  }
+
+  int alloc_slot() {
+    for (int i = 0; i < (int)slot_used.size(); ++i)
+      if (!slot_used[i]) {
+        slot_used[i] = true;
+        return i;
+      }
+    return -1;
+  }
+
+  void add(unsigned int tid) {
+    if (open.count(tid)) return;  // duplicate notice
+    int slot = alloc_slot();
+    if (slot < 0) {
+      DC_LOG_WARN("HW task counters: no free slot for tid=%u (raise DATACRUMBS_HW_TASK_SLOTS)",
+                  tid);
+      return;
+    }
+    std::vector<int> fds;
+    for (unsigned int s = 0; s < attrs.size(); ++s) {
+      struct perf_event_attr attr = attrs[s];
+      int fd = syscall(__NR_perf_event_open, &attr, (pid_t)tid, /*cpu=*/-1, /*group_fd=*/-1, 0);
+      if (fd < 0) {
+        DC_LOG_WARN("HW task counters: perf_event_open(tid=%u) failed: %s", tid, strerror(errno));
+        for (int f : fds) close(f);
+        slot_used[slot] = false;
+        return;
+      }
+      unsigned int idx = (unsigned int)slot * DATACRUMBS_HW_COUNTER_SLOTS + s;
+      if (bpf_map_update_elem(pmu_task_fd, &idx, &fd, BPF_ANY) != 0) {
+        close(fd);
+        for (int f : fds) close(f);
+        slot_used[slot] = false;
+        return;
+      }
+      fds.push_back(fd);
+    }
+    unsigned int slot_u = (unsigned int)slot;
+    bpf_map_update_elem(slot_map_fd, &tid, &slot_u, BPF_ANY);  // BPF begins reading
+    open[tid] = {slot_u, std::move(fds)};
+  }
+
+  void remove(unsigned int tid) {
+    auto it = open.find(tid);
+    if (it == open.end()) return;
+    bpf_map_delete_elem(slot_map_fd, &tid);
+    for (int fd : it->second.second) close(fd);
+    slot_used[it->second.first] = false;
+    open.erase(it);
+  }
+
+  void cleanup() {
+    for (auto& kv : open)
+      for (int fd : kv.second.second) close(fd);
+    open.clear();
+  }
+};
+
+static int hwc_notify_cb(void* ctx, void* data, size_t sz) {
+  if (sz < sizeof(struct hwc_pid_notify_t)) return 0;
+  auto* mgr = (HwTaskManager*)ctx;
+  auto* n = (struct hwc_pid_notify_t*)data;
+  if (n->op == 1)
+    mgr->add(n->tid);
+  else
+    mgr->remove(n->tid);
   return 0;
 }
 #endif  // DATACRUMBS_ENABLE_HW_COUNTERS
@@ -469,6 +561,10 @@ static int main_process(datacrumbs::EventProcessor* event_processor) {
   struct datacrumbs_bpf* skel = nullptr;
   struct ring_buffer* rb = nullptr;
   int err = 0;
+#if defined(DATACRUMBS_ENABLE_HW_COUNTERS) && (DATACRUMBS_ENABLE_HW_COUNTERS == 1)
+  HwTaskManager hw_task_mgr;
+  bool hw_task_active = false;
+#endif
   libbpf_set_print(libbpf_print_fn);
 
   skel = datacrumbs_bpf__open();
@@ -484,6 +580,12 @@ static int main_process(datacrumbs::EventProcessor* event_processor) {
     if (bpf_map__set_max_entries(skel->maps.hwc_pmu,
                                  (unsigned int)ncpu * DATACRUMBS_HW_COUNTER_SLOTS) != 0) {
       DC_LOG_ERROR("Failed to size hwc_pmu map");
+      datacrumbs_bpf__destroy(skel);
+      return 1;
+    }
+    if (bpf_map__set_max_entries(skel->maps.hwc_pmu_task, (unsigned int)DATACRUMBS_HW_TASK_SLOTS *
+                                                              DATACRUMBS_HW_COUNTER_SLOTS) != 0) {
+      DC_LOG_ERROR("Failed to size hwc_pmu_task map");
       datacrumbs_bpf__destroy(skel);
       return 1;
     }
@@ -509,10 +611,19 @@ static int main_process(datacrumbs::EventProcessor* event_processor) {
   }
 
 #if defined(DATACRUMBS_ENABLE_HW_COUNTERS) && (DATACRUMBS_ENABLE_HW_COUNTERS == 1)
-  if (setup_hw_counters(skel, event_processor->configManager_->hw_counter_events) != 0) {
-    DC_LOG_ERROR("Failed to set up hardware counters");
-    datacrumbs_bpf__destroy(skel);
-    return 1;
+  {
+    std::vector<struct perf_event_attr> hw_attrs;
+    const int hw_scope = (int)event_processor->configManager_->hw_scope;  // 0 cpu,1 task,2 both
+    if (setup_hw_counters(skel, event_processor->configManager_->hw_counter_events, hw_scope,
+                          &hw_attrs) != 0) {
+      DC_LOG_ERROR("Failed to set up hardware counters");
+      datacrumbs_bpf__destroy(skel);
+      return 1;
+    }
+    if (hw_scope != 0 && !hw_attrs.empty()) {  // task or both: open per-task on demand
+      hw_task_mgr.init(skel, std::move(hw_attrs));
+      hw_task_active = true;
+    }
   }
 #endif
 
@@ -591,6 +702,15 @@ static int main_process(datacrumbs::EventProcessor* event_processor) {
     datacrumbs_bpf__destroy(skel);
     return 1;
   }
+#if defined(DATACRUMBS_ENABLE_HW_COUNTERS) && (DATACRUMBS_ENABLE_HW_COUNTERS == 1)
+  if (hw_task_active &&
+      ring_buffer__add(rb, bpf_map__fd(skel->maps.hwc_notify), hwc_notify_cb, &hw_task_mgr) != 0) {
+    DC_LOG_ERROR("Failed to add hw_notify ring buffer");
+    ring_buffer__free(rb);
+    datacrumbs_bpf__destroy(skel);
+    return 1;
+  }
+#endif
 #else
   INITIALIZE_MAP_1();
 #ifdef GET_DATA_2_EXISTS
@@ -817,6 +937,9 @@ static int main_process(datacrumbs::EventProcessor* event_processor) {
 
 #if defined(DATACRUMBS_MODE) && (DATACRUMBS_MODE == 1)
   ring_buffer__free(rb);
+#endif
+#if defined(DATACRUMBS_ENABLE_HW_COUNTERS) && (DATACRUMBS_ENABLE_HW_COUNTERS == 1)
+  hw_task_mgr.cleanup();
 #endif
   datacrumbs_bpf__destroy(skel);
 

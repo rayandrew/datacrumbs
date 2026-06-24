@@ -31,20 +31,33 @@ DATACRUMBS_MAP(latest_interval, int, unsigned long long, 128);
 DATACRUMBS_MAP(file_map, char[MAX_STR_READ_LEN], u32, 1024);
 
 #if defined(DATACRUMBS_ENABLE_HW_COUNTERS) && (DATACRUMBS_ENABLE_HW_COUNTERS == 1)
-// Hardware PMU counter fds, one perf event per (cpu, slot) at index
-// cpu*DATACRUMBS_HW_COUNTER_SLOTS + slot. max_entries (ncpu*SLOTS) is sized by
-// userspace before load.
+// Per-cpu counter fds at index cpu*SLOTS + slot. Sized (ncpu*SLOTS) by userspace.
 struct {
   __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
   __uint(key_size, sizeof(int));
   __uint(value_size, sizeof(int));
 } hwc_pmu SEC(".maps");
-// Control: index 0 holds the number of active counters (0..SLOTS), set by
-// userspace after load. Lets the BPF read loop touch only configured counters.
+// Per-task counter fds at index task_slot*SLOTS + slot. Sized (TASK_SLOTS*SLOTS).
+struct {
+  __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+  __uint(key_size, sizeof(int));
+  __uint(value_size, sizeof(int));
+} hwc_pmu_task SEC(".maps");
+// tid -> task_slot (0..TASK_SLOTS-1), maintained by userspace for TASK/BOTH.
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, DATACRUMBS_HW_TASK_SLOTS);
+  __type(key, u32);
+  __type(value, u32);
+} hwc_task_slot SEC(".maps");
+// Control: [0] = active counter count (0..SLOTS), [1] = scope (0 cpu, 1 task,
+// 2 both). Set by userspace; lets BPF read only what is configured.
 struct {
   __uint(type, BPF_MAP_TYPE_ARRAY);
-  __uint(max_entries, 1);
+  __uint(max_entries, 2);
   __type(key, u32);
   __type(value, u32);
 } hwc_ctl SEC(".maps");
+// BPF -> userspace notices to open/close per-task events on a tid.
+DATACRUMBS_RINGBUF(hwc_notify, 64 * 1024U);
 #endif

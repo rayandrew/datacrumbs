@@ -40,11 +40,23 @@ extern struct {
   __uint(value_size, sizeof(int));
 } hwc_pmu SEC(".maps");
 extern struct {
+  __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+  __uint(key_size, sizeof(int));
+  __uint(value_size, sizeof(int));
+} hwc_pmu_task SEC(".maps");
+extern struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, DATACRUMBS_HW_TASK_SLOTS);
+  __type(key, u32);
+  __type(value, u32);
+} hwc_task_slot SEC(".maps");
+extern struct {
   __uint(type, BPF_MAP_TYPE_ARRAY);
-  __uint(max_entries, 1);
+  __uint(max_entries, 2);
   __type(key, u32);
   __type(value, u32);
 } hwc_ctl SEC(".maps");
+DATACRUMBS_RINGBUF_EXTERN(hwc_notify, 64 * 1024U);
 #endif
 
 #if defined(DATACRUMBS_ENABLE_INCLUSION_PATH) && (DATACRUMBS_ENABLE_INCLUSION_PATH == 1)
@@ -170,49 +182,136 @@ static inline __attribute__((always_inline)) u32 hwc_active_count(void) {
   return n > DATACRUMBS_HW_COUNTER_SLOTS ? DATACRUMBS_HW_COUNTER_SLOTS : n;
 }
 
-// Snapshot the active counters at function entry into the per-call fn state.
+// 0 = cpu, 1 = task, 2 = both.
+static inline __attribute__((always_inline)) u32 hwc_scope(void) {
+  u32 key = 1;
+  u32* v = (u32*)bpf_map_lookup_elem(&hwc_ctl, &key);
+  return v ? *v : 0;
+}
+
+// Task slot for the current tid, or -1 if userspace has not opened events yet.
+static inline __attribute__((always_inline)) int hwc_task_slot_of(u32 tid) {
+  u32* s = (u32*)bpf_map_lookup_elem(&hwc_task_slot, &tid);
+  if (s == NULL) return -1;
+  u32 slot = *s;
+  return slot < DATACRUMBS_HW_TASK_SLOTS ? (int)slot : -1;
+}
+
+// Ask userspace to open (op=1) or close (op=0) per-task events for a tid.
+static inline __attribute__((always_inline)) void hwc_notify_pid(u32 tid, u32 op) {
+  if (hwc_scope() == 0) return;  // cpu scope needs no per-task events
+  struct hwc_pid_notify_t* n =
+      (struct hwc_pid_notify_t*)bpf_ringbuf_reserve(&hwc_notify, sizeof(*n), 0);
+  if (!n) return;
+  n->op = op;
+  n->tid = tid;
+  bpf_ringbuf_submit(n, 0);
+}
+
+// Snapshot the active counters at function entry. The primary snapshot is
+// task-scoped for TASK/BOTH and per-cpu for CPU; BOTH also snapshots per-cpu.
 static inline __attribute__((always_inline)) void hwc_read_entry(struct fn_value_t* fn) {
   const u32 active = hwc_active_count();
+  const u32 scope = hwc_scope();
   const u32 cpu = bpf_get_smp_processor_id();
   fn->hwc_entry_cpu = cpu;
   fn->hwc_entry_valid_mask = 0;
+  fn->hwc_cpu_entry_valid_mask = 0;
+  if (scope != 0) {  // task or both: primary is the task counter
+    const u32 tid = (u32)bpf_get_current_pid_tgid();
+    const int slot = hwc_task_slot_of(tid);
+    if (slot >= 0) {
 #pragma unroll
-  for (int s = 0; s < DATACRUMBS_HW_COUNTER_SLOTS; ++s) {
-    if ((u32)s >= active) break;
-    struct bpf_perf_event_value val = {};
-    u64 idx = (u64)cpu * DATACRUMBS_HW_COUNTER_SLOTS + (u32)s;
-    if (bpf_perf_event_read_value(&hwc_pmu, idx, &val, sizeof(val)) == 0) {
-      fn->hwc_ctr[s] = val.counter;
-      fn->hwc_enabled[s] = val.enabled;
-      fn->hwc_running[s] = val.running;
-      fn->hwc_entry_valid_mask |= (1u << s);
+      for (int s = 0; s < DATACRUMBS_HW_COUNTER_SLOTS; ++s) {
+        if ((u32)s >= active) break;
+        struct bpf_perf_event_value val = {};
+        u64 idx = (u64)slot * DATACRUMBS_HW_COUNTER_SLOTS + (u32)s;
+        if (bpf_perf_event_read_value(&hwc_pmu_task, idx, &val, sizeof(val)) == 0) {
+          fn->hwc_ctr[s] = val.counter;
+          fn->hwc_enabled[s] = val.enabled;
+          fn->hwc_running[s] = val.running;
+          fn->hwc_entry_valid_mask |= (1u << s);
+        }
+      }
+    }
+  }
+  if (scope != 1) {  // cpu or both: per-cpu into primary (cpu) or cpu fields (both)
+#pragma unroll
+    for (int s = 0; s < DATACRUMBS_HW_COUNTER_SLOTS; ++s) {
+      if ((u32)s >= active) break;
+      struct bpf_perf_event_value val = {};
+      u64 idx = (u64)cpu * DATACRUMBS_HW_COUNTER_SLOTS + (u32)s;
+      if (bpf_perf_event_read_value(&hwc_pmu, idx, &val, sizeof(val)) != 0) continue;
+      if (scope == 0) {
+        fn->hwc_ctr[s] = val.counter;
+        fn->hwc_enabled[s] = val.enabled;
+        fn->hwc_running[s] = val.running;
+        fn->hwc_entry_valid_mask |= (1u << s);
+      } else {
+        fn->hwc_cpu_ctr[s] = val.counter;
+        fn->hwc_cpu_entry_valid_mask |= (1u << s);
+      }
     }
   }
 }
 
-// Read the active counters at exit, compute per-call deltas into the event.
-// Flags the sample if the thread migrated cpus (entry/exit reads on different
-// cpus make the delta meaningless).
+// Compute per-call deltas at exit. Per-cpu reads are invalidated on cpu
+// migration; task reads follow the thread and are not.
 static inline __attribute__((always_inline)) void hwc_fill_exit(const struct fn_value_t* fn,
                                                                 struct generic_event_t* event) {
   const u32 active = hwc_active_count();
+  const u32 scope = hwc_scope();
   const u32 cpu = bpf_get_smp_processor_id();
   event->hwc_migrated = (cpu != fn->hwc_entry_cpu) ? 1 : 0;
   event->hwc_valid_mask = 0;
+  event->hwc_cpu_valid_mask = 0;
 #pragma unroll
   for (int s = 0; s < DATACRUMBS_HW_COUNTER_SLOTS; ++s) {
     event->hwc_delta[s] = 0;
     event->hwc_enabled_delta[s] = 0;
     event->hwc_running_delta[s] = 0;
-    if ((u32)s >= active) continue;
-    if (event->hwc_migrated || !(fn->hwc_entry_valid_mask & (1u << s))) continue;
-    struct bpf_perf_event_value val = {};
-    u64 idx = (u64)cpu * DATACRUMBS_HW_COUNTER_SLOTS + (u32)s;
-    if (bpf_perf_event_read_value(&hwc_pmu, idx, &val, sizeof(val)) == 0) {
-      event->hwc_delta[s] = val.counter - fn->hwc_ctr[s];
-      event->hwc_enabled_delta[s] = val.enabled - fn->hwc_enabled[s];
-      event->hwc_running_delta[s] = val.running - fn->hwc_running[s];
-      event->hwc_valid_mask |= (1u << s);
+    event->hwc_cpu_delta[s] = 0;
+  }
+  if (scope != 0) {  // task or both: primary is the task counter
+    const u32 tid = (u32)bpf_get_current_pid_tgid();
+    const int slot = hwc_task_slot_of(tid);
+    if (slot >= 0) {
+#pragma unroll
+      for (int s = 0; s < DATACRUMBS_HW_COUNTER_SLOTS; ++s) {
+        if ((u32)s >= active) break;
+        if (!(fn->hwc_entry_valid_mask & (1u << s))) continue;
+        struct bpf_perf_event_value val = {};
+        u64 idx = (u64)slot * DATACRUMBS_HW_COUNTER_SLOTS + (u32)s;
+        if (bpf_perf_event_read_value(&hwc_pmu_task, idx, &val, sizeof(val)) == 0) {
+          event->hwc_delta[s] = val.counter - fn->hwc_ctr[s];
+          event->hwc_enabled_delta[s] = val.enabled - fn->hwc_enabled[s];
+          event->hwc_running_delta[s] = val.running - fn->hwc_running[s];
+          event->hwc_valid_mask |= (1u << s);
+        }
+      }
+    }
+  }
+  if (scope != 1 && !event->hwc_migrated) {  // cpu or both
+#pragma unroll
+    for (int s = 0; s < DATACRUMBS_HW_COUNTER_SLOTS; ++s) {
+      if ((u32)s >= active) break;
+      struct bpf_perf_event_value val = {};
+      u64 idx = (u64)cpu * DATACRUMBS_HW_COUNTER_SLOTS + (u32)s;
+      if (scope == 0) {  // primary is the per-cpu counter
+        if (!(fn->hwc_entry_valid_mask & (1u << s))) continue;
+        if (bpf_perf_event_read_value(&hwc_pmu, idx, &val, sizeof(val)) == 0) {
+          event->hwc_delta[s] = val.counter - fn->hwc_ctr[s];
+          event->hwc_enabled_delta[s] = val.enabled - fn->hwc_enabled[s];
+          event->hwc_running_delta[s] = val.running - fn->hwc_running[s];
+          event->hwc_valid_mask |= (1u << s);
+        }
+      } else {  // both: per-cpu into the cpu fields
+        if (!(fn->hwc_cpu_entry_valid_mask & (1u << s))) continue;
+        if (bpf_perf_event_read_value(&hwc_pmu, idx, &val, sizeof(val)) == 0) {
+          event->hwc_cpu_delta[s] = val.counter - fn->hwc_cpu_ctr[s];
+          event->hwc_cpu_valid_mask |= (1u << s);
+        }
+      }
     }
   }
 }
@@ -225,6 +324,10 @@ static inline __attribute__((always_inline)) void hwc_fill_exit(const struct fn_
   (void)fn;
   (void)event;
 }
+static inline __attribute__((always_inline)) void hwc_notify_pid(u32 tid, u32 op) {
+  (void)tid;
+  (void)op;
+}
 #endif
 
 static inline __attribute__((always_inline)) int mark_current_pid_traced(void) {
@@ -233,6 +336,7 @@ static inline __attribute__((always_inline)) int mark_current_pid_traced(void) {
   const u32 pid = current & 0xFFFFFFFF;
   if (pid == 0) return 0;
   bpf_map_update_elem(&pid_map, &pid, &tsp, BPF_ANY);
+  hwc_notify_pid(pid, 1);
   DBG_PRINTK("Marked tracing pid=%u", pid);
   return 0;
 }
@@ -242,6 +346,7 @@ static inline __attribute__((always_inline)) int unmark_current_pid_traced(void)
   const u32 pid = current & 0xFFFFFFFF;
   if (pid == 0) return 0;
   bpf_map_delete_elem(&pid_map, &pid);
+  hwc_notify_pid(pid, 0);
   DBG_PRINTK("Unmarked tracing pid=%u", pid);
   return 0;
 }
@@ -718,6 +823,7 @@ static inline __attribute__((always_inline)) int generic_fork_exit(struct pt_reg
     if (pid != 0) {
       DBG_PRINTK("Collect forked tracing PID %d", pid);
       bpf_map_update_elem(&pid_map, &pid, &tsp, BPF_ANY);
+      hwc_notify_pid(pid, 1);
     }
   }
   return generic_exit(ctx, event_id);
