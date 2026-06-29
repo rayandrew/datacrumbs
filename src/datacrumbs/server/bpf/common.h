@@ -562,15 +562,18 @@ static inline __attribute__((always_inline)) void capture_runtime_usdt_args(
 #if defined(DATACRUMBS_MODE) && (DATACRUMBS_MODE == 1)
 static inline __attribute__((always_inline)) int generic_entry(struct pt_regs* ctx,
                                                                u64 attach_cookie) {
-  const struct runtime_event_config_t* config = resolve_event_config(attach_cookie);
-  if (config == NULL) return 0;
-  const u64 event_id = config->event_id;
+  // pid gate FIRST: kprobes fire system-wide
+  // so most hits are untraced pids. 
+  // bail before the per-event config lookup to drop a map lookup on that path.
   struct fn_key_t key = {};
-  key.event_id = event_id;
   u64 start_ts = 0;
   if (!need_tracing(&key, &start_ts)) {
     return 0;  // not tracing this pid
   }
+  const struct runtime_event_config_t* config = resolve_event_config(attach_cookie);
+  if (config == NULL) return 0;
+  const u64 event_id = config->event_id;
+  key.event_id = event_id;
   struct fn_value_t* fn = get_scratch_fn_value();
   if (fn == NULL) return 0;
   __builtin_memset(fn, 0, sizeof(*fn));
@@ -584,15 +587,16 @@ static inline __attribute__((always_inline)) int generic_entry(struct pt_regs* c
 #else
 static inline __attribute__((always_inline)) int generic_entry(struct pt_regs* ctx,
                                                                u64 attach_cookie) {
-  const struct runtime_event_config_t* config = resolve_event_config(attach_cookie);
-  if (config == NULL) return 0;
-  const u64 event_id = config->event_id;
+  // pid gate FIRST (see generic_entry above): bail before the config lookup.
   struct fn_key_t key = {};
-  key.event_id = event_id;
   u64 start_ts;
   if (!need_tracing(&key, &start_ts)) {
     return 0;  // not tracing this pid
   }
+  const struct runtime_event_config_t* config = resolve_event_config(attach_cookie);
+  if (config == NULL) return 0;
+  const u64 event_id = config->event_id;
+  key.event_id = event_id;
   struct fn_value_t* fn = get_scratch_fn_value();
   if (fn == NULL) return 0;
   __builtin_memset(fn, 0, sizeof(*fn));
@@ -613,16 +617,17 @@ static inline __attribute__((always_inline)) int generic_entry(struct pt_regs* c
 #if defined(DATACRUMBS_MODE) && (DATACRUMBS_MODE == 1)
 static inline __attribute__((always_inline)) int generic_exit(struct pt_regs* ctx,
                                                               u64 attach_cookie) {
-  const struct runtime_event_config_t* config = resolve_event_config(attach_cookie);
-  if (config == NULL) return 0;
-  const u64 event_id = config->event_id;
-  u64 te = bpf_ktime_get_ns();
+  // pid gate FIRST (see generic_entry): bail before the config + state lookups.
   struct fn_key_t key = {};
-  key.event_id = event_id;
   u64 start_ts = 0;
   if (!need_tracing(&key, &start_ts)) {
     return 0;  // not tracing this pid
   }
+  u64 te = bpf_ktime_get_ns();
+  const struct runtime_event_config_t* config = resolve_event_config(attach_cookie);
+  if (config == NULL) return 0;
+  const u64 event_id = config->event_id;
+  key.event_id = event_id;
   struct fn_value_t* fn = bpf_map_lookup_elem(&fn_pid_map, &key);
   if (fn == 0) return 0;  // missed entry
   DATACRUMBS_SKIP_SMALL_EVENTS(fn, te);
@@ -640,16 +645,17 @@ static inline __attribute__((always_inline)) int generic_exit(struct pt_regs* ct
 #else
 static inline __attribute__((always_inline)) int generic_exit(struct pt_regs* ctx,
                                                               u64 attach_cookie) {
-  const struct runtime_event_config_t* config = resolve_event_config(attach_cookie);
-  if (config == NULL) return 0;
-  const u64 event_id = config->event_id;
-  u64 te = bpf_ktime_get_ns();
+  // pid gate FIRST (see generic_entry): bail before the config + state lookups.
   struct fn_key_t key = {};
-  key.event_id = event_id;
   u64 start_ts;
   if (!need_tracing(&key, &start_ts)) {
     return 0;  // not tracing this pid
   }
+  u64 te = bpf_ktime_get_ns();
+  const struct runtime_event_config_t* config = resolve_event_config(attach_cookie);
+  if (config == NULL) return 0;
+  const u64 event_id = config->event_id;
+  key.event_id = event_id;
   struct fn_value_t* fn = bpf_map_lookup_elem(&fn_pid_map, &key);
   if (fn == 0) return 0;  // missed entry
   struct profile_key_t profile_key = {};
@@ -689,15 +695,16 @@ static inline __attribute__((always_inline)) int generic_exit(struct pt_regs* ct
 static inline __attribute__((always_inline)) int generic_syscall_entry(
     struct pt_regs* ctx, u64 attach_cookie, unsigned long long arg0, unsigned long long arg1,
     unsigned long long arg2, unsigned long long arg3, unsigned long long arg4) {
-  const struct runtime_event_config_t* config = resolve_event_config(attach_cookie);
-  if (config == NULL) return 0;
-  const u64 event_id = config->event_id;
+  // pid gate FIRST (see generic_entry): bail before the per-event config lookup.
   struct fn_key_t key = {};
-  key.event_id = event_id;
   u64 start_ts = 0;
   if (!need_tracing(&key, &start_ts)) {
     return 0;
   }
+  const struct runtime_event_config_t* config = resolve_event_config(attach_cookie);
+  if (config == NULL) return 0;
+  const u64 event_id = config->event_id;
+  key.event_id = event_id;
   struct fn_value_t* fn = get_scratch_fn_value();
   if (fn == NULL) return 0;
   __builtin_memset(fn, 0, sizeof(*fn));
@@ -726,15 +733,16 @@ static inline __attribute__((always_inline)) int generic_syscall_entry(
 #if defined(DATACRUMBS_ENABLE) && (DATACRUMBS_ENABLE == 1)
 static inline __attribute__((always_inline)) int usdt_entry(struct pt_regs* ctx,
                                                             u64 attach_cookie) {
-  const struct runtime_event_config_t* config = resolve_event_config(attach_cookie);
-  if (config == NULL) return 0;
-  const u64 event_id = config->event_id;
+  // pid gate FIRST (see generic_entry above): bail before the config lookup.
   struct fn_key_t key = {};
-  key.event_id = event_id;
   u64 start_ts;
   if (!need_tracing(&key, &start_ts)) {
     return 0;  // not tracing this pid
   }
+  const struct runtime_event_config_t* config = resolve_event_config(attach_cookie);
+  if (config == NULL) return 0;
+  const u64 event_id = config->event_id;
+  key.event_id = event_id;
   struct fn_value_t* fn = get_scratch_fn_value();
   if (fn == NULL) return 0;
   __builtin_memset(fn, 0, sizeof(*fn));
@@ -757,16 +765,17 @@ static inline __attribute__((always_inline)) int usdt_entry(struct pt_regs* ctx,
 #if defined(DATACRUMBS_MODE) && (DATACRUMBS_MODE == 1)
 static inline __attribute__((always_inline)) int usdt_exit(struct pt_regs* ctx, u64 attach_cookie,
                                                            long clazz, long method) {
-  const struct runtime_event_config_t* config = resolve_event_config(attach_cookie);
-  if (config == NULL) return 0;
-  const u64 event_id = config->event_id;
-  u64 te = bpf_ktime_get_ns();
+  // pid gate FIRST (see generic_entry above): bail before the config lookup.
   struct fn_key_t key = {};
-  key.event_id = event_id;
   u64 start_ts;
   if (!need_tracing(&key, &start_ts)) {
     return 0;  // not tracing this pid
   }
+  u64 te = bpf_ktime_get_ns();
+  const struct runtime_event_config_t* config = resolve_event_config(attach_cookie);
+  if (config == NULL) return 0;
+  const u64 event_id = config->event_id;
+  key.event_id = event_id;
   struct fn_value_t* fn = bpf_map_lookup_elem(&fn_pid_map, &key);
   if (fn == 0) return 0;  // missed entry
   DATACRUMBS_SKIP_SMALL_EVENTS(fn, te);
@@ -784,16 +793,17 @@ static inline __attribute__((always_inline)) int usdt_exit(struct pt_regs* ctx, 
 #else
 static inline __attribute__((always_inline)) int usdt_exit(struct pt_regs* ctx, u64 attach_cookie,
                                                            long clazz, long method) {
-  const struct runtime_event_config_t* config = resolve_event_config(attach_cookie);
-  if (config == NULL) return 0;
-  const u64 event_id = config->event_id;
-  u64 te = bpf_ktime_get_ns();
+  // pid gate FIRST (see generic_entry above): bail before the config lookup.
   struct fn_key_t key = {};
-  key.event_id = event_id;
   u64 start_ts;
   if (!need_tracing(&key, &start_ts)) {
     return 0;  // not tracing this pid
   }
+  u64 te = bpf_ktime_get_ns();
+  const struct runtime_event_config_t* config = resolve_event_config(attach_cookie);
+  if (config == NULL) return 0;
+  const u64 event_id = config->event_id;
+  key.event_id = event_id;
   struct fn_value_t* fn = bpf_map_lookup_elem(&fn_pid_map, &key);
   if (fn == 0) return 0;  // missed entry
   DATACRUMBS_SKIP_SMALL_EVENTS(fn, te);
@@ -846,6 +856,7 @@ static inline __attribute__((always_inline)) int usdt_exit(struct pt_regs* ctx, 
 #if defined(DATACRUMBS_ENABLE) && (DATACRUMBS_ENABLE == 1)
 static inline __attribute__((always_inline)) int generic_fork_exit(struct pt_regs* ctx,
                                                                    u64 event_id) {
+  // pid gate FIRST (see generic_entry above): bail before the config lookup.
   struct fn_key_t key = {};
   key.event_id = event_id;
   u64 start_ts;
