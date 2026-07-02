@@ -248,11 +248,13 @@ void ChromeWriter::finalize() {
 }
 
 void ChromeWriter::push_event(EventWithId* event) {
+  bool was_empty;
   {
     std::lock_guard<std::mutex> lock(queue_mutex_);
+    was_empty = event_queue_.empty();
     event_queue_.emplace_back(event);
   }
-  queue_cv_.notify_one();
+  if (was_empty) queue_cv_.notify_one();  // notify only on empty->nonempty (else futex/event)
 }
 
 // Serialize and write a single event to the file, including event_id as "id".
@@ -346,28 +348,20 @@ void ChromeWriter::write_event(EventWithId* event_with_id) {
 
 void ChromeWriter::worker_loop() {
   DC_LOG_DEBUG("ChromeWriter worker loop started");
-  int count = 0;
+  std::deque<EventWithId*> batch;
   while (true) {
-    EventWithId* event_with_id = nullptr;
     {
       std::unique_lock<std::mutex> lock(queue_mutex_);
       queue_cv_.wait(lock, [this] { return !event_queue_.empty() || stop_flag_; });
       if (event_queue_.empty() && stop_flag_) {
         break;
       }
-      if (!event_queue_.empty()) {
-        event_with_id = event_queue_.front();
-        event_queue_.pop_front();
-        DC_LOG_DEBUG("Processing event with ID: %d and %d left", event_with_id->event_id,
-                     event_queue_.size());
-      } else {
-        continue;
-      }
+      batch.swap(event_queue_);  // drain whole queue per lock so the producer isn't starved
     }
-    if (event_with_id != nullptr) {
-      write_event(event_with_id);
+    for (EventWithId* event_with_id : batch) {
+      if (event_with_id != nullptr) write_event(event_with_id);  // write_event frees it
     }
-    count++;
+    batch.clear();
   }
   DC_LOG_DEBUG("ChromeWriter worker loop exiting");
 }

@@ -103,7 +103,7 @@ set_property(CACHE DATACRUMBS_SCHEDULER_TYPE PROPERTY STRINGS FLUX SLURM OPENMPI
 set(DATACRUMBS_SCHEDULER_JOBID_ENV_VAR "NONE" CACHE STRING "Scheduler job ID environment variable name")
 
 # Tracing Options
-set(DATACRUMBS_TRACE_RINGBUF_SIZE_MB "16" CACHE STRING "Ring buffer size in MB for BPF tracing")
+set(DATACRUMBS_TRACE_RINGBUF_SIZE_MB "64" CACHE STRING "Ring buffer size in MB for BPF tracing")
 set(DATACRUMBS_MAX_RUNTIME_FUNCTIONS "16384" CACHE STRING "Maximum number of runtime functions supported in one probes file")
 set(DATACRUMBS_SKIP_SMALL_EVENTS_THRESHOLD_NS "1000" CACHE STRING "Threshold in microseconds for skipping events")
 
