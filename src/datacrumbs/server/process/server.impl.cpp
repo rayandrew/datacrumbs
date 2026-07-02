@@ -422,6 +422,7 @@ static int setup_hw_counters(struct datacrumbs_bpf* skel, const std::vector<std:
     }
     attr.disabled = 0;  // count immediately
     attr.inherit = 0;
+    attr.pinned = 1;  // register-read, no multiplexing; masked out if it can't schedule
     if (out_attrs) out_attrs->push_back(attr);  // for per-task reopening (TASK/BOTH)
 
     if (scope != 1) {  // CPU or BOTH: open one per-cpu event per cpu

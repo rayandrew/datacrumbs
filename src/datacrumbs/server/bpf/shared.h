@@ -82,6 +82,10 @@ struct fn_value_t {
   unsigned long long hwc_running[DATACRUMBS_HW_COUNTER_SLOTS];
   unsigned int hwc_entry_cpu;         // cpu id at entry (migration detection)
   unsigned int hwc_entry_valid_mask;  // bit i set => entry read of slot i succeeded
+  // cached at entry, reused at exit -> no second hwc_ctl/hwc_task_slot lookup
+  unsigned int hwc_active;        // active counter count
+  unsigned int hwc_scope_cached;  // 0=cpu 1=task 2=both
+  int hwc_task_slot_cached;       // task slot, or -1 if not opened
   // Per-cpu entry snapshot, used only in BOTH (primary holds the task snapshot).
   unsigned long long hwc_cpu_ctr[DATACRUMBS_HW_COUNTER_SLOTS];
   unsigned int hwc_cpu_entry_valid_mask;

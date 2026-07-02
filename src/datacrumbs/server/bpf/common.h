@@ -153,10 +153,9 @@ static inline __attribute__((always_inline)) int need_tracing(struct fn_key_t* k
 }
 #else
 static inline __attribute__((always_inline)) int need_tracing(struct fn_key_t* key, u64* start_ts) {
-  key->id = bpf_get_current_pid_tgid();
-  u32 pid = key->id & 0xFFFFFFFF;
-  (void)pid;
-  start_ts = (u64*)bpf_map_lookup_elem(&pid_map, &pid);
+  key->id = bpf_get_current_pid_tgid();  // full tgid|tid: fn_pid_map pairs per-thread
+  u32 tgid = key->id >> 32;              // gate by process so worker threads trace too
+  start_ts = (u64*)bpf_map_lookup_elem(&pid_map, &tgid);
   if (start_ts == 0 || key->id == 0) return 0;
   return 1;
 }
@@ -288,22 +287,26 @@ static inline __attribute__((always_inline)) u32 hwc_delta_ctr(void* map, u64 ba
   return mask;
 }
 
-// Snapshot the active counters at function entry.
+// Snapshot active counters at entry; cache active/scope/slot in fn for exit to reuse.
 static inline __attribute__((always_inline)) void hwc_read_entry(struct fn_value_t* fn) {
   const u32 active = hwc_active_count();
   const u32 scope = hwc_scope();
   const u32 cpu = bpf_get_smp_processor_id();
   const u64 cpu_base = (u64)cpu * DATACRUMBS_HW_COUNTER_SLOTS;
+  int slot = -1;
   fn->hwc_entry_cpu = cpu;
   fn->hwc_entry_valid_mask = 0;
   fn->hwc_cpu_entry_valid_mask = 0;
+  fn->hwc_active = active;
+  fn->hwc_scope_cached = scope;
   if (scope != 0) {  // task or both: primary is the task counter
-    const int slot = hwc_task_slot_of((u32)bpf_get_current_pid_tgid());
+    slot = hwc_task_slot_of((u32)bpf_get_current_pid_tgid());
     if (slot >= 0)
       fn->hwc_entry_valid_mask =
           hwc_read_full(&hwc_pmu_task, (u64)slot * DATACRUMBS_HW_COUNTER_SLOTS, active, fn->hwc_ctr,
                         fn->hwc_enabled, fn->hwc_running);
   }
+  fn->hwc_task_slot_cached = slot;
   if (scope == 0) {  // cpu: primary is the per-cpu counter
     fn->hwc_entry_valid_mask =
         hwc_read_full(&hwc_pmu, cpu_base, active, fn->hwc_ctr, fn->hwc_enabled, fn->hwc_running);
@@ -315,8 +318,8 @@ static inline __attribute__((always_inline)) void hwc_read_entry(struct fn_value
 // Compute per-call deltas at exit.
 static inline __attribute__((always_inline)) void hwc_fill_exit(const struct fn_value_t* fn,
                                                                 struct generic_event_t* event) {
-  const u32 active = hwc_active_count();
-  const u32 scope = hwc_scope();
+  const u32 active = fn->hwc_active;        // cached at entry (no hwc_ctl re-read)
+  const u32 scope = fn->hwc_scope_cached;   // cached at entry
   const u32 cpu = bpf_get_smp_processor_id();
   const u64 cpu_base = (u64)cpu * DATACRUMBS_HW_COUNTER_SLOTS;
   event->hwc_migrated = (cpu != fn->hwc_entry_cpu) ? 1 : 0;
@@ -330,7 +333,7 @@ static inline __attribute__((always_inline)) void hwc_fill_exit(const struct fn_
     event->hwc_cpu_delta[s] = 0;
   }
   if (scope != 0) {  // task or both: primary is the task counter
-    const int slot = hwc_task_slot_of((u32)bpf_get_current_pid_tgid());
+    const int slot = fn->hwc_task_slot_cached;  // cached at entry (no hwc_task_slot re-read)
     if (slot >= 0)
       event->hwc_valid_mask =
           hwc_delta_full(&hwc_pmu_task, (u64)slot * DATACRUMBS_HW_COUNTER_SLOTS, active,
@@ -366,21 +369,21 @@ static inline __attribute__((always_inline)) void hwc_notify_pid(u32 tid, u32 op
 static inline __attribute__((always_inline)) int mark_current_pid_traced(void) {
   const u64 tsp = bpf_ktime_get_ns();
   const u64 current = bpf_get_current_pid_tgid();
-  const u32 pid = current & 0xFFFFFFFF;
-  if (pid == 0) return 0;
-  bpf_map_update_elem(&pid_map, &pid, &tsp, BPF_ANY);
-  hwc_notify_pid(pid, 1);
-  DBG_PRINTK("Marked tracing pid=%u", pid);
+  const u32 tgid = current >> 32;  // mark the process; gate is per-tgid
+  if (tgid == 0) return 0;
+  bpf_map_update_elem(&pid_map, &tgid, &tsp, BPF_ANY);
+  hwc_notify_pid(tgid, 1);
+  DBG_PRINTK("Marked tracing tgid=%u", tgid);
   return 0;
 }
 
 static inline __attribute__((always_inline)) int unmark_current_pid_traced(void) {
   const u64 current = bpf_get_current_pid_tgid();
-  const u32 pid = current & 0xFFFFFFFF;
-  if (pid == 0) return 0;
-  bpf_map_delete_elem(&pid_map, &pid);
-  hwc_notify_pid(pid, 0);
-  DBG_PRINTK("Unmarked tracing pid=%u", pid);
+  const u32 tgid = current >> 32;
+  if (tgid == 0) return 0;
+  bpf_map_delete_elem(&pid_map, &tgid);
+  hwc_notify_pid(tgid, 0);
+  DBG_PRINTK("Unmarked tracing tgid=%u", tgid);
   return 0;
 }
 
@@ -563,7 +566,7 @@ static inline __attribute__((always_inline)) void capture_runtime_usdt_args(
 static inline __attribute__((always_inline)) int generic_entry(struct pt_regs* ctx,
                                                                u64 attach_cookie) {
   // pid gate FIRST: kprobes fire system-wide
-  // so most hits are untraced pids. 
+  // so most hits are untraced pids.
   // bail before the per-event config lookup to drop a map lookup on that path.
   struct fn_key_t key = {};
   u64 start_ts = 0;
