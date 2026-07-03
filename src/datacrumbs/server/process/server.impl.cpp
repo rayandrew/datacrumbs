@@ -64,7 +64,11 @@ static volatile bool stop = false;
 
 static void sig_handler(int) {
   stop = true;
-  DC_LOG_INFO("\nReceived SIGINT, stopping server loop");
+  // Async-signal-safe only: DC_LOG locks a mutex + fprintf, so logging here deadlocks if
+  // the signal interrupts a thread already holding the log mutex (intermittent shutdown hang).
+  static const char msg[] = "\nReceived SIGINT, stopping server loop\n";
+  ssize_t n = write(STDERR_FILENO, msg, sizeof(msg) - 1);
+  (void)n;
 }
 
 static bool split_uprobe_target(const std::string& symbol_with_offset, std::string* symbol_name,
