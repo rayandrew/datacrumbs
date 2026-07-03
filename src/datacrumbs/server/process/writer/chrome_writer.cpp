@@ -7,11 +7,14 @@
 #include <datacrumbs/common/typedefs.h>
 #include <datacrumbs/server/bpf/shared.h>
 #include <datacrumbs/server/process/compress/zlib_compressor.h>
+#include <zlib.h>
 
+#include <cstdlib>
 #include <cstring>
 #include <iomanip>
 #include <limits>
 #include <sstream>
+#include <thread>
 
 namespace {
 
@@ -204,29 +207,71 @@ std::shared_ptr<datacrumbs::ChromeWriter>
 template <>
 bool datacrumbs::Singleton<datacrumbs::ChromeWriter>::stop_creating_instances = false;
 
+namespace {
+// env override for a numeric config; keeps the default if unset/unparseable.
+long env_num(const char* name, long dflt) {
+  if (const char* e = std::getenv(name)) {
+    char* end = nullptr;
+    long v = std::strtol(e, &end, 10);
+    if (end != e) return v;
+  }
+  return dflt;
+}
+
+// Compress a buffer into a self-contained gzip member. Concatenated members form a
+// valid multi-member gzip (Perfetto/gunzip read it as one stream), so members can be
+// produced in parallel and appended in any order -- the .pfw is newline-delimited
+// objects, no inter-event commas, so order doesn't matter.
+std::vector<uint8_t> gzip_block(const std::string& in, int level) {
+  z_stream s{};
+  if (deflateInit2(&s, level, Z_DEFLATED, 15 + 16, 8, Z_DEFAULT_STRATEGY) != Z_OK)
+    throw std::runtime_error("deflateInit2 failed");
+  std::vector<uint8_t> out(deflateBound(&s, in.size()));
+  s.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(in.data()));
+  s.avail_in = static_cast<uInt>(in.size());
+  s.next_out = out.data();
+  s.avail_out = static_cast<uInt>(out.size());
+  int r = deflate(&s, Z_FINISH);
+  deflateEnd(&s);
+  if (r != Z_STREAM_END) throw std::runtime_error("deflate failed");
+  out.resize(out.size() - s.avail_out);
+  return out;
+}
+}  // namespace
+
 namespace datacrumbs {
-ChromeWriter::ChromeWriter() : stop_flag_(false), finalized_(false), chunk_size_(16 * 1024 * 1024) {
+ChromeWriter::ChromeWriter()
+    : stop_flag_(false), finalized_(false), index_(0), batch_events_(8192), flush_bytes_(1 << 20) {
+  // Tunables (env-overridable for testing):
+  //  MAX_QUEUE_EVENTS  backpressure bound on the poll->pool queue (0 = unbounded)
+  //  WRITER_THREADS    parallel serialize+gzip+write workers
+  //  ZLIB_LEVEL        deflate level (default 6; keep gzip for Perfetto)
+  max_queue_events_ = static_cast<size_t>(env_num("DATACRUMBS_MAX_QUEUE_EVENTS", 500000));
+  zlib_level_ = static_cast<int>(env_num("DATACRUMBS_ZLIB_LEVEL", Z_DEFAULT_COMPRESSION));
+  long hw = static_cast<long>(std::thread::hardware_concurrency());
+  long nthreads = env_num("DATACRUMBS_WRITER_THREADS", hw > 4 ? hw - 2 : 2);
+  if (nthreads < 1) nthreads = 1;
+
   auto configManager_ =
       datacrumbs::Singleton<datacrumbs::RuntimeConfigurationManager>::get_instance();
-  compressor_ = new ZlibCompression(configManager_->trace_file_path, chunk_size_);
-  // file_ = std::fopen(configManager_->trace_file_path.c_str(), "a+");
+  file_ = std::fopen(configManager_->trace_file_path.c_str(), "wb");
+  if (!file_) throw std::runtime_error("Failed to open trace file for writing");
   auto pwd = getpwnam(configManager_->user.c_str());
   uid_t uid = pwd ? pwd->pw_uid : static_cast<uid_t>(-1);
   gid_t gid = pwd ? pwd->pw_gid : static_cast<gid_t>(-1);
-  // Set file ownership to configManager_->user
   chown(configManager_->trace_file_path.c_str(), uid, gid);
-  // Optionally set permissions (e.g., rw-r-----)
   chmod(configManager_->trace_file_path.c_str(), 0660);
-  compressor_->compress("[\n");
-  first_event_ = true;
-  worker_ = std::thread([this]() { this->worker_loop(); });
+
+  {  // opening bracket as its own gzip member
+    auto m = gzip_block("[\n", zlib_level_);
+    std::fwrite(m.data(), 1, m.size(), file_);
+  }
+  for (long i = 0; i < nthreads; ++i) workers_.emplace_back([this]() { this->worker_loop(); });
 }
 
-// Destructor flushes and closes the file, and joins the worker thread.
+// Destructor flushes and closes the file, and joins all threads.
 ChromeWriter::~ChromeWriter() {
   finalize();
-  delete compressor_;
-  compressor_ = nullptr;
 }
 void ChromeWriter::finalize() {
   {
@@ -237,33 +282,42 @@ void ChromeWriter::finalize() {
     stop_flag_ = true;
     finalized_ = true;
   }
-  DC_LOG_DEBUG("ChromeWriter worker loop exiting");
-  queue_cv_.notify_one();
-  if (worker_.joinable()) worker_.join();
-  if (compressor_ != nullptr) {
-    compressor_->compress("]");
-    compressor_->finalize();
+  queue_cv_.notify_all();     // wake all pool threads to drain + exit
+  not_full_cv_.notify_all();  // release any producer blocked on backpressure
+  for (auto& t : workers_)
+    if (t.joinable()) t.join();
+
+  if (file_) {
+    auto m = gzip_block("]\n", zlib_level_);
+    std::fwrite(m.data(), 1, m.size(), file_);
+    std::fclose(file_);
+    file_ = nullptr;
   }
   DC_LOG_DEBUG("ChromeWriter finalized");
 }
 
 void ChromeWriter::push_event(EventWithId* event) {
-  bool was_empty;
   {
-    std::lock_guard<std::mutex> lock(queue_mutex_);
-    was_empty = event_queue_.empty();
+    std::unique_lock<std::mutex> lock(queue_mutex_);
+    if (max_queue_events_)  // backpressure: block the producer until the writer drains
+      not_full_cv_.wait(lock,
+                        [this] { return event_queue_.size() < max_queue_events_ || stop_flag_; });
     event_queue_.emplace_back(event);
   }
-  if (was_empty) queue_cv_.notify_one();  // notify only on empty->nonempty (else futex/event)
+  // Wake a worker for every event: with a multi-consumer pool, notifying only on
+  // empty->nonempty leaves most workers parked while one drains the backlog (pathological
+  // slowdown at high event rate). One notify/event keeps up to N workers active.
+  queue_cv_.notify_one();
 }
 
-// Serialize and write a single event to the file, including event_id as "id".
-void ChromeWriter::write_event(EventWithId* event_with_id) {
-  index_++;
+// Serialize one event to a JSON line (no compress/IO); frees the event. Thread-safe:
+// runs on any pool worker (id is atomic; category_map is read-only during tracing).
+std::string ChromeWriter::serialize_event(EventWithId* event_with_id) {
+  unsigned long id = index_.fetch_add(1) + 1;
   auto configManager_ =
       datacrumbs::Singleton<datacrumbs::RuntimeConfigurationManager>::get_instance();
-  uint64_t index = event_with_id->index;
   auto args = event_with_id->args;
+  std::string result;
 
   unsigned int pid = event_with_id->tgid_pid;
   unsigned int tid = event_with_id->tgid_pid >> 32;
@@ -297,21 +351,20 @@ void ChromeWriter::write_event(EventWithId* event_with_id) {
     int len = 0;
     if (event_with_id->event_type == COUNTER_EVENT) {
       len = std::snprintf(
-          buffer, sizeof(buffer), R"({"id":%lu,"name":"%s","cat":"%s","ph":"%c","ts":%llu)", index_,
+          buffer, sizeof(buffer), R"({"id":%lu,"name":"%s","cat":"%s","ph":"%c","ts":%llu)", id,
           function_name.c_str(), probe_name.c_str(), event_with_id->event_type, ts_us);
     } else if (event_with_id->event_type == METADATA_EVENT) {
       len = std::snprintf(buffer, sizeof(buffer), R"({"id":%lu,"name":"%s","cat":"%s","ph":"%c")",
-                          index_, function_name.c_str(), probe_name.c_str(),
-                          event_with_id->event_type);
+                          id, function_name.c_str(), probe_name.c_str(), event_with_id->event_type);
     } else if (event_with_id->event_type == NORMAL_EVENT) {
       // Normal even
       len = std::snprintf(
           buffer, sizeof(buffer),
           R"({"id":%lu,"name":"%s","cat":"%s","ph":"%c","ts":%llu,"dur":%llu,"pid":%d,"tid":%d)",
-          index_, function_name.c_str(), probe_name.c_str(), event_with_id->event_type, ts_us,
-          dur_us, pid, tid);
+          id, function_name.c_str(), probe_name.c_str(), event_with_id->event_type, ts_us, dur_us,
+          pid, tid);
     } else {
-      return;
+      len = 0;  // unknown event type -> skip (empty result)
     }
 
     std::string args_json = "{";
@@ -331,12 +384,7 @@ void ChromeWriter::write_event(EventWithId* event_with_id) {
     }
     args_json += "}";
 
-    {
-      std::lock_guard<std::mutex> lock(file_mutex_);
-      std::string event_json = std::string(buffer, len) + ",\"args\":" + args_json + "}\n";
-      DC_LOG_DEBUG("Writing event: %s", event_json.c_str());
-      compressor_->compress(event_json);
-    }
+    if (len > 0) result = std::string(buffer, len) + ",\"args\":" + args_json + "}\n";
   }
   if (args != nullptr) {
     delete args;  // Clean up args after use
@@ -344,25 +392,42 @@ void ChromeWriter::write_event(EventWithId* event_with_id) {
   if (event_with_id != nullptr) {
     delete event_with_id;  // Clean up event after writing
   }
+  return result;
 }
 
+// Pool thread: grab up to batch_events_ events under the lock, then serialize + gzip +
+// append the member (order-independent since the .pfw is newline-delimited). Single
+// bounded queue + backpressure -> parallel compression with no cross-stage coordination.
 void ChromeWriter::worker_loop() {
-  DC_LOG_DEBUG("ChromeWriter worker loop started");
   std::deque<EventWithId*> batch;
+  std::string acc;
   while (true) {
+    bool stopping = false;
     {
       std::unique_lock<std::mutex> lock(queue_mutex_);
       queue_cv_.wait(lock, [this] { return !event_queue_.empty() || stop_flag_; });
-      if (event_queue_.empty() && stop_flag_) {
-        break;
+      if (event_queue_.empty()) {
+        stopping = true;  // woken by stop with nothing left
+      } else {
+        size_t n = std::min(batch_events_, event_queue_.size());
+        batch.assign(event_queue_.begin(), event_queue_.begin() + n);
+        event_queue_.erase(event_queue_.begin(), event_queue_.begin() + n);
       }
-      batch.swap(event_queue_);  // drain whole queue per lock so the producer isn't starved
     }
-    for (EventWithId* event_with_id : batch) {
-      if (event_with_id != nullptr) write_event(event_with_id);  // write_event frees it
-    }
+    not_full_cv_.notify_all();  // freed space -> wake producer blocked on backpressure
+    for (EventWithId* e : batch)
+      if (e != nullptr) acc += serialize_event(e);  // frees e
     batch.clear();
+    // Coalesce into ~flush_bytes_ gzip members. At low arrival rate each grab is tiny;
+    // one member per grab would mean ~one member per event -> huge per-member gzip
+    // overhead + bloated output. Compress only once the accumulator is full (or at stop).
+    if (acc.size() >= flush_bytes_ || (stopping && !acc.empty())) {
+      auto member = gzip_block(acc, zlib_level_);
+      std::lock_guard<std::mutex> lock(file_mutex_);
+      std::fwrite(member.data(), 1, member.size(), file_);
+      acc.clear();
+    }
+    if (stopping) break;
   }
-  DC_LOG_DEBUG("ChromeWriter worker loop exiting");
 }
 }  // namespace datacrumbs

@@ -11,6 +11,7 @@
 #include <unistd.h>
 
 #include <any>
+#include <atomic>
 #include <cmath>
 #include <condition_variable>
 #include <cstdio>
@@ -34,27 +35,28 @@ class ChromeWriter {
 
   void push_event(EventWithId* event);
 
-  // Serialize and write a single event to the file, including event_id as "id".
-  void write_event(EventWithId* event_with_id);
-
   void finalize();
 
  private:
-  void worker_loop();
+  void worker_loop();                         // pool thread: grab -> serialize -> gzip -> write
+  std::string serialize_event(EventWithId*);  // one event -> JSON line; frees the event
 
-  bool first_event_ = true;
+  std::mutex file_mutex_;  // serialize gzip-member appends to file_
+  FILE* file_ = nullptr;
 
-  std::mutex file_mutex_;
-
-  std::deque<EventWithId*> event_queue_;
+  std::deque<EventWithId*> event_queue_;  // poll thread -> pool
   std::mutex queue_mutex_;
-  std::condition_variable queue_cv_;
-  std::thread worker_;
+  std::condition_variable queue_cv_;     // pool wakes on empty->nonempty / stop
+  std::condition_variable not_full_cv_;  // poll thread wakes when queue drains below cap
+  size_t max_queue_events_;              // backpressure bound (0 = unbounded)
+
+  std::vector<std::thread> workers_;  // parallel serialize+gzip+write pool
   bool stop_flag_;
   bool finalized_;
-  unsigned long index_;
-  ZlibCompression* compressor_;
-  size_t chunk_size_;
+  std::atomic<unsigned long> index_;  // unique event id (parallel -> atomic)
+  size_t batch_events_;               // events grabbed per lock acquisition
+  size_t flush_bytes_;                // coalesce serialized JSON to ~this per gzip member
+  int zlib_level_;                    // DATACRUMBS_ZLIB_LEVEL (default 6)
 };
 
 }  // namespace datacrumbs
