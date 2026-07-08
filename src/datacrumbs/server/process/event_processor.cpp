@@ -173,6 +173,13 @@ int EventProcessor::handle_event(void* data, size_t data_sz) {
                              configManager_->hw_scope);
     }
 #endif
+    // fork/clone: surface the child pid (the exit return value) as args.ret so parent->child
+    // process spawning is followable in the trace.
+    if (function_name.find("fork") != std::string::npos ||
+        function_name.find("clone") != std::string::npos) {
+      if (!runtime_args) runtime_args = std::make_unique<DataCrumbsArgs>();
+      runtime_args->emplace("ret", static_cast<unsigned int>(event->ret));
+    }
     auto write_event =
         new datacrumbs::EventWithId(NORMAL_EVENT, event_index.fetch_add(1), event->type, event->id,
                                     event->event_id, event->ts, event->dur, runtime_args.release());

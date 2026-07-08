@@ -639,6 +639,7 @@ static inline __attribute__((always_inline)) int generic_exit(struct pt_regs* ct
   event->type = config->probe_kind;
   event->id = key.id;
   event->event_id = event_id;
+  event->ret = (unsigned int)PT_REGS_RC(ctx);  // return value; for fork/clone exit = child pid
   DATACRUMBS_COLLECT_TIME(event);
   copy_captured_args_to_event(fn, event);
   hwc_fill_exit(fn, event);
@@ -787,6 +788,7 @@ static inline __attribute__((always_inline)) int usdt_exit(struct pt_regs* ctx, 
   event->type = config->probe_kind;
   event->id = key.id;
   event->event_id = event_id;
+  event->ret = (unsigned int)PT_REGS_RC(ctx);  // return value; for fork/clone exit = child pid
   DATACRUMBS_COLLECT_TIME(event);
   copy_captured_args_to_event(fn, event);
   hwc_fill_exit(fn, event);

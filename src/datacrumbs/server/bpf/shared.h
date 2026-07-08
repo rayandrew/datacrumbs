@@ -38,6 +38,7 @@ struct generic_event_t {
   unsigned int arg_data_len[DATACRUMBS_MAX_CAPTURE_ARGS];
   unsigned int arg_data_status[DATACRUMBS_MAX_CAPTURE_ARGS];
   unsigned char arg_data[DATACRUMBS_MAX_CAPTURE_ARGS][DATACRUMBS_MAX_CAPTURE_BYTES];
+  unsigned int ret;  // function return value (PT_REGS_RC); for fork/clone this is the child pid
 #if defined(DATACRUMBS_ENABLE_HW_COUNTERS) && (DATACRUMBS_ENABLE_HW_COUNTERS == 1)
   // Primary per-call counter deltas (exit - entry): task-scoped for TASK/BOTH,
   // per-cpu for CPU. enabled/running deltas allow scaling if multiplexed.
