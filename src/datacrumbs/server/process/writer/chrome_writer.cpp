@@ -7,6 +7,8 @@
 #include <datacrumbs/common/typedefs.h>
 #include <datacrumbs/server/bpf/shared.h>
 #include <datacrumbs/server/process/compress/zlib_compressor.h>
+#include <fcntl.h>
+#include <sys/mman.h>
 #include <zlib.h>
 
 #include <cstdlib>
@@ -266,7 +268,50 @@ ChromeWriter::ChromeWriter()
     auto m = gzip_block("[\n", zlib_level_);
     std::fwrite(m.data(), 1, m.size(), file_);
   }
+  map_timesync_snapshot();
+
   for (long i = 0; i < nthreads; ++i) workers_.emplace_back([this]() { this->worker_loop(); });
+}
+
+// mmap the dc_timesync daemon's read-only snapshot. Best-effort: if the daemon
+// is not running / file absent, tsync_ stays null and timestamps pass through
+// as CLOCK_MONOTONIC (trace is honestly labeled clock_domain=monotonic).
+void ChromeWriter::map_timesync_snapshot() {
+  const char* path = std::getenv("DC_TIMESYNC_SNAPSHOT");
+  if (!path) path = DC_TIMESYNC_DEFAULT_PATH;
+  int fd = ::open(path, O_RDONLY);
+  if (fd < 0) {
+    DC_LOG_DEBUG("dc_timesync snapshot %s not available; trace stays CLOCK_MONOTONIC", path);
+    return;
+  }
+  void* p = ::mmap(nullptr, sizeof(dc_timesync_snapshot), PROT_READ, MAP_SHARED, fd, 0);
+  ::close(fd);
+  if (p == MAP_FAILED) return;
+  tsync_ = reinterpret_cast<const volatile dc_timesync_snapshot*>(p);
+  DC_LOG_PRINT("dc_timesync snapshot mapped from %s", path);
+}
+
+// Remap a CLOCK_MONOTONIC ns timestamp onto the reference PHC timeline via the
+// daemon snapshot (seqlock-consistent read). Passthrough if no valid fix.
+unsigned long long ChromeWriter::remap_ts(unsigned long long mono_ns) const {
+  if (!tsync_) return mono_ns;
+  dc_timesync_snapshot s;
+  for (int tries = 0; tries < 4; ++tries) {  // seqlock: retry if a write straddled the read
+    unsigned int seq1 = __atomic_load_n(&tsync_->seq, __ATOMIC_ACQUIRE);
+    if (seq1 & 1u) continue;  // write in progress
+    std::memcpy(&s, const_cast<const dc_timesync_snapshot*>(tsync_), sizeof(s));
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    unsigned int seq2 = __atomic_load_n(&tsync_->seq, __ATOMIC_RELAXED);
+    if (seq1 == seq2) {
+      if (s.magic != DC_TIMESYNC_MAGIC || !s.valid) return mono_ns;
+      long long phc_local = static_cast<long long>(mono_ns) + s.bridge_mono_to_phc_ns;
+      long long ref =
+          phc_local + s.offset_ns +
+          static_cast<long long>(s.skew_ppb * (phc_local - s.anchor_phc_ns) / 1000000000LL);
+      return ref < 0 ? 0ull : static_cast<unsigned long long>(ref);
+    }
+  }
+  return mono_ns;  // couldn't get a stable read; stay MONOTONIC this event
 }
 
 // Destructor flushes and closes the file, and joins all threads.
@@ -336,12 +381,10 @@ std::string ChromeWriter::serialize_event(EventWithId* event_with_id) {
       (*args)["duration"] = duration;
     }
     char buffer[1024];
-    unsigned long long ts_us = 0;
-    if (event_with_id->ts > std::numeric_limits<unsigned long long>::max() / 1000) {
-      ts_us = std::numeric_limits<unsigned long long>::max();
-    } else {
-      ts_us = static_cast<unsigned long long>(std::floor(event_with_id->ts / 1000.0));
-    }
+    // dc_timesync: remap MONOTONIC -> shared reference timeline (passthrough if no fix).
+    // Integer divide (not double floor): reference-PHC ns are ~1.8e18 and would trip
+    // the old ULLONG_MAX/1000 double-overflow guard and clamp to a sentinel.
+    unsigned long long ts_us = remap_ts(event_with_id->ts) / 1000;
     unsigned long long dur_us = 0;
     if (event_with_id->dur > std::numeric_limits<unsigned long long>::max() / 1000) {
       dur_us = std::numeric_limits<unsigned long long>::max();
@@ -385,6 +428,27 @@ std::string ChromeWriter::serialize_event(EventWithId* event_with_id) {
     args_json += "}";
 
     if (len > 0) result = std::string(buffer, len) + ",\"args\":" + args_json + "}\n";
+  }
+  // Emit one metadata line stating whether ts are on the shared reference timeline
+  // (dc_timesync mapped) or raw CLOCK_MONOTONIC, so a reader can never mistake one
+  // for the other. Prepended to the first serialized event line.
+  if (!domain_emitted_.exchange(true)) {
+    char meta[256];
+    int mlen;
+    dc_timesync_snapshot s{};
+    if (tsync_) std::memcpy(&s, const_cast<const dc_timesync_snapshot*>(tsync_), sizeof(s));
+    if (tsync_ && s.magic == DC_TIMESYNC_MAGIC && s.valid)
+      mlen = std::snprintf(
+          meta, sizeof(meta),
+          R"({"name":"datacrumbs.clock_domain","ph":"M","args":{"domain":"global","ref_id":%u,"self_id":%u,"offset_ns":%lld,"skew_ppb":%lld}})"
+          "\n",
+          s.ref_id, s.self_id, (long long)s.offset_ns, (long long)s.skew_ppb);
+    else
+      mlen = std::snprintf(
+          meta, sizeof(meta),
+          R"({"name":"datacrumbs.clock_domain","ph":"M","args":{"domain":"monotonic"}})"
+          "\n");
+    if (mlen > 0) result = std::string(meta, mlen) + result;
   }
   if (args != nullptr) {
     delete args;  // Clean up args after use

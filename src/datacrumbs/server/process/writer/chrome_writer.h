@@ -3,6 +3,7 @@
 #include <datacrumbs/datacrumbs_config.h>
 // Other headers
 #include <datacrumbs/common/data_structures.h>
+#include <datacrumbs/common/dc_timesync_snapshot.h>
 #include <datacrumbs/server/process/compress/zlib_compressor.h>
 // std headers
 #include <pwd.h>
@@ -40,6 +41,14 @@ class ChromeWriter {
  private:
   void worker_loop();                         // pool thread: grab -> serialize -> gzip -> write
   std::string serialize_event(EventWithId*);  // one event -> JSON line; frees the event
+
+  // dc_timesync: remap a CLOCK_MONOTONIC event ts (ns) onto the shared cross-node
+  // reference timeline using the daemon's seqlock snapshot. Passes through
+  // unchanged when no valid snapshot is mapped (trace stays MONOTONIC).
+  unsigned long long remap_ts(unsigned long long mono_ns) const;
+  void map_timesync_snapshot();  // mmap the read-only snapshot (best-effort)
+  const volatile dc_timesync_snapshot* tsync_ = nullptr;  // mmap'd; null if unavailable
+  std::atomic<bool> domain_emitted_{false};  // emit the clock-domain metadata line once
 
   std::mutex file_mutex_;  // serialize gzip-member appends to file_
   FILE* file_ = nullptr;

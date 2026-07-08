@@ -1,0 +1,28 @@
+[Unit]
+Description=Datacrumbs cross-node time reconciliation daemon
+# Needs the fabric netdev up so SIOCSHWTSTAMP + the link-local peer exchange work.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Runs as root (unlike the other datacrumbs services): the daemon opens /dev/ptpN
+# for the PHC bridge, which is root-only on most kernels, and arms NIC hw
+# timestamping via SIOCSHWTSTAMP (CAP_NET_ADMIN). CAP_NET_ADMIN alone (a non-root
+# DATACRUMBS_SERVICE_USER) is NOT enough -- the /dev/ptpN open still fails. The
+# published snapshot is world-readable (0644) so the unprivileged server reads it.
+User=root
+# Per-node params (see dc_timesync.env.sample). Optional (-) so a missing file
+# surfaces as a clear daemon error in the journal, not a start refusal.
+# DC_TIMESYNC_SNAPSHOT, if set here, redirects the published mmap snapshot.
+EnvironmentFile=-@DATACRUMBS_SERVER_RUN_DIR@/dc_timesync.env
+# ref_ll/cadence are positional and optional: leave DC_TIMESYNC_REF_LL empty on
+# the reference node (self_id==ref_id) so shell word-splitting drops the arg.
+# (To override cadence on the reference node, its own link-local can be passed
+# as a harmless placeholder ref_ll, since the reference branch ignores it.)
+ExecStart=/bin/sh -c 'exec @DATACRUMBS_INSTALL_BINARYDIR@/dc_timesync "${DC_TIMESYNC_IFACE}" daemon "${DC_TIMESYNC_SELF_ID}" "${DC_TIMESYNC_REF_ID}" ${DC_TIMESYNC_REF_LL} ${DC_TIMESYNC_CADENCE_MS}'
+Restart=on-failure
+RestartSec=2s
+
+[Install]
+WantedBy=multi-user.target

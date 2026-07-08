@@ -284,6 +284,7 @@ set(DATACRUMBS_COMMON_SRC
 set(DATACRUMBS_PUBLIC_COMMON_HEADERS
     ${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/common/constants.h
     ${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/common/data_structures.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/common/dc_timesync_snapshot.h
     ${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/common/enumerations.h
     ${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/common/logging.h
     ${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/common/probe_file.h
@@ -540,6 +541,23 @@ configure_file(${CMAKE_CURRENT_SOURCE_DIR}/etc/datacrumbs/systemd/datacrumbs_pro
 install(
     PROGRAMS
     ${CMAKE_SYSTEMD_OUTPUT_DIRECTORY}/datacrumbs_probe_manager.service
+    DESTINATION
+    ${DATACRUMBS_INSTALL_ETC_SYSTEMD}
+)
+
+# cross-node time reconciliation daemon (dc_timesync ships from datacrumbs-utils
+# into the shared prefix bin/; this node-level unit runs it per node, reading
+# each node's params from <run-dir>/dc_timesync.env -- see dc_timesync.env.sample).
+configure_file(${CMAKE_CURRENT_SOURCE_DIR}/etc/datacrumbs/systemd/dc_timesync.service.in ${CMAKE_SYSTEMD_OUTPUT_DIRECTORY}/dc_timesync.service @ONLY)
+install(
+    PROGRAMS
+    ${CMAKE_SYSTEMD_OUTPUT_DIRECTORY}/dc_timesync.service
+    DESTINATION
+    ${DATACRUMBS_INSTALL_ETC_SYSTEMD}
+)
+install(
+    FILES
+    ${CMAKE_CURRENT_SOURCE_DIR}/etc/datacrumbs/systemd/dc_timesync.env.sample
     DESTINATION
     ${DATACRUMBS_INSTALL_ETC_SYSTEMD}
 )
