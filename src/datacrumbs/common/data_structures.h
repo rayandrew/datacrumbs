@@ -25,6 +25,8 @@ namespace datacrumbs {
 struct ProbeArgCaptureSpec {
   unsigned int index = 0;
   unsigned int num_bytes = 0;
+  unsigned int offset =
+      0;  // byte offset into the pointee, to capture a struct field via a pointer arg
   bool is_pointer = false;
   std::string label;
   std::string c_type;
@@ -34,6 +36,7 @@ struct ProbeArgCaptureSpec {
     json_object* j = json_object_new_object();
     json_object_object_add(j, "index", json_object_new_int(index));
     json_object_object_add(j, "num_bytes", json_object_new_int(num_bytes));
+    json_object_object_add(j, "offset", json_object_new_int(offset));
     json_object_object_add(j, "is_pointer", json_object_new_boolean(is_pointer));
     json_object_object_add(j, "label", json_object_new_string(label.c_str()));
     json_object_object_add(j, "c_type", json_object_new_string(c_type.c_str()));
@@ -46,6 +49,7 @@ struct ProbeArgCaptureSpec {
     json_object* obj = nullptr;
     if (json_object_object_get_ex(j, "index", &obj)) spec.index = json_object_get_int(obj);
     if (json_object_object_get_ex(j, "num_bytes", &obj)) spec.num_bytes = json_object_get_int(obj);
+    if (json_object_object_get_ex(j, "offset", &obj)) spec.offset = json_object_get_int(obj);
     if (json_object_object_get_ex(j, "is_pointer", &obj)) {
       spec.is_pointer = json_object_get_boolean(obj);
     }

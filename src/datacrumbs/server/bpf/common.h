@@ -14,6 +14,7 @@
 
 DATACRUMBS_MAP_EXTERN(pid_map, u32, u64, 1024);
 DATACRUMBS_MAP_EXTERN(fn_pid_map, struct fn_key_t, struct fn_value_t);
+DATACRUMBS_MAP_EXTERN(probe_guard, u64, struct probe_guard_t, DATACRUMBS_MAX_RUNTIME_FUNCTIONS);
 DATACRUMBS_MAP_EXTERN(event_arg_config_map, u64, struct runtime_event_config_t,
                       DATACRUMBS_MAX_RUNTIME_FUNCTIONS);
 extern struct {
@@ -161,10 +162,39 @@ static inline __attribute__((always_inline)) int need_tracing(struct fn_key_t* k
 }
 #endif
 
-static inline __attribute__((always_inline)) const struct runtime_event_config_t*
-resolve_event_config(u64 attach_cookie) {
+static inline __attribute__((always_inline))
+const struct runtime_event_config_t* resolve_event_config(u64 attach_cookie) {
   return (const struct runtime_event_config_t*)bpf_map_lookup_elem(&event_arg_config_map,
                                                                    &attach_cookie);
+}
+
+#ifndef DATACRUMBS_HOT_PROBE_WINDOW_NS
+#define DATACRUMBS_HOT_PROBE_WINDOW_NS 100000000ULL  // 100ms window
+#endif
+#ifndef DATACRUMBS_HOT_PROBE_MAX_PER_WINDOW
+#define DATACRUMBS_HOT_PROBE_MAX_PER_WINDOW 20000ULL  // ~200k events/s/probe cap
+#endif
+
+// Guard against a runaway probe (e.g. a busy-poll loop firing millions/s): cap emitted events per
+// probe per window; excess is dropped and counted so a per-event trace of a hot loop can't wedge
+// the writer. Returns 1 => drop. Normal probes fire far below the cap and are unaffected.
+static inline __attribute__((always_inline)) int hot_probe_drop(u64 event_id, u64 te) {
+  struct probe_guard_t* g = (struct probe_guard_t*)bpf_map_lookup_elem(&probe_guard, &event_id);
+  if (g == NULL) {
+    struct probe_guard_t init = {.win_ts = te, .count = 1, .dropped = 0};
+    bpf_map_update_elem(&probe_guard, &event_id, &init, BPF_ANY);
+    return 0;
+  }
+  if (te - g->win_ts >= DATACRUMBS_HOT_PROBE_WINDOW_NS) {
+    g->win_ts = te;
+    g->count = 0;
+  }
+  g->count += 1;
+  if (g->count > DATACRUMBS_HOT_PROBE_MAX_PER_WINDOW) {
+    g->dropped += 1;
+    return 1;
+  }
+  return 0;
 }
 
 static inline __attribute__((always_inline)) struct fn_value_t* get_scratch_fn_value(void) {
@@ -318,8 +348,8 @@ static inline __attribute__((always_inline)) void hwc_read_entry(struct fn_value
 // Compute per-call deltas at exit.
 static inline __attribute__((always_inline)) void hwc_fill_exit(const struct fn_value_t* fn,
                                                                 struct generic_event_t* event) {
-  const u32 active = fn->hwc_active;        // cached at entry (no hwc_ctl re-read)
-  const u32 scope = fn->hwc_scope_cached;   // cached at entry
+  const u32 active = fn->hwc_active;       // cached at entry (no hwc_ctl re-read)
+  const u32 scope = fn->hwc_scope_cached;  // cached at entry
   const u32 cpu = bpf_get_smp_processor_id();
   const u64 cpu_base = (u64)cpu * DATACRUMBS_HW_COUNTER_SLOTS;
   event->hwc_migrated = (cpu != fn->hwc_entry_cpu) ? 1 : 0;
@@ -332,7 +362,7 @@ static inline __attribute__((always_inline)) void hwc_fill_exit(const struct fn_
     event->hwc_running_delta[s] = 0;
     event->hwc_cpu_delta[s] = 0;
   }
-  if (scope != 0) {  // task or both: primary is the task counter
+  if (scope != 0) {                             // task or both: primary is the task counter
     const int slot = fn->hwc_task_slot_cached;  // cached at entry (no hwc_task_slot re-read)
     if (slot >= 0)
       event->hwc_valid_mask =
@@ -451,10 +481,11 @@ static inline __attribute__((always_inline)) void capture_runtime_args(
     }
     if (config->arg_is_pointer[index] && raw_value != 0) {
       fn->arg_data_len[index] = num_bytes;
+      const void* src = (const void*)(raw_value + config->arg_offset[index]);
       if (config->probe_kind == DATACRUMBS_RUNTIME_PROBE_KIND_UPROBE) {
-        err = bpf_probe_read_user(fn->arg_data[index], num_bytes, (const void*)raw_value);
+        err = bpf_probe_read_user(fn->arg_data[index], num_bytes, src);
       } else {
-        err = bpf_probe_read_kernel(fn->arg_data[index], num_bytes, (const void*)raw_value);
+        err = bpf_probe_read_kernel(fn->arg_data[index], num_bytes, src);
       }
       fn->arg_data_status[index] = err == 0 ? 2 : 3;
       continue;
@@ -506,10 +537,11 @@ static inline __attribute__((always_inline)) void capture_runtime_raw_args(
     }
     if (config->arg_is_pointer[index] && raw_value != 0) {
       fn->arg_data_len[index] = num_bytes;
+      const void* src = (const void*)(raw_value + config->arg_offset[index]);
       if (read_user_pointers) {
-        err = bpf_probe_read_user(fn->arg_data[index], num_bytes, (const void*)raw_value);
+        err = bpf_probe_read_user(fn->arg_data[index], num_bytes, src);
       } else {
-        err = bpf_probe_read_kernel(fn->arg_data[index], num_bytes, (const void*)raw_value);
+        err = bpf_probe_read_kernel(fn->arg_data[index], num_bytes, src);
       }
       fn->arg_data_status[index] = err == 0 ? 2 : 3;
       continue;
@@ -563,8 +595,8 @@ static inline __attribute__((always_inline)) void capture_runtime_usdt_args(
 
 #if defined(DATACRUMBS_ENABLE) && (DATACRUMBS_ENABLE == 1)
 #if defined(DATACRUMBS_MODE) && (DATACRUMBS_MODE == 1)
-static inline __attribute__((always_inline)) int generic_entry(struct pt_regs* ctx,
-                                                               u64 attach_cookie) {
+static inline
+    __attribute__((always_inline)) int generic_entry(struct pt_regs* ctx, u64 attach_cookie) {
   // pid gate FIRST: kprobes fire system-wide
   // so most hits are untraced pids.
   // bail before the per-event config lookup to drop a map lookup on that path.
@@ -588,8 +620,8 @@ static inline __attribute__((always_inline)) int generic_entry(struct pt_regs* c
   return 0;
 }
 #else
-static inline __attribute__((always_inline)) int generic_entry(struct pt_regs* ctx,
-                                                               u64 attach_cookie) {
+static inline
+    __attribute__((always_inline)) int generic_entry(struct pt_regs* ctx, u64 attach_cookie) {
   // pid gate FIRST (see generic_entry above): bail before the config lookup.
   struct fn_key_t key = {};
   u64 start_ts;
@@ -611,15 +643,15 @@ static inline __attribute__((always_inline)) int generic_entry(struct pt_regs* c
 }
 #endif
 #else
-static inline __attribute__((always_inline)) int generic_entry(struct pt_regs* ctx,
-                                                               u64 attach_cookie) {
+static inline
+    __attribute__((always_inline)) int generic_entry(struct pt_regs* ctx, u64 attach_cookie) {
   return 0;
 }
 #endif
 #if defined(DATACRUMBS_ENABLE) && (DATACRUMBS_ENABLE == 1)
 #if defined(DATACRUMBS_MODE) && (DATACRUMBS_MODE == 1)
-static inline __attribute__((always_inline)) int generic_exit(struct pt_regs* ctx,
-                                                              u64 attach_cookie) {
+static inline
+    __attribute__((always_inline)) int generic_exit(struct pt_regs* ctx, u64 attach_cookie) {
   // pid gate FIRST (see generic_entry): bail before the config + state lookups.
   struct fn_key_t key = {};
   u64 start_ts = 0;
@@ -634,6 +666,7 @@ static inline __attribute__((always_inline)) int generic_exit(struct pt_regs* ct
   struct fn_value_t* fn = bpf_map_lookup_elem(&fn_pid_map, &key);
   if (fn == 0) return 0;  // missed entry
   DATACRUMBS_SKIP_SMALL_EVENTS(fn, te);
+  if (hot_probe_drop(event_id, te)) return 0;  // rate-limit a runaway (busy-poll) probe
   struct generic_event_t* event;
   DATACRUMBS_RB_RESERVE(output, struct generic_event_t, event);
   event->type = config->probe_kind;
@@ -647,8 +680,8 @@ static inline __attribute__((always_inline)) int generic_exit(struct pt_regs* ct
   return 0;
 }
 #else
-static inline __attribute__((always_inline)) int generic_exit(struct pt_regs* ctx,
-                                                              u64 attach_cookie) {
+static inline
+    __attribute__((always_inline)) int generic_exit(struct pt_regs* ctx, u64 attach_cookie) {
   // pid gate FIRST (see generic_entry): bail before the config + state lookups.
   struct fn_key_t key = {};
   u64 start_ts;
@@ -688,8 +721,8 @@ static inline __attribute__((always_inline)) int generic_exit(struct pt_regs* ct
 }
 #endif
 #else
-static inline __attribute__((always_inline)) int generic_exit(struct pt_regs* ctx,
-                                                              u64 attach_cookie) {
+static inline
+    __attribute__((always_inline)) int generic_exit(struct pt_regs* ctx, u64 attach_cookie) {
   return 0;
 }
 #endif
@@ -735,8 +768,8 @@ static inline __attribute__((always_inline)) int generic_syscall_entry(
 #endif
 
 #if defined(DATACRUMBS_ENABLE) && (DATACRUMBS_ENABLE == 1)
-static inline __attribute__((always_inline)) int usdt_entry(struct pt_regs* ctx,
-                                                            u64 attach_cookie) {
+static inline
+    __attribute__((always_inline)) int usdt_entry(struct pt_regs* ctx, u64 attach_cookie) {
   // pid gate FIRST (see generic_entry above): bail before the config lookup.
   struct fn_key_t key = {};
   u64 start_ts;
@@ -759,8 +792,8 @@ static inline __attribute__((always_inline)) int usdt_entry(struct pt_regs* ctx,
 }
 
 #else
-static inline __attribute__((always_inline)) int usdt_entry(struct pt_regs* ctx,
-                                                            u64 attach_cookie) {
+static inline
+    __attribute__((always_inline)) int usdt_entry(struct pt_regs* ctx, u64 attach_cookie) {
   return 0;
 }
 #endif
@@ -783,6 +816,7 @@ static inline __attribute__((always_inline)) int usdt_exit(struct pt_regs* ctx, 
   struct fn_value_t* fn = bpf_map_lookup_elem(&fn_pid_map, &key);
   if (fn == 0) return 0;  // missed entry
   DATACRUMBS_SKIP_SMALL_EVENTS(fn, te);
+  if (hot_probe_drop(event_id, te)) return 0;  // rate-limit a runaway (busy-poll) probe
   struct generic_event_t* event;
   DATACRUMBS_RB_RESERVE(output, struct generic_event_t, event);
   event->type = config->probe_kind;
@@ -859,8 +893,8 @@ static inline __attribute__((always_inline)) int usdt_exit(struct pt_regs* ctx, 
 #endif
 
 #if defined(DATACRUMBS_ENABLE) && (DATACRUMBS_ENABLE == 1)
-static inline __attribute__((always_inline)) int generic_fork_exit(struct pt_regs* ctx,
-                                                                   u64 event_id) {
+static inline
+    __attribute__((always_inline)) int generic_fork_exit(struct pt_regs* ctx, u64 event_id) {
   // pid gate FIRST (see generic_entry above): bail before the config lookup.
   struct fn_key_t key = {};
   key.event_id = event_id;
@@ -879,8 +913,8 @@ static inline __attribute__((always_inline)) int generic_fork_exit(struct pt_reg
 }
 
 #else
-static inline __attribute__((always_inline)) int generic_fork_exit(struct pt_regs* ctx,
-                                                                   u64 event_id) {
+static inline
+    __attribute__((always_inline)) int generic_fork_exit(struct pt_regs* ctx, u64 event_id) {
   return 0;
 }
 #endif

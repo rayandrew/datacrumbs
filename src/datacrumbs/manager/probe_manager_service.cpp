@@ -204,7 +204,7 @@ bool validate_function_arguments(json_object* function_arguments, const std::str
         continue;
       }
       if (!validate_exact_keys(arg_spec, {"index", "num_bytes", "is_pointer", "label", "c_type"},
-                               {"group"}, arg_context, errors)) {
+                               {"group", "offset"}, arg_context, errors)) {
         ok = false;
       }
       json_object* value = nullptr;

@@ -118,10 +118,16 @@ static int populate_event_arg_config(
     for (unsigned int index = 0; index < config.arg_count; ++index) {
       const auto& spec = (*arg_specs)[index];
       config.arg_index[index] = (*arg_specs)[index].index;
+      config.arg_offset[index] = spec.offset;
       if (spec.is_pointer) {
         if (is_char_pointer_type(spec.c_type)) {
           config.arg_num_bytes[index] =
               std::min<unsigned int>(spec.num_bytes, DATACRUMBS_MAX_CAPTURE_BYTES);
+          config.arg_is_pointer[index] = 1;
+        } else if (spec.num_bytes > 0) {
+          // non-char pointer: read a scalar struct field at ptr+offset (num_bytes<=8, decoded by
+          // writer)
+          config.arg_num_bytes[index] = std::min<unsigned int>(spec.num_bytes, 8U);
           config.arg_is_pointer[index] = 1;
         } else {
           config.arg_num_bytes[index] = 0;
