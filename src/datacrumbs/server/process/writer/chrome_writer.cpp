@@ -273,9 +273,7 @@ ChromeWriter::ChromeWriter()
   for (long i = 0; i < nthreads; ++i) workers_.emplace_back([this]() { this->worker_loop(); });
 }
 
-// mmap the dc_timesync daemon's read-only snapshot. Best-effort: if the daemon
-// is not running / file absent, tsync_ stays null and timestamps pass through
-// as CLOCK_MONOTONIC (trace is honestly labeled clock_domain=monotonic).
+// mmap the daemon snapshot (best-effort; null -> timestamps stay CLOCK_MONOTONIC).
 void ChromeWriter::map_timesync_snapshot() {
   const char* path = std::getenv("DC_TIMESYNC_SNAPSHOT");
   if (!path) path = DC_TIMESYNC_DEFAULT_PATH;
@@ -291,8 +289,7 @@ void ChromeWriter::map_timesync_snapshot() {
   DC_LOG_PRINT("dc_timesync snapshot mapped from %s", path);
 }
 
-// Remap a CLOCK_MONOTONIC ns timestamp onto the reference PHC timeline via the
-// daemon snapshot (seqlock-consistent read). Passthrough if no valid fix.
+// Remap CLOCK_MONOTONIC ns onto the reference PHC via the seqlock snapshot; passthrough if no fix.
 unsigned long long ChromeWriter::remap_ts(unsigned long long mono_ns) const {
   if (!tsync_) return mono_ns;
   dc_timesync_snapshot s;
@@ -429,9 +426,8 @@ std::string ChromeWriter::serialize_event(EventWithId* event_with_id) {
 
     if (len > 0) result = std::string(buffer, len) + ",\"args\":" + args_json + "}\n";
   }
-  // Emit one metadata line stating whether ts are on the shared reference timeline
-  // (dc_timesync mapped) or raw CLOCK_MONOTONIC, so a reader can never mistake one
-  // for the other. Prepended to the first serialized event line.
+  // Clock-domain metadata on the first line. global emits the full fit (offset/skew/anchor) so a
+  // reader can remap other same-domain-PHC timestamps (e.g. NIC hw_ns) exactly, not just monotonic.
   if (!domain_emitted_.exchange(true)) {
     char meta[256];
     int mlen;
@@ -440,9 +436,10 @@ std::string ChromeWriter::serialize_event(EventWithId* event_with_id) {
     if (tsync_ && s.magic == DC_TIMESYNC_MAGIC && s.valid)
       mlen = std::snprintf(
           meta, sizeof(meta),
-          R"({"name":"datacrumbs.clock_domain","ph":"M","args":{"domain":"global","ref_id":%u,"self_id":%u,"offset_ns":%lld,"skew_ppb":%lld}})"
+          R"({"name":"datacrumbs.clock_domain","ph":"M","args":{"domain":"global","ref_id":%u,"self_id":%u,"offset_ns":%lld,"skew_ppb":%lld,"anchor_phc_ns":%lld}})"
           "\n",
-          s.ref_id, s.self_id, (long long)s.offset_ns, (long long)s.skew_ppb);
+          s.ref_id, s.self_id, (long long)s.offset_ns, (long long)s.skew_ppb,
+          (long long)s.anchor_phc_ns);
     else
       mlen = std::snprintf(
           meta, sizeof(meta),
