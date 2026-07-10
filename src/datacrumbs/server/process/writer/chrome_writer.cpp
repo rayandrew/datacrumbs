@@ -361,8 +361,9 @@ std::string ChromeWriter::serialize_event(EventWithId* event_with_id) {
   auto args = event_with_id->args;
   std::string result;
 
-  unsigned int pid = event_with_id->tgid_pid;
-  unsigned int tid = event_with_id->tgid_pid >> 32;
+  // bpf_get_current_pid_tgid() packs tgid<<32 | tid: low half is the thread, high half the process.
+  unsigned int tid = event_with_id->tgid_pid;
+  unsigned int pid = event_with_id->tgid_pid >> 32;
   auto it = configManager_->category_map.find(event_with_id->event_id);
   if (it != configManager_->category_map.end()) {
     std::string probe_name = it->second.first;
