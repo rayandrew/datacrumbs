@@ -14,7 +14,10 @@
 #include <stdint.h>
 
 #define DC_TIMESYNC_MAGIC 0x44435453u  // "DCTS"
-#define DC_TIMESYNC_VERSION 1u
+// v2 APPENDS the local clock registry (clocks[]) after the v1 body. Appending keeps v1 readers valid:
+// they mmap sizeof(v1) and see an unchanged prefix. Bump only for prefix-breaking changes.
+#define DC_TIMESYNC_VERSION 2u
+#define DC_TIMESYNC_MAX_CLOCKS 8
 // Default publish path (mmap'd file). Override via env DC_TIMESYNC_SNAPSHOT.
 #define DC_TIMESYNC_DEFAULT_PATH "/dev/shm/dc_timesync.snapshot"
 
@@ -45,6 +48,26 @@ struct dc_timesync_snapshot {
 
   uint64_t updated_mono_ns;  // CLOCK_MONOTONIC ns of last successful update
   double residual_rms_ns;    // fit quality (diagnostic)
+
+  // ---- v2: local clock registry ------------------------------------------------------------
+  // The fit above maps ONE clock (synced_phc_index) onto the reference. But a NIC hardware
+  // timestamp comes from whichever device carried the traffic, and a node has several independent
+  // PHCs (BlueField exposes 4). Without this table a hw timestamp from another PHC is silently ~20 s
+  // away from the reference. Each entry bridges one local PHC onto the synced one; the PHCs share an
+  // oscillator so the delta is stable (~2 ns/s drift), and it is measured by differencing two
+  // PTP_SYS_OFFSET_PRECISE reads (hardware cross-timestamping), i.e. sub-ns.
+  //
+  // Remap a hw timestamp t_phc taken on PHC k:
+  //   t_synced = t_phc + clocks[k].delta_to_synced_ns
+  //   t_ref    = t_synced + offset_ns + skew_ppb * (t_synced - anchor_phc_ns) / 1e9
+  uint32_t n_clocks;          // entries populated in clocks[]
+  int32_t synced_phc_index;   // the PHC the fit above refers to; -1 if unknown
+  struct dc_timesync_clock {
+    int32_t phc_index;            // N of /dev/ptpN
+    uint32_t valid;               // 0 = not measured this cycle; do NOT remap with it
+    int64_t delta_to_synced_ns;   // ADD to this PHC's ns -> synced PHC ns (0 for the synced PHC)
+    uint64_t updated_mono_ns;     // CLOCK_MONOTONIC ns of this entry's last measurement
+  } clocks[DC_TIMESYNC_MAX_CLOCKS];
 };
 
 #ifdef __cplusplus
