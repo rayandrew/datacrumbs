@@ -12,6 +12,8 @@
 #include <cstdint>
 #include <cstring>
 #include <map>
+#include <set>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -51,6 +53,8 @@ int g_entry_prog_id = -1, g_exit_prog_id = -1, g_cfg_map_id = -1, g_output_id = 
 std::map<int, int> g_fd2id;  // kernel map fd -> bpftime map id
 std::atomic<bool> g_drain_stop{false};
 std::thread g_drain_thread;
+std::atomic<bool> g_autoinject_stop{false};
+std::thread g_autoinject_thread;
 
 int mirror_prog(struct bpf_program* pr) {
   const struct bpf_insn* ins = bpf_program__insns(pr);
@@ -173,6 +177,35 @@ int bpftime_hot_inject(int pid, const char* agent_so) {
   frida_unref(injector);
   frida_deinit();
   return rc;
+}
+
+int bpftime_hot_start_autoinject(int kernel_pid_map_fd, const char* agent_so) {
+  if (!g_inited || kernel_pid_map_fd < 0) return -1;
+  std::string agent = agent_so;
+  g_autoinject_stop.store(false);
+  g_autoinject_thread = std::thread([kernel_pid_map_fd, agent]() {
+    std::set<uint32_t> injected;
+    while (!g_autoinject_stop.load(std::memory_order_relaxed)) {
+      uint32_t key = 0, next = 0;
+      int ret = bpf_map_get_next_key(kernel_pid_map_fd, nullptr, &next);
+      while (ret == 0) {
+        if (injected.find(next) == injected.end() && bpftime_hot_inject((int)next, agent.c_str()) == 0)
+          injected.insert(next);
+        key = next;
+        ret = bpf_map_get_next_key(kernel_pid_map_fd, &key, &next);
+      }
+      usleep(200000);
+    }
+  });
+  DC_LOG_INFO("bpftime: auto-inject thread watching kernel pid_map (agent=%s)", agent.c_str());
+  return 0;
+}
+
+void bpftime_hot_stop_autoinject() {
+  if (g_autoinject_thread.joinable()) {
+    g_autoinject_stop.store(true);
+    g_autoinject_thread.join();
+  }
 }
 
 }  // namespace datacrumbs

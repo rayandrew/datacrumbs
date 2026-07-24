@@ -162,9 +162,8 @@ static int attach_hot_via_bpftime(struct bpf_object* obj, int kernel_cfg_fd,
   if (is_usdt) return -1;  // USDT hot path not wired yet
   if (datacrumbs::bpftime_hot_init(obj) != 0) return -1;
   if (datacrumbs::bpftime_hot_attach_uprobe(binary, offset, cookie, kernel_cfg_fd) != 0) return -1;
-  DC_LOG_INFO("bpftime: %s registered in shm; agent inject + ring drain pending, keeping kernel probe",
-              func.c_str());
-  return -1;  // flip to 0 once inject + drain land
+  DC_LOG_INFO("bpftime: %s routed to bpftime (agent auto-injected per traced pid)", func.c_str());
+  return 0;  // committed to bpftime; skip the kernel uprobe
 }
 #endif
 
@@ -759,12 +758,10 @@ static int main_process(datacrumbs::EventProcessor* event_processor) {
   // hot uprobes emit into bpftime's own shm ring; drain it into the same event_processor
   if (datacrumbs::bpftime_hot_active()) {
     datacrumbs::bpftime_hot_start_drain(handle_event, event_processor);
-    // TODO(auto-inject): inject on trace_client_start so any traced pid is covered. For now a test
-    // hook injects into a known pid; DC_BPFTIME_AGENT overrides the agent .so path.
-    if (const char* hp = getenv("DC_BPFTIME_HOT_PID")) {
-      const char* agent = getenv("DC_BPFTIME_AGENT");
-      datacrumbs::bpftime_hot_inject(atoi(hp), agent ? agent : "libbpftime-agent.so");
-    }
+    // inject the agent into every traced pid (kernel pid_map is populated by trace_client_start)
+    const char* agent = getenv("DC_BPFTIME_AGENT");
+    datacrumbs::bpftime_hot_start_autoinject(bpf_map__fd(skel->maps.pid_map),
+                                             agent ? agent : "libbpftime-agent.so");
   }
 #endif
 #if defined(DATACRUMBS_ENABLE_HW_COUNTERS) && (DATACRUMBS_ENABLE_HW_COUNTERS == 1)
@@ -1027,6 +1024,7 @@ static int main_process(datacrumbs::EventProcessor* event_processor) {
   }
 
 #if defined(DATACRUMBS_BPFTIME_COMPATIBLE_FLAG) && (DATACRUMBS_BPFTIME_COMPATIBLE_FLAG == 1)
+  datacrumbs::bpftime_hot_stop_autoinject();
   datacrumbs::bpftime_hot_stop_drain();
 #endif
 #if defined(DATACRUMBS_MODE) && (DATACRUMBS_MODE == 1)

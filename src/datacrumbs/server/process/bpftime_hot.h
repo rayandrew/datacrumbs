@@ -24,6 +24,11 @@ bool bpftime_hot_active();
 // mirrored programs execute there, and mark that pid traced in the bpftime pid_map. Returns 0 on ok.
 int bpftime_hot_inject(int pid, const char* agent_so);
 
+// Background thread: poll the kernel pid_map (traced pids, set by trace_client_start) and inject the
+// agent into each newly-traced pid, so hot uprobes cover every process datacrumbs traces.
+int bpftime_hot_start_autoinject(int kernel_pid_map_fd, const char* agent_so);
+void bpftime_hot_stop_autoinject();
+
 // Drain the bpftime output ring on a background thread into cb(ctx, data, size) -- pass the same
 // forwarder + event_processor the kernel ring uses so hot events land on the same timeline/pfw.gz.
 int bpftime_hot_start_drain(int (*cb)(void*, void*, size_t), void* ctx);
