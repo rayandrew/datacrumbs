@@ -199,8 +199,10 @@ macro(include_dependencies)
       include_directories(${BPFTIME_INCLUDE_DIR})
       get_filename_component(BPFTIME_LIBRARY_DIR "${BPFTIME_LIBRARY}" DIRECTORY)
       list(APPEND DEPENDENCY_LIBRARY_DIRS ${BPFTIME_LIBRARY_DIR})
+      # -lelf/-lz repeated AFTER the static bpftime libs: its bundled libbpf pulls elf.o late, and
+      # the earlier -lelf has already been processed (static link order).
       set(DEPENDENCY_LIB ${DEPENDENCY_LIB} -Wl,--allow-multiple-definition ${BPFTIME_LIBRARY}
-          ${FRIDA_GUM_LIBRARY} -ldl -lrt -lresolv -lm)
+          ${FRIDA_GUM_LIBRARY} -ldl -lrt -lresolv -lm -lelf -lz)
       message(STATUS "             - Found bpftime:${BPFTIME_LIBRARY} frida-gum:${FRIDA_GUM_LIBRARY}")
     else()
       message(

@@ -146,6 +146,17 @@ std::shared_ptr<Probe> probe_from_json(json_object* probe_obj) {
   }
 }
 
+// uprobe targets carry their attach offset ("probe_target:0xa20"); the offset is only needed to
+// attach, so strip it for the trace name (a catch-all trace is otherwise all "func:0xADDR").
+std::string display_function_name(const std::string& fn) {
+  const auto pos = fn.rfind(":0x");
+  if (pos == std::string::npos) return fn;
+  const auto hex = fn.substr(pos + 3);
+  if (!hex.empty() && hex.find_first_not_of("0123456789abcdefABCDEF") == std::string::npos)
+    return fn.substr(0, pos);
+  return fn;
+}
+
 std::string runtime_event_key(const std::string& probe_name, const std::string& function_name) {
   return probe_name + "\n" + function_name;
 }
@@ -746,7 +757,7 @@ void RuntimeConfigurationManager::load_runtime_probe_file() {
     total_runtime_functions += probe->functions.size();
     for (const auto& function_name : probe->functions) {
       const uint64_t assigned_event_id = event_id++;
-      category_map[assigned_event_id] = std::make_pair(probe->name, function_name);
+      category_map[assigned_event_id] = std::make_pair(probe->name, display_function_name(function_name));
       runtime_event_ids[runtime_event_key(probe->name, function_name)] = assigned_event_id;
       RuntimeEventMetadata metadata;
       metadata.probe_type = probe->type;
