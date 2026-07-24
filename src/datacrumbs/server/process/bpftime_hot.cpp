@@ -46,7 +46,8 @@ int bpftime_poll_from_ringbuf(int rb_fd, void* ctx, int (*cb)(void*, void*, size
 namespace datacrumbs {
 namespace {
 bool g_inited = false;
-int g_entry_prog_id = -1, g_exit_prog_id = -1, g_cfg_map_id = -1, g_output_id = -1, g_pid_map_id = -1;
+int g_entry_prog_id = -1, g_exit_prog_id = -1, g_cfg_map_id = -1, g_output_id = -1, g_pid_map_id = -1,
+    g_dc_hwc_attr_id = -1;
 std::map<int, int> g_fd2id;  // kernel map fd -> bpftime map id
 std::atomic<bool> g_drain_stop{false};
 std::thread g_drain_thread;
@@ -87,6 +88,7 @@ int bpftime_hot_init(struct bpf_object* obj) {
     if (!strcmp(bpf_map__name(m), "event_arg_config_map")) g_cfg_map_id = id;
     if (!strcmp(bpf_map__name(m), "output")) g_output_id = id;
     if (!strcmp(bpf_map__name(m), "pid_map")) g_pid_map_id = id;
+    if (!strcmp(bpf_map__name(m), "dc_hwc_attr")) g_dc_hwc_attr_id = id;
   }
   struct bpf_program* entry = bpf_object__find_program_by_name(obj, "trace_generic_uprobe_entry");
   struct bpf_program* exit = bpf_object__find_program_by_name(obj, "trace_generic_uprobe_exit");
@@ -128,6 +130,20 @@ int bpftime_hot_attach_uprobe(const std::string& binary, unsigned long offset,
 }
 
 bool bpftime_hot_active() { return g_inited; }
+
+int bpftime_hot_set_pmu_attrs(const void* attrs, unsigned int attr_size, unsigned int count) {
+  if (!g_inited || g_dc_hwc_attr_id < 0) return -1;
+  const unsigned char* p = static_cast<const unsigned char*>(attrs);
+  for (unsigned int s = 0; s < count; s++) {
+    unsigned char blob[128] = {};
+    unsigned int n = attr_size < sizeof(blob) ? attr_size : (unsigned int)sizeof(blob);
+    memcpy(blob, p + static_cast<size_t>(s) * attr_size, n);
+    unsigned int key = s;
+    bpftime_map_update_elem(g_dc_hwc_attr_id, &key, blob, 0);
+  }
+  DC_LOG_INFO("bpftime: wrote %u PMU attr(s) into dc_hwc_attr", count);
+  return 0;
+}
 
 int bpftime_hot_start_drain(int (*cb)(void*, void*, size_t), void* ctx, int kernel_pid_map_fd) {
   if (!g_inited || g_output_id < 0) return -1;

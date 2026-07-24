@@ -57,6 +57,16 @@ extern struct {
   __type(key, u32);
   __type(value, u32);
 } hwc_ctl SEC(".maps");
+#if defined(DATACRUMBS_BPFTIME_COMPATIBLE_FLAG) && (DATACRUMBS_BPFTIME_COMPATIBLE_FLAG == 1)
+// slot -> perf_event_attr blob; the server populates it so the agent's dc_pmu_read can open a
+// self counter for the configured event (ubpf has no kernel perf_event_array read).
+extern struct {
+  __uint(type, BPF_MAP_TYPE_ARRAY);
+  __uint(max_entries, DATACRUMBS_HW_COUNTER_SLOTS);
+  __type(key, u32);
+  __type(value, struct dc_pmu_attr_t);
+} dc_hwc_attr SEC(".maps");
+#endif
 DATACRUMBS_RINGBUF_EXTERN(hwc_notify, 64 * 1024U);
 #endif
 
@@ -317,6 +327,48 @@ static inline __attribute__((always_inline)) u32 hwc_delta_ctr(void* map, u64 ba
   return mask;
 }
 
+#if defined(DATACRUMBS_BPFTIME_COMPATIBLE_FLAG) && (DATACRUMBS_BPFTIME_COMPATIBLE_FLAG == 1)
+// bpftime hot path: ubpf has no kernel bpf_perf_event_read, so read task-scoped self counters via the
+// dc_pmu_read helper (opens a self perf_event from the server-provided attr in dc_hwc_attr). Only the
+// primary (task) delta is produced; cpu/both scaling is n/a for a self-monitoring agent.
+static u64 (*dc_pmu_read)(void* attr, u64 slot) = (void*)0x1001;
+static inline __attribute__((always_inline)) void hwc_read_entry(struct fn_value_t* fn) {
+  const u32 active = hwc_active_count();
+  fn->hwc_active = active;
+  fn->hwc_entry_valid_mask = 0;
+#pragma unroll
+  for (int s = 0; s < DATACRUMBS_HW_COUNTER_SLOTS; ++s) {
+    if ((u32)s >= active) break;
+    u32 key = (u32)s;
+    void* attr = bpf_map_lookup_elem(&dc_hwc_attr, &key);
+    if (attr) {
+      fn->hwc_ctr[s] = dc_pmu_read(attr, (u64)s);
+      fn->hwc_entry_valid_mask |= (1u << s);
+    }
+  }
+}
+static inline __attribute__((always_inline)) void hwc_fill_exit(const struct fn_value_t* fn,
+                                                                struct generic_event_t* event) {
+  const u32 active = fn->hwc_active;
+  event->hwc_valid_mask = 0;
+  event->hwc_migrated = 0;
+  event->hwc_cpu_valid_mask = 0;
+#pragma unroll
+  for (int s = 0; s < DATACRUMBS_HW_COUNTER_SLOTS; ++s) {
+    event->hwc_delta[s] = 0;
+    event->hwc_enabled_delta[s] = 0;
+    event->hwc_running_delta[s] = 0;
+    event->hwc_cpu_delta[s] = 0;
+    if ((u32)s >= active) continue;
+    u32 key = (u32)s;
+    void* attr = bpf_map_lookup_elem(&dc_hwc_attr, &key);
+    if (attr && (fn->hwc_entry_valid_mask & (1u << s))) {
+      event->hwc_delta[s] = dc_pmu_read(attr, (u64)s) - fn->hwc_ctr[s];
+      event->hwc_valid_mask |= (1u << s);
+    }
+  }
+}
+#else
 // Snapshot active counters at entry; cache active/scope/slot in fn for exit to reuse.
 static inline __attribute__((always_inline)) void hwc_read_entry(struct fn_value_t* fn) {
   const u32 active = hwc_active_count();
@@ -381,6 +433,7 @@ static inline __attribute__((always_inline)) void hwc_fill_exit(const struct fn_
                       event->hwc_cpu_delta);
   }
 }
+#endif  // DATACRUMBS_BPFTIME_COMPATIBLE_FLAG
 #else
 static inline __attribute__((always_inline)) void hwc_read_entry(struct fn_value_t* fn) {
   (void)fn;

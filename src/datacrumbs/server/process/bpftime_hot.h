@@ -20,6 +20,10 @@ int bpftime_hot_attach_uprobe(const std::string& binary, unsigned long offset,
 
 bool bpftime_hot_active();
 
+// Write the configured PMU perf_event_attrs (one per slot) into the bpftime dc_hwc_attr map so the
+// agent's dc_pmu_read helper can open a self counter per slot. attr_size = sizeof(perf_event_attr).
+int bpftime_hot_set_pmu_attrs(const void* attrs, unsigned int attr_size, unsigned int count);
+
 // Injection is by LD_PRELOAD-ing libbpftime-agent.so into the workload at launch (its ctor calls
 // bpftime_agent_main); no server-side inject.
 
