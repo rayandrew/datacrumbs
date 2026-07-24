@@ -485,6 +485,10 @@ set(DATACRUMBS_PROCESS_EVENTS_OBJ_SRC
 set(DATACRUMBS_SERVER_SRC
     ${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/server/process/server.cpp
 )
+if(DATACRUMBS_BPFTIME_COMPATIBLE)
+  list(APPEND DATACRUMBS_SERVER_SRC
+      ${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/server/process/bpftime_hot.cpp)
+endif()
 
 include_directories(${CMAKE_INCLUDE_OUTPUT_DIRECTORY})
 
