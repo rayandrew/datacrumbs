@@ -308,14 +308,21 @@ struct KProbe : public Probe {
 struct UProbe : public Probe {
  public:
   UProbe(const UProbe& other)
-      : Probe(other), binary_path(other.binary_path), include_offsets(other.include_offsets) {
+      : Probe(other),
+        binary_path(other.binary_path),
+        include_offsets(other.include_offsets),
+        hot(other.hot) {
     DC_LOG_TRACE("UProbe copy constructor called");
   }
-  UProbe() : Probe(ProbeType::UPROBE), binary_path(), include_offsets(false) {
+  UProbe() : Probe(ProbeType::UPROBE), binary_path(), include_offsets(false), hot(false) {
     DC_LOG_TRACE("UProbe constructor called");
   }
   std::string binary_path;  // Path to the binary being probed
   bool include_offsets;
+  // Route this uprobe through bpftime's userspace runtime (frida inline-hook, ~335ns)
+  // instead of the kernel trap (~1us). Only honored in a DATACRUMBS_BPFTIME_COMPATIBLE
+  // build; ignored otherwise. Use for hot function boundaries that a kernel uprobe would wedge.
+  bool hot;
   // Validates the uprobe's configuration
   bool validate() const override {
     DC_LOG_TRACE("UProbe::validate called");
@@ -333,6 +340,7 @@ struct UProbe : public Probe {
     json_object* j = Probe::toJson(include_functions);
     json_object_object_add(j, "binary_path", json_object_new_string(binary_path.c_str()));
     json_object_object_add(j, "include_offsets", json_object_new_boolean(include_offsets));
+    json_object_object_add(j, "hot", json_object_new_boolean(hot));
     return j;
   }
 
@@ -351,6 +359,9 @@ struct UProbe : public Probe {
     json_object* include_offsets_obj = json_object_object_get(j, "include_offsets");
     if (include_offsets_obj) p.include_offsets = json_object_get_boolean(include_offsets_obj);
 
+    json_object* hot_obj = json_object_object_get(j, "hot");
+    if (hot_obj) p.hot = json_object_get_boolean(hot_obj);
+
     return p;
   }
 };
@@ -359,14 +370,16 @@ struct UProbe : public Probe {
 struct USDTProbe : public Probe {
  public:
   USDTProbe(const USDTProbe& other)
-      : Probe(other), binary_path(other.binary_path), provider(other.provider) {
+      : Probe(other), binary_path(other.binary_path), provider(other.provider), hot(other.hot) {
     DC_LOG_TRACE("USDTProbe copy constructor called");
   }
-  USDTProbe() : Probe(ProbeType::USDT), binary_path(), provider() {
+  USDTProbe() : Probe(ProbeType::USDT), binary_path(), provider(), hot(false) {
     DC_LOG_TRACE("USDTProbe constructor called");
   }
   std::string binary_path;  // Path to the binary being probed
   std::string provider;     // USDT provider name
+  // Route through bpftime's userspace runtime instead of a kernel USDT probe (see UProbe::hot).
+  bool hot;
 
   // Validates the USDT probe's configuration
   bool validate() const override {
@@ -389,6 +402,7 @@ struct USDTProbe : public Probe {
     json_object* j = Probe::toJson(include_functions);
     json_object_object_add(j, "binary_path", json_object_new_string(binary_path.c_str()));
     json_object_object_add(j, "provider", json_object_new_string(provider.c_str()));
+    json_object_object_add(j, "hot", json_object_new_boolean(hot));
     return j;
   }
 
@@ -407,6 +421,9 @@ struct USDTProbe : public Probe {
 
     json_object* provider_obj = json_object_object_get(j, "provider");
     if (provider_obj) p.provider = json_object_get_string(provider_obj);
+
+    json_object* hot_obj = json_object_object_get(j, "hot");
+    if (hot_obj) p.hot = json_object_get_boolean(hot_obj);
 
     return p;
   }

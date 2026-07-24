@@ -696,9 +696,11 @@ bool ProbeManagerService::validate_signing_payload(const std::string& signing_pa
       if (probe_type == datacrumbs::ProbeType::UPROBE) {
         required_keys.insert("binary_path");
         required_keys.insert("include_offsets");
+        optional_keys.insert("hot");  // route through bpftime userspace runtime
       } else if (probe_type == datacrumbs::ProbeType::USDT) {
         required_keys.insert("binary_path");
         required_keys.insert("provider");
+        optional_keys.insert("hot");  // route through bpftime userspace runtime
       } else if (probe_type == datacrumbs::ProbeType::CUSTOM) {
         required_keys.insert("bpf_path");
         required_keys.insert("start_event_id");

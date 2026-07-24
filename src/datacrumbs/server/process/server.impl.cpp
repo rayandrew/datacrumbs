@@ -147,6 +147,31 @@ static int populate_event_arg_config(
   return 0;
 }
 
+#if defined(DATACRUMBS_BPFTIME_COMPATIBLE_FLAG) && (DATACRUMBS_BPFTIME_COMPATIBLE_FLAG == 1)
+// Route a hot userspace probe (uprobe or USDT) through bpftime's userspace runtime -- the
+// eBPF handler runs in the target via a frida inline-hook (~335ns) instead of the kernel
+// trap (~1us DPU / ~17us host), which a hot boundary (e.g. DDS pread2) would otherwise wedge.
+// `cookie` is the bpf_cookie the datacrumbs programs use to resolve their event config.
+// Returns 0 on success; nonzero => the caller falls back to the kernel attach (safe default:
+// cold probes and any process we cannot inject into stay on the kernel path).
+static int attach_hot_via_bpftime(const std::string& binary, const std::string& func,
+                                  unsigned long offset, unsigned long long cookie, bool is_usdt,
+                                  const std::string& usdt_provider) {
+  // TODO(phase3-exec): load the compat-compiled datacrumbs uprobe program into bpftime's ubpf
+  // VM, mirror its maps + output ring into shm, bpftime_uprobe_create() this attach point, and
+  // frida-inject the runtime agent into the target pid(s); drain the shm ring into the same
+  // event_processor. De-risk first: confirm the real program loads in ubpf on the synth target.
+  (void)offset;
+  (void)cookie;
+  DC_LOG_WARN("bpftime hot routing selected for %s %s:%s but execution not yet wired; "
+              "using kernel %s",
+              is_usdt ? "usdt" : "uprobe", binary.c_str(), func.c_str(),
+              is_usdt ? "usdt probe" : "uprobe");
+  (void)usdt_provider;
+  return -1;
+}
+#endif
+
 static int attach_runtime_probes(datacrumbs::EventProcessor* event_processor,
                                  struct datacrumbs_bpf* skel) {
   auto config_manager = event_processor->configManager_;
@@ -305,6 +330,15 @@ static int attach_runtime_probes(datacrumbs::EventProcessor* event_processor,
           entry_opts.func_name = function_name.c_str();
           exit_opts.func_name = function_name.c_str();
         }
+#if defined(DATACRUMBS_BPFTIME_COMPATIBLE_FLAG) && (DATACRUMBS_BPFTIME_COMPATIBLE_FLAG == 1)
+        if (uprobe->hot && attach_hot_via_bpftime(uprobe->binary_path, function_name, offset,
+                                                  current_cookie, false, "") == 0) {
+          config_manager->record_successful_runtime_probe(probe, function_name);
+          runtime_probe_state_updated = true;
+          total_attached += 2;
+          continue;  // routed to bpftime; skip the kernel attach
+        }
+#endif
         auto* entry_link = bpf_program__attach_uprobe_opts(
             uprobe_entry, -1, uprobe->binary_path.c_str(), offset, &entry_opts);
         auto* exit_link = bpf_program__attach_uprobe_opts(
@@ -332,6 +366,16 @@ static int attach_runtime_probes(datacrumbs::EventProcessor* event_processor,
         struct bpf_usdt_opts exit_opts = {};
         exit_opts.sz = sizeof(exit_opts);
         exit_opts.usdt_cookie = current_cookie;
+#if defined(DATACRUMBS_BPFTIME_COMPATIBLE_FLAG) && (DATACRUMBS_BPFTIME_COMPATIBLE_FLAG == 1)
+        if (usdt && usdt->hot &&
+            attach_hot_via_bpftime(usdt->binary_path, function_name, 0, current_cookie, true,
+                                   usdt->provider) == 0) {
+          config_manager->record_successful_runtime_probe(probe, function_name);
+          runtime_probe_state_updated = true;
+          total_attached += 2;
+          continue;  // routed to bpftime; skip the kernel attach
+        }
+#endif
         auto* entry_link = usdt ? bpf_program__attach_usdt(
                                       usdt_entry, -1, usdt->binary_path.c_str(),
                                       usdt->provider.c_str(), function_name.c_str(), &entry_opts)
