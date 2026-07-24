@@ -20,13 +20,12 @@ int bpftime_hot_attach_uprobe(const std::string& binary, unsigned long offset,
 
 bool bpftime_hot_active();
 
-// The agent reaches the target via LD_PRELOAD at launch (its ctor calls bpftime_agent_main), not a
-// server-side inject: workloads are already launched with LD_PRELOAD=libdatacrumbs_client.so, so add
-// libbpftime-agent.so + AGENT_SO to that chain. (Frida running-pid injection is broken on aarch64.)
+// Injection is by LD_PRELOAD-ing libbpftime-agent.so into the workload at launch (its ctor calls
+// bpftime_agent_main); no server-side inject.
 
-// Drain the bpftime output ring on a background thread into cb(ctx, data, size) -- pass the same
-// forwarder + event_processor the kernel ring uses so hot events land on the same timeline/pfw.gz.
-int bpftime_hot_start_drain(int (*cb)(void*, void*, size_t), void* ctx);
+// Drain the bpftime output ring into cb(ctx,data,size) on a thread (feed the same event_processor as
+// the kernel ring). Also mirrors kernel pid_map -> bpftime pid_map so the agent's need_tracing passes.
+int bpftime_hot_start_drain(int (*cb)(void*, void*, size_t), void* ctx, int kernel_pid_map_fd);
 void bpftime_hot_stop_drain();
 
 }  // namespace datacrumbs

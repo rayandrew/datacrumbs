@@ -756,10 +756,10 @@ static int main_process(datacrumbs::EventProcessor* event_processor) {
   }
 #if defined(DATACRUMBS_BPFTIME_COMPATIBLE_FLAG) && (DATACRUMBS_BPFTIME_COMPATIBLE_FLAG == 1)
   // hot uprobes emit into bpftime's own shm ring; drain it into the same event_processor
-  // hot uprobes run in the target (agent LD_PRELOADed at workload launch) and emit into bpftime's
-  // own shm ring; drain it into the same event_processor
+  // drain bpftime's shm ring (hot uprobes run in the LD_PRELOADed agent) into the same event_processor
   if (datacrumbs::bpftime_hot_active())
-    datacrumbs::bpftime_hot_start_drain(handle_event, event_processor);
+    datacrumbs::bpftime_hot_start_drain(handle_event, event_processor,
+                                        bpf_map__fd(skel->maps.pid_map));
 #endif
 #if defined(DATACRUMBS_ENABLE_HW_COUNTERS) && (DATACRUMBS_ENABLE_HW_COUNTERS == 1)
   if (hw_task_active &&

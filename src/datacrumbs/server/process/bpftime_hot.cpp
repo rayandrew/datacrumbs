@@ -46,7 +46,7 @@ int bpftime_poll_from_ringbuf(int rb_fd, void* ctx, int (*cb)(void*, void*, size
 namespace datacrumbs {
 namespace {
 bool g_inited = false;
-int g_entry_prog_id = -1, g_exit_prog_id = -1, g_cfg_map_id = -1, g_output_id = -1;
+int g_entry_prog_id = -1, g_exit_prog_id = -1, g_cfg_map_id = -1, g_output_id = -1, g_pid_map_id = -1;
 std::map<int, int> g_fd2id;  // kernel map fd -> bpftime map id
 std::atomic<bool> g_drain_stop{false};
 std::thread g_drain_thread;
@@ -86,6 +86,7 @@ int bpftime_hot_init(struct bpf_object* obj) {
     g_fd2id[bpf_map__fd(m)] = id;
     if (!strcmp(bpf_map__name(m), "event_arg_config_map")) g_cfg_map_id = id;
     if (!strcmp(bpf_map__name(m), "output")) g_output_id = id;
+    if (!strcmp(bpf_map__name(m), "pid_map")) g_pid_map_id = id;
   }
   struct bpf_program* entry = bpf_object__find_program_by_name(obj, "trace_generic_uprobe_entry");
   struct bpf_program* exit = bpf_object__find_program_by_name(obj, "trace_generic_uprobe_exit");
@@ -128,16 +129,31 @@ int bpftime_hot_attach_uprobe(const std::string& binary, unsigned long offset,
 
 bool bpftime_hot_active() { return g_inited; }
 
-int bpftime_hot_start_drain(int (*cb)(void*, void*, size_t), void* ctx) {
+int bpftime_hot_start_drain(int (*cb)(void*, void*, size_t), void* ctx, int kernel_pid_map_fd) {
   if (!g_inited || g_output_id < 0) return -1;
   g_drain_stop.store(false);
-  g_drain_thread = std::thread([cb, ctx]() {
+  g_drain_thread = std::thread([cb, ctx, kernel_pid_map_fd]() {
+    int since_sync = 0;
     while (!g_drain_stop.load(std::memory_order_relaxed)) {
       bpftime_poll_from_ringbuf(g_output_id, ctx, cb);
+      // ~every 200ms mirror the kernel pid_map (traced pids) into the bpftime pid_map
+      if (kernel_pid_map_fd >= 0 && g_pid_map_id >= 0 && ++since_sync >= 1000) {
+        since_sync = 0;
+        uint32_t key = 0, next = 0;
+        uint64_t val = 0;
+        int ret = bpf_map_get_next_key(kernel_pid_map_fd, nullptr, &next);
+        while (ret == 0) {
+          if (bpf_map_lookup_elem(kernel_pid_map_fd, &next, &val) == 0)
+            bpftime_map_update_elem(g_pid_map_id, &next, &val, 0);
+          key = next;
+          ret = bpf_map_get_next_key(kernel_pid_map_fd, &key, &next);
+        }
+      }
       usleep(200);
     }
   });
-  DC_LOG_INFO("bpftime: drain thread started on output ring id=%d", g_output_id);
+  DC_LOG_INFO("bpftime: drain thread started (output id=%d, pid_map sync from kernel fd=%d)",
+              g_output_id, kernel_pid_map_fd);
   return 0;
 }
 
