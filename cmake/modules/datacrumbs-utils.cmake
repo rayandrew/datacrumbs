@@ -184,6 +184,31 @@ macro(include_dependencies)
     endif()
   endif()
 
+  # Optional: bpftime (userspace-uprobe runtime) for fast hot-path uprobes. A hot
+  # uprobe runs in userspace via frida inline-hooking (~335ns) instead of the kernel
+  # trap (~1060ns DPU / ~16687ns host). Cross-built into $DEPS as a static
+  # libbpftime.a (+ libfrida-gum.a) by provision/build_dc_dpu.sh --stage bpftime.
+  if(DATACRUMBS_BPFTIME_COMPATIBLE)
+    find_library(BPFTIME_LIBRARY bpftime)
+    find_library(FRIDA_GUM_LIBRARY frida-gum)
+    find_path(BPFTIME_INCLUDE_DIR bpftime_shm.hpp PATH_SUFFIXES bpftime)
+    if(BPFTIME_LIBRARY AND FRIDA_GUM_LIBRARY AND BPFTIME_INCLUDE_DIR)
+      include_directories(${BPFTIME_INCLUDE_DIR})
+      get_filename_component(BPFTIME_LIBRARY_DIR "${BPFTIME_LIBRARY}" DIRECTORY)
+      list(APPEND DEPENDENCY_LIBRARY_DIRS ${BPFTIME_LIBRARY_DIR})
+      # static link order: bpftime pulls frida-gum, which pulls these system libs
+      set(DEPENDENCY_LIB ${DEPENDENCY_LIB} ${BPFTIME_LIBRARY} ${FRIDA_GUM_LIBRARY} -ldl -lrt -lresolv)
+      message(STATUS "             - Found bpftime at lib:${BPFTIME_LIBRARY} frida-gum:${FRIDA_GUM_LIBRARY} include:${BPFTIME_INCLUDE_DIR}")
+    else()
+      message(
+        FATAL_ERROR
+          "[${UPPER_PROJECT_NAME}] DATACRUMBS_BPFTIME_COMPATIBLE=ON but bpftime was not found "
+          "(need libbpftime.a + libfrida-gum.a + bpftime_shm.hpp). Cross-build it with "
+          "provision/build_dc_dpu.sh --stage bpftime, or add its prefix to CMAKE_PREFIX_PATH."
+      )
+    endif()
+  endif()
+
   list(APPEND DEPENDENCY_LIBRARY_DIRS ${DATACRUMBS_INSTALL_LIB_DIR})
   list(REMOVE_DUPLICATES DEPENDENCY_LIBRARY_DIRS)
 
