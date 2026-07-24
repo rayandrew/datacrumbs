@@ -46,7 +46,8 @@ int bpftime_poll_from_ringbuf(int rb_fd, void* ctx, int (*cb)(void*, void*, size
 namespace datacrumbs {
 namespace {
 bool g_inited = false;
-int g_entry_prog_id = -1, g_exit_prog_id = -1, g_cfg_map_id = -1, g_output_id = -1, g_pid_map_id = -1;
+int g_entry_prog_id = -1, g_exit_prog_id = -1, g_cfg_map_id = -1, g_output_id = -1, g_pid_map_id = -1,
+    g_hwc_ctl_id = -1;
 std::map<int, int> g_fd2id;  // kernel map fd -> bpftime map id
 std::atomic<bool> g_drain_stop{false};
 std::thread g_drain_thread;
@@ -87,6 +88,7 @@ int bpftime_hot_init(struct bpf_object* obj) {
     if (!strcmp(bpf_map__name(m), "event_arg_config_map")) g_cfg_map_id = id;
     if (!strcmp(bpf_map__name(m), "output")) g_output_id = id;
     if (!strcmp(bpf_map__name(m), "pid_map")) g_pid_map_id = id;
+    if (!strcmp(bpf_map__name(m), "hwc_ctl")) g_hwc_ctl_id = id;
   }
   struct bpf_program* entry = bpf_object__find_program_by_name(obj, "trace_generic_uprobe_entry");
   struct bpf_program* exit = bpf_object__find_program_by_name(obj, "trace_generic_uprobe_exit");
@@ -128,6 +130,17 @@ int bpftime_hot_attach_uprobe(const std::string& binary, unsigned long offset,
 }
 
 bool bpftime_hot_active() { return g_inited; }
+
+int bpftime_hot_sync_hwc_ctl(int kernel_hwc_ctl_fd) {
+  if (!g_inited || g_hwc_ctl_id < 0 || kernel_hwc_ctl_fd < 0) return -1;
+  for (uint32_t k = 0; k < 2; k++) {
+    uint32_t v = 0;
+    if (bpf_map_lookup_elem(kernel_hwc_ctl_fd, &k, &v) == 0)
+      bpftime_map_update_elem(g_hwc_ctl_id, &k, &v, 0);
+  }
+  DC_LOG_INFO("bpftime: mirrored hwc_ctl into shm");
+  return 0;
+}
 
 int bpftime_hot_start_drain(int (*cb)(void*, void*, size_t), void* ctx, int kernel_pid_map_fd) {
   if (!g_inited || g_output_id < 0) return -1;

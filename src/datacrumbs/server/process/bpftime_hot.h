@@ -20,6 +20,10 @@ int bpftime_hot_attach_uprobe(const std::string& binary, unsigned long offset,
 
 bool bpftime_hot_active();
 
+// Mirror the kernel hwc_ctl ([0]=active count, [1]=scope) into the bpftime map so the agent's
+// hwc_active_count()/hwc_scope() see the configured counters (else it reads 0 and skips the PMU).
+int bpftime_hot_sync_hwc_ctl(int kernel_hwc_ctl_fd);
+
 // Injection is by LD_PRELOAD-ing libbpftime-agent.so into the workload at launch (its ctor calls
 // bpftime_agent_main); no server-side inject.
 
