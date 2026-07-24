@@ -61,12 +61,4 @@ struct {
 } hwc_ctl SEC(".maps");
 // BPF -> userspace notices to open/close per-task events on a tid.
 DATACRUMBS_RINGBUF(hwc_notify, 64 * 1024U);
-#if defined(DATACRUMBS_BPFTIME_COMPATIBLE_FLAG) && (DATACRUMBS_BPFTIME_COMPATIBLE_FLAG == 1)
-struct {
-  __uint(type, BPF_MAP_TYPE_ARRAY);
-  __uint(max_entries, DATACRUMBS_HW_COUNTER_SLOTS);
-  __type(key, u32);
-  __type(value, struct dc_pmu_attr_t);
-} dc_hwc_attr SEC(".maps");
-#endif
 #endif

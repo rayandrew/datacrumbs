@@ -672,11 +672,6 @@ static int main_process(datacrumbs::EventProcessor* event_processor) {
       datacrumbs_bpf__destroy(skel);
       return 1;
     }
-#if defined(DATACRUMBS_BPFTIME_COMPATIBLE_FLAG) && (DATACRUMBS_BPFTIME_COMPATIBLE_FLAG == 1)
-    if (datacrumbs::bpftime_hot_active() && !hw_attrs.empty())
-      datacrumbs::bpftime_hot_set_pmu_attrs(hw_attrs.data(), sizeof(struct perf_event_attr),
-                                            (unsigned int)hw_attrs.size());
-#endif
     if (hw_scope != 0 && !hw_attrs.empty()) {  // task or both: open per-task on demand
       hw_task_mgr.init(skel, std::move(hw_attrs));
       hw_task_active = true;

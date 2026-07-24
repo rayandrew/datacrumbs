@@ -121,12 +121,6 @@ struct string_t {
   char str[MAX_STR_READ_LEN];
 };
 
-// perf_event_attr blob (>= sizeof(struct perf_event_attr)); the server writes the libpfm4-encoded
-// attr here per slot and the bpftime dc_pmu_read helper opens a self counter from it.
-struct dc_pmu_attr_t {
-  unsigned char b[128];
-};
-
 struct profile_key_t {
   unsigned int type;
   unsigned long long id;
