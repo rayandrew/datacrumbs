@@ -755,6 +755,10 @@ static int main_process(datacrumbs::EventProcessor* event_processor) {
     datacrumbs_bpf__destroy(skel);
     return 1;
   }
+#if defined(DATACRUMBS_BPFTIME_COMPATIBLE_FLAG) && (DATACRUMBS_BPFTIME_COMPATIBLE_FLAG == 1)
+  // hot uprobes emit into bpftime's own shm ring; drain it into the same event_processor
+  if (datacrumbs::bpftime_hot_active()) datacrumbs::bpftime_hot_start_drain(handle_event, event_processor);
+#endif
 #if defined(DATACRUMBS_ENABLE_HW_COUNTERS) && (DATACRUMBS_ENABLE_HW_COUNTERS == 1)
   if (hw_task_active &&
       ring_buffer__add(rb, bpf_map__fd(skel->maps.hwc_notify), hwc_notify_cb, &hw_task_mgr) != 0) {
@@ -1014,6 +1018,9 @@ static int main_process(datacrumbs::EventProcessor* event_processor) {
     std::filesystem::remove(event_processor->configManager_->server_ready_file, ec);
   }
 
+#if defined(DATACRUMBS_BPFTIME_COMPATIBLE_FLAG) && (DATACRUMBS_BPFTIME_COMPATIBLE_FLAG == 1)
+  datacrumbs::bpftime_hot_stop_drain();
+#endif
 #if defined(DATACRUMBS_MODE) && (DATACRUMBS_MODE == 1)
   ring_buffer__free(rb);
 #endif

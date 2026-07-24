@@ -5,9 +5,13 @@
 #include <bpf/libbpf.h>
 #include <datacrumbs/common/logging.h>
 
+#include <unistd.h>
+
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <map>
+#include <thread>
 #include <vector>
 
 // Minimal bpftime raw-API decls, kept in sync with runtime/include/bpftime_shm.hpp, so the server
@@ -36,13 +40,16 @@ int bpftime_uprobe_create(int fd, int pid, const char* name, uint64_t offset, bo
                           size_t ref_ctr_off);
 int bpftime_attach_perf_to_bpf_with_cookie(int perf_fd, int bpf_fd, uint64_t cookie);
 long bpftime_map_update_elem(int fd, const void* key, const void* value, uint64_t flags);
+int bpftime_poll_from_ringbuf(int rb_fd, void* ctx, int (*cb)(void*, void*, size_t));
 }
 
 namespace datacrumbs {
 namespace {
 bool g_inited = false;
-int g_entry_prog_id = -1, g_exit_prog_id = -1, g_cfg_map_id = -1;
+int g_entry_prog_id = -1, g_exit_prog_id = -1, g_cfg_map_id = -1, g_output_id = -1;
 std::map<int, int> g_fd2id;  // kernel map fd -> bpftime map id
+std::atomic<bool> g_drain_stop{false};
+std::thread g_drain_thread;
 
 int mirror_prog(struct bpf_program* pr) {
   const struct bpf_insn* ins = bpf_program__insns(pr);
@@ -78,6 +85,7 @@ int bpftime_hot_init(struct bpf_object* obj) {
     }
     g_fd2id[bpf_map__fd(m)] = id;
     if (!strcmp(bpf_map__name(m), "event_arg_config_map")) g_cfg_map_id = id;
+    if (!strcmp(bpf_map__name(m), "output")) g_output_id = id;
   }
   struct bpf_program* entry = bpf_object__find_program_by_name(obj, "trace_generic_uprobe_entry");
   struct bpf_program* exit = bpf_object__find_program_by_name(obj, "trace_generic_uprobe_exit");
@@ -116,6 +124,28 @@ int bpftime_hot_attach_uprobe(const std::string& binary, unsigned long offset,
   bpftime_attach_perf_to_bpf_with_cookie(px, g_exit_prog_id, cookie);
   DC_LOG_INFO("bpftime: registered hot uprobe %s+0x%lx cookie=%llu", binary.c_str(), offset, cookie);
   return 0;
+}
+
+bool bpftime_hot_active() { return g_inited; }
+
+int bpftime_hot_start_drain(int (*cb)(void*, void*, size_t), void* ctx) {
+  if (!g_inited || g_output_id < 0) return -1;
+  g_drain_stop.store(false);
+  g_drain_thread = std::thread([cb, ctx]() {
+    while (!g_drain_stop.load(std::memory_order_relaxed)) {
+      bpftime_poll_from_ringbuf(g_output_id, ctx, cb);
+      usleep(200);
+    }
+  });
+  DC_LOG_INFO("bpftime: drain thread started on output ring id=%d", g_output_id);
+  return 0;
+}
+
+void bpftime_hot_stop_drain() {
+  if (g_drain_thread.joinable()) {
+    g_drain_stop.store(true);
+    g_drain_thread.join();
+  }
 }
 
 }  // namespace datacrumbs

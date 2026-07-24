@@ -18,5 +18,12 @@ int bpftime_hot_init(struct bpf_object* obj);
 int bpftime_hot_attach_uprobe(const std::string& binary, unsigned long offset,
                               unsigned long long cookie, int kernel_cfg_fd);
 
+bool bpftime_hot_active();
+
+// Drain the bpftime output ring on a background thread into cb(ctx, data, size) -- pass the same
+// forwarder + event_processor the kernel ring uses so hot events land on the same timeline/pfw.gz.
+int bpftime_hot_start_drain(int (*cb)(void*, void*, size_t), void* ctx);
+void bpftime_hot_stop_drain();
+
 }  // namespace datacrumbs
 #endif
