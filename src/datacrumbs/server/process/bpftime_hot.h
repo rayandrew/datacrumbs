@@ -20,14 +20,9 @@ int bpftime_hot_attach_uprobe(const std::string& binary, unsigned long offset,
 
 bool bpftime_hot_active();
 
-// Frida-inject the bpftime agent (agent_so, e.g. libbpftime-agent.so) into a running pid so the
-// mirrored programs execute there, and mark that pid traced in the bpftime pid_map. Returns 0 on ok.
-int bpftime_hot_inject(int pid, const char* agent_so);
-
-// Background thread: poll the kernel pid_map (traced pids, set by trace_client_start) and inject the
-// agent into each newly-traced pid, so hot uprobes cover every process datacrumbs traces.
-int bpftime_hot_start_autoinject(int kernel_pid_map_fd, const char* agent_so);
-void bpftime_hot_stop_autoinject();
+// The agent reaches the target via LD_PRELOAD at launch (its ctor calls bpftime_agent_main), not a
+// server-side inject: workloads are already launched with LD_PRELOAD=libdatacrumbs_client.so, so add
+// libbpftime-agent.so + AGENT_SO to that chain. (Frida running-pid injection is broken on aarch64.)
 
 // Drain the bpftime output ring on a background thread into cb(ctx, data, size) -- pass the same
 // forwarder + event_processor the kernel ring uses so hot events land on the same timeline/pfw.gz.

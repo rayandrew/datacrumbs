@@ -4,7 +4,6 @@
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 #include <datacrumbs/common/logging.h>
-#include <frida-core.h>
 
 #include <unistd.h>
 
@@ -12,8 +11,6 @@
 #include <cstdint>
 #include <cstring>
 #include <map>
-#include <set>
-#include <string>
 #include <thread>
 #include <vector>
 
@@ -49,12 +46,10 @@ int bpftime_poll_from_ringbuf(int rb_fd, void* ctx, int (*cb)(void*, void*, size
 namespace datacrumbs {
 namespace {
 bool g_inited = false;
-int g_entry_prog_id = -1, g_exit_prog_id = -1, g_cfg_map_id = -1, g_output_id = -1, g_pid_map_id = -1;
+int g_entry_prog_id = -1, g_exit_prog_id = -1, g_cfg_map_id = -1, g_output_id = -1;
 std::map<int, int> g_fd2id;  // kernel map fd -> bpftime map id
 std::atomic<bool> g_drain_stop{false};
 std::thread g_drain_thread;
-std::atomic<bool> g_autoinject_stop{false};
-std::thread g_autoinject_thread;
 
 int mirror_prog(struct bpf_program* pr) {
   const struct bpf_insn* ins = bpf_program__insns(pr);
@@ -91,7 +86,6 @@ int bpftime_hot_init(struct bpf_object* obj) {
     g_fd2id[bpf_map__fd(m)] = id;
     if (!strcmp(bpf_map__name(m), "event_arg_config_map")) g_cfg_map_id = id;
     if (!strcmp(bpf_map__name(m), "output")) g_output_id = id;
-    if (!strcmp(bpf_map__name(m), "pid_map")) g_pid_map_id = id;
   }
   struct bpf_program* entry = bpf_object__find_program_by_name(obj, "trace_generic_uprobe_entry");
   struct bpf_program* exit = bpf_object__find_program_by_name(obj, "trace_generic_uprobe_exit");
@@ -151,60 +145,6 @@ void bpftime_hot_stop_drain() {
   if (g_drain_thread.joinable()) {
     g_drain_stop.store(true);
     g_drain_thread.join();
-  }
-}
-
-int bpftime_hot_inject(int pid, const char* agent_so) {
-  if (g_pid_map_id >= 0) {  // open the pid gate so need_tracing() passes in the target
-    uint32_t tgid = static_cast<uint32_t>(pid);
-    uint64_t ts = 1;
-    bpftime_map_update_elem(g_pid_map_id, &tgid, &ts, 0);
-  }
-  frida_init();
-  FridaInjector* injector = frida_injector_new();
-  GError* err = nullptr;
-  guint iid = frida_injector_inject_library_file_sync(injector, pid, agent_so, "bpftime_agent_main",
-                                                      "", nullptr, &err);
-  int rc = 0;
-  if (err) {
-    DC_LOG_ERROR("bpftime: frida inject pid=%d failed: %s", pid, err->message);
-    g_error_free(err);
-    rc = -1;
-  } else {
-    DC_LOG_INFO("bpftime: injected agent into pid=%d (id=%u)", pid, iid);
-  }
-  frida_injector_close_sync(injector, nullptr, nullptr);
-  frida_unref(injector);
-  frida_deinit();
-  return rc;
-}
-
-int bpftime_hot_start_autoinject(int kernel_pid_map_fd, const char* agent_so) {
-  if (!g_inited || kernel_pid_map_fd < 0) return -1;
-  std::string agent = agent_so;
-  g_autoinject_stop.store(false);
-  g_autoinject_thread = std::thread([kernel_pid_map_fd, agent]() {
-    std::set<uint32_t> injected;
-    while (!g_autoinject_stop.load(std::memory_order_relaxed)) {
-      uint32_t key = 0, next = 0;
-      int ret = bpf_map_get_next_key(kernel_pid_map_fd, nullptr, &next);
-      while (ret == 0) {
-        if (injected.find(next) == injected.end() && bpftime_hot_inject((int)next, agent.c_str()) == 0)
-          injected.insert(next);
-        key = next;
-        ret = bpf_map_get_next_key(kernel_pid_map_fd, &key, &next);
-      }
-      usleep(200000);
-    }
-  });
-  DC_LOG_INFO("bpftime: auto-inject thread watching kernel pid_map (agent=%s)", agent.c_str());
-  return 0;
-}
-
-void bpftime_hot_stop_autoinject() {
-  if (g_autoinject_thread.joinable()) {
-    g_autoinject_stop.store(true);
-    g_autoinject_thread.join();
   }
 }
 

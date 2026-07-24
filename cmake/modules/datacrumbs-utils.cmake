@@ -188,28 +188,26 @@ macro(include_dependencies)
   # uprobe runs in userspace via frida inline-hooking (~335ns) instead of the kernel
   # trap (~1060ns DPU / ~16687ns host). Cross-built into $DEPS as a static
   # libbpftime.a (+ libfrida-gum.a) by provision/build_dc_dpu.sh --stage bpftime.
+  # The server registers + drains the hot path; the agent reaches the target via LD_PRELOAD at
+  # workload launch (not a server-side frida inject), so only libbpftime.a (+ its bundled frida-gum)
+  # is linked here -- no frida-core.
   if(DATACRUMBS_BPFTIME_COMPATIBLE)
     find_library(BPFTIME_LIBRARY bpftime)
     find_library(FRIDA_GUM_LIBRARY frida-gum)
-    find_library(FRIDA_CORE_LIBRARY frida-core)
     find_path(BPFTIME_INCLUDE_DIR bpftime_shm.hpp PATH_SUFFIXES bpftime)
-    find_path(FRIDA_CORE_INCLUDE_DIR frida-core.h)
-    if(BPFTIME_LIBRARY AND FRIDA_GUM_LIBRARY AND FRIDA_CORE_LIBRARY AND BPFTIME_INCLUDE_DIR
-       AND FRIDA_CORE_INCLUDE_DIR)
-      include_directories(${BPFTIME_INCLUDE_DIR} ${FRIDA_CORE_INCLUDE_DIR})
+    if(BPFTIME_LIBRARY AND FRIDA_GUM_LIBRARY AND BPFTIME_INCLUDE_DIR)
+      include_directories(${BPFTIME_INCLUDE_DIR})
       get_filename_component(BPFTIME_LIBRARY_DIR "${BPFTIME_LIBRARY}" DIRECTORY)
       list(APPEND DEPENDENCY_LIBRARY_DIRS ${BPFTIME_LIBRARY_DIR})
-      # frida-core (agent injection) bundles glib+gum; allow-multiple-definition since it and
-      # libbpftime.a/frida-gum carry overlapping gum symbols (same frida 16.1.2).
       set(DEPENDENCY_LIB ${DEPENDENCY_LIB} -Wl,--allow-multiple-definition ${BPFTIME_LIBRARY}
-          ${FRIDA_CORE_LIBRARY} ${FRIDA_GUM_LIBRARY} -ldl -lrt -lresolv -lm)
-      message(STATUS "             - Found bpftime:${BPFTIME_LIBRARY} frida-core:${FRIDA_CORE_LIBRARY}")
+          ${FRIDA_GUM_LIBRARY} -ldl -lrt -lresolv -lm)
+      message(STATUS "             - Found bpftime:${BPFTIME_LIBRARY} frida-gum:${FRIDA_GUM_LIBRARY}")
     else()
       message(
         FATAL_ERROR
-          "[${UPPER_PROJECT_NAME}] DATACRUMBS_BPFTIME_COMPATIBLE=ON but bpftime/frida was not found "
-          "(need libbpftime.a + libfrida-gum.a + libfrida-core.a + bpftime_shm.hpp + frida-core.h). "
-          "Cross-build with provision/build_dc_dpu.sh --stage bpftime."
+          "[${UPPER_PROJECT_NAME}] DATACRUMBS_BPFTIME_COMPATIBLE=ON but bpftime was not found "
+          "(need libbpftime.a + libfrida-gum.a + bpftime_shm.hpp). Cross-build with "
+          "provision/build_dc_dpu.sh --stage bpftime."
       )
     endif()
   endif()

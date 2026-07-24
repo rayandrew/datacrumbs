@@ -756,13 +756,10 @@ static int main_process(datacrumbs::EventProcessor* event_processor) {
   }
 #if defined(DATACRUMBS_BPFTIME_COMPATIBLE_FLAG) && (DATACRUMBS_BPFTIME_COMPATIBLE_FLAG == 1)
   // hot uprobes emit into bpftime's own shm ring; drain it into the same event_processor
-  if (datacrumbs::bpftime_hot_active()) {
+  // hot uprobes run in the target (agent LD_PRELOADed at workload launch) and emit into bpftime's
+  // own shm ring; drain it into the same event_processor
+  if (datacrumbs::bpftime_hot_active())
     datacrumbs::bpftime_hot_start_drain(handle_event, event_processor);
-    // inject the agent into every traced pid (kernel pid_map is populated by trace_client_start)
-    const char* agent = getenv("DC_BPFTIME_AGENT");
-    datacrumbs::bpftime_hot_start_autoinject(bpf_map__fd(skel->maps.pid_map),
-                                             agent ? agent : "libbpftime-agent.so");
-  }
 #endif
 #if defined(DATACRUMBS_ENABLE_HW_COUNTERS) && (DATACRUMBS_ENABLE_HW_COUNTERS == 1)
   if (hw_task_active &&
@@ -1024,7 +1021,6 @@ static int main_process(datacrumbs::EventProcessor* event_processor) {
   }
 
 #if defined(DATACRUMBS_BPFTIME_COMPATIBLE_FLAG) && (DATACRUMBS_BPFTIME_COMPATIBLE_FLAG == 1)
-  datacrumbs::bpftime_hot_stop_autoinject();
   datacrumbs::bpftime_hot_stop_drain();
 #endif
 #if defined(DATACRUMBS_MODE) && (DATACRUMBS_MODE == 1)
