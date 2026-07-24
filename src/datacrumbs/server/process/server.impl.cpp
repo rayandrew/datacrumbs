@@ -757,7 +757,15 @@ static int main_process(datacrumbs::EventProcessor* event_processor) {
   }
 #if defined(DATACRUMBS_BPFTIME_COMPATIBLE_FLAG) && (DATACRUMBS_BPFTIME_COMPATIBLE_FLAG == 1)
   // hot uprobes emit into bpftime's own shm ring; drain it into the same event_processor
-  if (datacrumbs::bpftime_hot_active()) datacrumbs::bpftime_hot_start_drain(handle_event, event_processor);
+  if (datacrumbs::bpftime_hot_active()) {
+    datacrumbs::bpftime_hot_start_drain(handle_event, event_processor);
+    // TODO(auto-inject): inject on trace_client_start so any traced pid is covered. For now a test
+    // hook injects into a known pid; DC_BPFTIME_AGENT overrides the agent .so path.
+    if (const char* hp = getenv("DC_BPFTIME_HOT_PID")) {
+      const char* agent = getenv("DC_BPFTIME_AGENT");
+      datacrumbs::bpftime_hot_inject(atoi(hp), agent ? agent : "libbpftime-agent.so");
+    }
+  }
 #endif
 #if defined(DATACRUMBS_ENABLE_HW_COUNTERS) && (DATACRUMBS_ENABLE_HW_COUNTERS == 1)
   if (hw_task_active &&
