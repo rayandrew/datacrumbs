@@ -581,11 +581,13 @@ class HeaderCaptureProbe : public CaptureProbe {
 // Capture probe for binaries
 class BinaryCaptureProbe : public CaptureProbe {
  public:
-  BinaryCaptureProbe() : CaptureProbe(CaptureType::BINARY), file(), include_offsets(false) {
+  BinaryCaptureProbe()
+      : CaptureProbe(CaptureType::BINARY), file(), include_offsets(false), hot(false) {
     DC_LOG_TRACE("BinaryCaptureProbe constructor called");
   }
   std::string file;  // Path to the binary
   bool include_offsets;
+  bool hot;  // route the generated uprobes through bpftime (DATACRUMBS_BPFTIME_COMPATIBLE builds)
 };
 
 // Capture probe for USDT probes
