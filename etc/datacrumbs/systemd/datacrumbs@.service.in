@@ -16,7 +16,7 @@ ExecStartPost=/bin/sh -c 'for i in $(seq 1 $${DATACRUMBS_READY_TIMEOUT:-300}); d
 ExecStop=/bin/kill -INT $MAINPID
 KillSignal=SIGINT
 KillMode=control-group
-TimeoutStartSec=30min
+TimeoutStartSec=90min
 TimeoutStopSec=10min
 
 [Install]
