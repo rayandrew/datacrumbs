@@ -361,9 +361,18 @@ std::string ChromeWriter::serialize_event(EventWithId* event_with_id) {
   auto args = event_with_id->args;
   std::string result;
 
-  // bpf_get_current_pid_tgid() packs tgid<<32 | tid: low half is the thread, high half the process.
-  unsigned int tid = event_with_id->tgid_pid;
-  unsigned int pid = event_with_id->tgid_pid >> 32;
+  // bpf_get_current_pid_tgid() nominally packs tgid<<32 | tid (high=process, low=thread). On the
+  // BlueField aarch64 kernel the two halves arrive REVERSED (verified against datacrumbs_start's
+  // getpid() ground truth: the process id lands in the low half), which made every thread look like a
+  // separate process in DPU traces. The server writes each trace on its own node, so gate on the build
+  // arch: aarch64 (DPUs) takes the process from the low half, x86 hosts from the high half.
+#if defined(__aarch64__)
+  unsigned int pid = event_with_id->tgid_pid;         // process (tgid) is the low half here
+  unsigned int tid = event_with_id->tgid_pid >> 32;   // thread
+#else
+  unsigned int tid = event_with_id->tgid_pid;         // thread (low half)
+  unsigned int pid = event_with_id->tgid_pid >> 32;   // process (tgid, high half)
+#endif
   auto it = configManager_->category_map.find(event_with_id->event_id);
   if (it != configManager_->category_map.end()) {
     std::string probe_name = it->second.first;
