@@ -289,26 +289,40 @@ void ChromeWriter::map_timesync_snapshot() {
   DC_LOG_PRINT("dc_timesync snapshot mapped from %s", path);
 }
 
-// Remap CLOCK_MONOTONIC ns onto the reference PHC via the seqlock snapshot; passthrough if no fix.
+// Remap CLOCK_MONOTONIC ns onto the reference PHC via the seqlock snapshot.
+//
+// A failed live read (write straddled all retries, or a momentarily-invalid snapshot) MUST NOT fall
+// back to the raw monotonic value: that is boot-relative (~days) while every remapped event is epoch,
+// so a single stray fallback lands one event ~days away and wrecks every viewer's time axis. Instead
+// reuse the last stable+valid snapshot this thread saw -- the parameters drift negligibly between the
+// daemon's ~1 Hz updates, and it keeps every event on the ONE timeline. Raw passthrough happens only
+// when no valid fix has EVER been seen (the documented no-daemon case: the whole trace is monotonic).
 unsigned long long ChromeWriter::remap_ts(unsigned long long mono_ns) const {
   if (!tsync_) return mono_ns;
+  thread_local dc_timesync_snapshot cached;
+  thread_local bool have_cached = false;
   dc_timesync_snapshot s;
+  bool stable = false;
   for (int tries = 0; tries < 4; ++tries) {  // seqlock: retry if a write straddled the read
     unsigned int seq1 = __atomic_load_n(&tsync_->seq, __ATOMIC_ACQUIRE);
     if (seq1 & 1u) continue;  // write in progress
     std::memcpy(&s, const_cast<const dc_timesync_snapshot*>(tsync_), sizeof(s));
     __atomic_thread_fence(__ATOMIC_ACQUIRE);
     unsigned int seq2 = __atomic_load_n(&tsync_->seq, __ATOMIC_RELAXED);
-    if (seq1 == seq2) {
-      if (s.magic != DC_TIMESYNC_MAGIC || !s.valid) return mono_ns;
-      long long phc_local = static_cast<long long>(mono_ns) + s.bridge_mono_to_phc_ns;
-      long long ref =
-          phc_local + s.offset_ns +
-          static_cast<long long>(s.skew_ppb * (phc_local - s.anchor_phc_ns) / 1000000000LL);
-      return ref < 0 ? 0ull : static_cast<unsigned long long>(ref);
-    }
+    if (seq1 == seq2) { stable = true; break; }
   }
-  return mono_ns;  // couldn't get a stable read; stay MONOTONIC this event
+  if (stable && s.magic == DC_TIMESYNC_MAGIC && s.valid) {
+    cached = s;           // remember the last stable, valid fix for this thread
+    have_cached = true;
+  } else if (have_cached) {
+    s = cached;           // stale/mid-update read -> reuse last good (same timeline, tiny drift)
+  } else {
+    return mono_ns;       // never had a fix -> documented MONOTONIC passthrough (whole trace)
+  }
+  long long phc_local = static_cast<long long>(mono_ns) + s.bridge_mono_to_phc_ns;
+  long long ref = phc_local + s.offset_ns +
+                  static_cast<long long>(s.skew_ppb * (phc_local - s.anchor_phc_ns) / 1000000000LL);
+  return ref < 0 ? 0ull : static_cast<unsigned long long>(ref);
 }
 
 // Destructor flushes and closes the file, and joins all threads.
