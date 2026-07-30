@@ -104,6 +104,7 @@ struct fn_value_t {
 struct runtime_event_config_t {
   unsigned long long event_id;
   unsigned int probe_kind;
+  unsigned int system_wide;  // tracepoints: 1 => skip the pid gate (capture on all pids)
   unsigned int arg_count;
   unsigned int arg_index[DATACRUMBS_MAX_CAPTURE_ARGS];
   unsigned int arg_num_bytes[DATACRUMBS_MAX_CAPTURE_ARGS];

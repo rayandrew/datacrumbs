@@ -123,7 +123,8 @@ class Probe {
       : type(other.type),
         name(other.name),
         functions(other.functions),
-        function_arguments(other.function_arguments) {
+        function_arguments(other.function_arguments),
+        system_wide(other.system_wide) {
     DC_LOG_TRACE("Probe copy constructor called");
   }
 
@@ -132,7 +133,8 @@ class Probe {
       : type(other.type),
         name(std::move(other.name)),
         functions(std::move(other.functions)),
-        function_arguments(std::move(other.function_arguments)) {
+        function_arguments(std::move(other.function_arguments)),
+        system_wide(other.system_wide) {
     DC_LOG_TRACE("Probe move constructor called");
   }
   // Constructor initializing the probe type
@@ -143,6 +145,8 @@ class Probe {
   std::vector<std::string> functions;  // List of functions or arguments for the probe
   std::unordered_map<std::string, std::vector<ProbeArgCaptureSpec>>
       function_arguments;  // Optional per-function runtime arg capture specification
+  bool system_wide = false;  // tracepoints: capture on ALL pids (skip the pid gate) -- for global
+                             // NIC/firmware tracepoints that fire off any traced pid
 
   // Validates the probe's configuration
   virtual bool validate() const {
@@ -176,6 +180,8 @@ class Probe {
 
     json_object_object_add(j, "functions", funcs);
 
+    if (system_wide) json_object_object_add(j, "system_wide", json_object_new_boolean(true));
+
     if (!function_arguments.empty()) {
       json_object* jfunction_arguments = json_object_new_object();
       for (const auto& [function_name, arg_specs] : function_arguments) {
@@ -197,6 +203,9 @@ class Probe {
     Probe p(static_cast<ProbeType>(json_object_get_int(json_object_object_get(j, "type"))));
     json_object* name_obj = json_object_object_get(j, "name");
     if (name_obj) p.name = json_object_get_string(name_obj);
+
+    json_object* sw_obj = json_object_object_get(j, "system_wide");
+    if (sw_obj) p.system_wide = json_object_get_boolean(sw_obj);
 
     json_object* funcs_obj = json_object_object_get(j, "functions");
     if (funcs_obj && json_object_get_type(funcs_obj) == json_type_array) {
@@ -320,6 +329,7 @@ struct TracepointProbe : public Probe {
     p.name = base.name;
     p.functions = base.functions;
     p.function_arguments = base.function_arguments;
+    p.system_wide = base.system_wide;
     return p;
   }
 };
@@ -540,6 +550,7 @@ class CaptureProbe {
   std::string name;      // Name of the capture probe
   ProbeType probe_type;  // Type of probe associated with the capture
   bool enable_explorer;  // Flag to enable explorer for this capture probe
+  bool system_wide = false;  // tracepoints: capture on ALL pids (propagated to the built Probe)
   std::unordered_map<std::string, std::vector<ProbeArgCaptureSpec>>
       function_arguments;  // Optional per-function arg capture specification from YAML
 

@@ -112,10 +112,11 @@ static unsigned int runtime_probe_kind(datacrumbs::ProbeType probe_type) {
 
 static int populate_event_arg_config(
     int map_fd, uint64_t cookie, uint64_t event_id, datacrumbs::ProbeType probe_type,
-    const std::vector<datacrumbs::ProbeArgCaptureSpec>* arg_specs) {
+    const std::vector<datacrumbs::ProbeArgCaptureSpec>* arg_specs, bool system_wide = false) {
   runtime_event_config_t config = {};
   config.event_id = event_id;
   config.probe_kind = runtime_probe_kind(probe_type);
+  config.system_wide = system_wide ? 1u : 0u;
   if (arg_specs != nullptr) {
     config.arg_count = std::min<unsigned int>(arg_specs->size(), DATACRUMBS_MAX_CAPTURE_ARGS);
     for (unsigned int index = 0; index < config.arg_count; ++index) {
@@ -275,7 +276,7 @@ static int attach_runtime_probes(datacrumbs::EventProcessor* event_processor,
       } else if (probe->type == datacrumbs::ProbeType::TRACEPOINT) {
         total_requested += 1;  // point event -> one attach, not entry+exit
         if (populate_event_arg_config(event_arg_config_fd, current_cookie, *event_id, probe->type,
-                                      probe->getArgSpecs(function_name)) != 0) {
+                                      probe->getArgSpecs(function_name), probe->system_wide) != 0) {
           total_failed += 1;
           continue;
         }
