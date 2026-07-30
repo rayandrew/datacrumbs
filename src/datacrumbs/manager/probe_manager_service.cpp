@@ -155,6 +155,11 @@ std::string syscall_base_name(const std::string& function_name) {
 
 bool is_valid_kernel_function(const std::unordered_set<std::string>& kernel_symbols,
                               datacrumbs::ProbeType probe_type, const std::string& function_name) {
+  // Tracepoint targets are literal "category:name" from tracefs, not kallsyms symbols -- accept them
+  // as-is (a nonexistent tracepoint fails gracefully at attach and is recorded invalid there).
+  if (probe_type == datacrumbs::ProbeType::TRACEPOINT) {
+    return true;
+  }
   const std::string base_name = probe_type == datacrumbs::ProbeType::SYSCALLS
                                     ? syscall_base_name(function_name)
                                     : strip_offset_suffix(function_name);
@@ -684,7 +689,7 @@ bool ProbeManagerService::validate_signing_payload(const std::string& signing_pa
 
       const int probe_type_value = json_object_get_int(type_obj);
       if (probe_type_value < static_cast<int>(datacrumbs::ProbeType::SYSCALLS) ||
-          probe_type_value > static_cast<int>(datacrumbs::ProbeType::CUSTOM)) {
+          probe_type_value > static_cast<int>(datacrumbs::ProbeType::TRACEPOINT)) {
         errors->push_back(context + ".type contains invalid probe type value");
         ok = false;
         continue;

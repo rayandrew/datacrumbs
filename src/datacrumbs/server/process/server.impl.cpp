@@ -103,6 +103,8 @@ static unsigned int runtime_probe_kind(datacrumbs::ProbeType probe_type) {
       return DATACRUMBS_RUNTIME_PROBE_KIND_SYSCALL;
     case datacrumbs::ProbeType::USDT:
       return DATACRUMBS_RUNTIME_PROBE_KIND_USDT;
+    case datacrumbs::ProbeType::TRACEPOINT:
+      return DATACRUMBS_RUNTIME_PROBE_KIND_TRACEPOINT;
     default:
       return 0;
   }
@@ -180,6 +182,7 @@ static int attach_runtime_probes(datacrumbs::EventProcessor* event_processor,
   auto* uprobe_exit = bpf_object__find_program_by_name(skel->obj, "trace_generic_uprobe_exit");
   auto* usdt_entry = bpf_object__find_program_by_name(skel->obj, "trace_generic_usdt_entry");
   auto* usdt_exit = bpf_object__find_program_by_name(skel->obj, "trace_generic_usdt_exit");
+  auto* tracepoint_prog = bpf_object__find_program_by_name(skel->obj, "trace_generic_tracepoint");
   const int event_arg_config_fd = bpf_map__fd(skel->maps.event_arg_config_map);
 
   if (event_arg_config_fd < 0) {
@@ -269,6 +272,38 @@ static int attach_runtime_probes(datacrumbs::EventProcessor* event_processor,
         config_manager->record_successful_runtime_probe(probe, function_name);
         runtime_probe_state_updated = true;
         total_attached += 2;
+      } else if (probe->type == datacrumbs::ProbeType::TRACEPOINT) {
+        total_requested += 1;  // point event -> one attach, not entry+exit
+        if (populate_event_arg_config(event_arg_config_fd, current_cookie, *event_id, probe->type,
+                                      probe->getArgSpecs(function_name)) != 0) {
+          total_failed += 1;
+          continue;
+        }
+        // function_name is "category:name" (e.g. "mlx5:mlx5_fw"); libbpf attaches by (cat, name).
+        const auto colon = function_name.find(':');
+        const std::string tp_category =
+            colon == std::string::npos ? std::string() : function_name.substr(0, colon);
+        const std::string tp_name =
+            colon == std::string::npos ? function_name : function_name.substr(colon + 1);
+        struct bpf_tracepoint_opts tp_opts = {};
+        tp_opts.sz = sizeof(tp_opts);
+        tp_opts.bpf_cookie = current_cookie;
+        auto* tp_link = bpf_program__attach_tracepoint_opts(tracepoint_prog, tp_category.c_str(),
+                                                            tp_name.c_str(), &tp_opts);
+        if (libbpf_get_error(tp_link)) {
+          DC_LOG_WARN("tracepoint attach FAILED %s:%s prog=%p type=%d fd=%d err=%ld errno=%d",
+                      tp_category.c_str(), tp_name.c_str(), (void*)tracepoint_prog,
+                      tracepoint_prog ? (int)bpf_program__type(tracepoint_prog) : -1,
+                      tracepoint_prog ? bpf_program__fd(tracepoint_prog) : -1,
+                      libbpf_get_error(tp_link), errno);
+          config_manager->record_invalid_runtime_probe(probe, function_name);
+          runtime_probe_state_updated = true;
+          total_failed += 1;
+          continue;
+        }
+        config_manager->record_successful_runtime_probe(probe, function_name);
+        runtime_probe_state_updated = true;
+        total_attached += 1;
       } else if (probe->type == datacrumbs::ProbeType::SYSCALLS) {
         total_requested += 2;
         const std::string syscall_name = normalize_syscall_name_for_attach(function_name);

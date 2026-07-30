@@ -135,6 +135,8 @@ std::shared_ptr<Probe> probe_from_json(json_object* probe_obj) {
       return std::make_shared<SysCallProbe>(SysCallProbe::fromJson(probe_obj));
     case ProbeType::KPROBE:
       return std::make_shared<KProbe>(KProbe::fromJson(probe_obj));
+    case ProbeType::TRACEPOINT:
+      return std::make_shared<TracepointProbe>(TracepointProbe::fromJson(probe_obj));
     case ProbeType::UPROBE:
       return std::make_shared<UProbe>(UProbe::fromJson(probe_obj));
     case ProbeType::USDT:
@@ -167,6 +169,7 @@ bool is_supported_runtime_probe_type(ProbeType type) {
     case ProbeType::UPROBE:
     case ProbeType::SYSCALLS:
     case ProbeType::USDT:
+    case ProbeType::TRACEPOINT:
       return true;
     default:
       return false;
@@ -183,6 +186,8 @@ InvalidProbeBucket invalid_probe_bucket(const std::shared_ptr<Probe>& probe) {
       return {"syscalls", ""};
     case ProbeType::KPROBE:
       return {"kprobes", ""};
+    case ProbeType::TRACEPOINT:
+      return {"tracepoints", ""};
     case ProbeType::UPROBE: {
       const auto uprobe = std::dynamic_pointer_cast<UProbe>(probe);
       return {"binary", uprobe ? uprobe->binary_path : ""};

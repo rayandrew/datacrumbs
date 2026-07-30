@@ -919,5 +919,33 @@ static inline
 }
 #endif
 
+// Tracepoint handler: a tracepoint fires ONCE (no entry/exit pairing like kprobes), so emit a single
+// point event (dur=0). ctx is the tracepoint context, not pt_regs -- we read nothing from it here (v1
+// captures timing + which tracepoint + pid/tid; the tracepoint's own fields are not decoded yet).
+static inline __attribute__((always_inline)) int generic_point(u64 attach_cookie) {
+  struct fn_key_t key = {};
+  u64 start_ts = 0;
+  if (!need_tracing(&key, &start_ts)) return 0;  // pid gate: tracepoints fire system-wide
+  const u64 now = bpf_ktime_get_ns();
+  const struct runtime_event_config_t* config = resolve_event_config(attach_cookie);
+  if (config == NULL) return 0;
+  const u64 event_id = config->event_id;
+  struct generic_event_t* event;
+  DATACRUMBS_RB_RESERVE(output, struct generic_event_t, event);
+  event->type = config->probe_kind;
+  event->id = key.id;
+  event->event_id = event_id;
+  event->ts = now;
+  event->dur = 0;
+  event->arg_count = 0;
+  event->ret = 0;
+#if defined(DATACRUMBS_ENABLE_HW_COUNTERS) && (DATACRUMBS_ENABLE_HW_COUNTERS == 1)
+  event->hwc_valid_mask = 0;
+  event->hwc_cpu_valid_mask = 0;
+#endif
+  DATACRUMBS_EVENT_SUBMIT(event, key.id, event_id);
+  return 0;
+}
+
 char LICENSE[] SEC("license") = "Dual BSD/GPL";
 #endif  // __DATACRUMBS_SERVER_BPF_COMMON_H

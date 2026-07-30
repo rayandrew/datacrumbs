@@ -304,6 +304,26 @@ struct KProbe : public Probe {
   }
 };
 
+// Probe for kernel tracepoints. functions hold "category:name" (e.g. "mlx5:mlx5_fw"); no extra fields.
+struct TracepointProbe : public Probe {
+ public:
+  TracepointProbe(const TracepointProbe& other) : Probe(other) {}
+  TracepointProbe() : Probe(ProbeType::TRACEPOINT) {}
+  bool validate() const override { return Probe::validate(); }
+  json_object* toJson(bool include_functions = true) const override {
+    return Probe::toJson(include_functions);
+  }
+  static TracepointProbe fromJson(const json_object* j) {
+    TracepointProbe p;
+    Probe base = Probe::fromJson(j);
+    p.type = base.type;
+    p.name = base.name;
+    p.functions = base.functions;
+    p.function_arguments = base.function_arguments;
+    return p;
+  }
+};
+
 // Probe for user-space functions (uprobes)
 struct UProbe : public Probe {
  public:
@@ -566,6 +586,14 @@ class KernelCaptureProbe : public CaptureProbe {
  public:
   KernelCaptureProbe() : CaptureProbe(CaptureType::KSYM) {
     DC_LOG_TRACE("KernelCaptureProbe constructor called");
+  }
+};
+
+// Capture probe for kernel tracepoints (regex matched against tracefs "category:name" entries).
+class TracepointCaptureProbe : public CaptureProbe {
+ public:
+  TracepointCaptureProbe() : CaptureProbe(CaptureType::TRACEPOINT) {
+    DC_LOG_TRACE("TracepointCaptureProbe constructor called");
   }
 };
 

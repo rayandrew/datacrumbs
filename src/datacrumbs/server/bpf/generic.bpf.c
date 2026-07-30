@@ -43,6 +43,13 @@ int BPF_URETPROBE(trace_generic_uprobe_exit) {
   return generic_exit(ctx, cookie);
 }
 
+SEC("tracepoint")
+int trace_generic_tracepoint(void* ctx) {
+  const unsigned long long cookie = bpf_get_attach_cookie(ctx);
+  DBG_PRINTK("tracepoint cookie=%llu", cookie);
+  return generic_point(cookie);
+}
+
 SEC("usdt")
 int BPF_USDT(trace_generic_usdt_entry, long clazz, long method) {
   const unsigned long long cookie = bpf_usdt_cookie(ctx);
