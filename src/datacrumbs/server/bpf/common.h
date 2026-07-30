@@ -947,7 +947,8 @@ static inline __attribute__((always_inline)) int generic_point(void* ctx, u64 at
   event->id = key.id;
   event->event_id = event_id;
   event->ts = now;
-  event->dur = 0;
+  event->dur = 1;  // nominal (a tracepoint is instantaneous) -> writer emits dur:1us so the standard
+                   // ph:"X" slice is non-zero-width and renders; no special phase/format.
   event->ret = 0;
   // Field decode: read the raw tracepoint record (ctx) at each field's offset (parsed from the
   // tracepoint's tracefs `format` at attach). arg_is_pointer=1 => a byte field (fixed char array
