@@ -656,6 +656,24 @@ void RuntimeConfigurationManager::derive_telemetry_sources() {
     src.counters.push_back({"tx_packets", base + "/counters/port_xmit_packets", 1.0});
     src.counters.push_back({"out_of_buffer", base + "/hw_counters/out_of_buffer", 1.0});
     telemetry_sources.push_back(std::move(src));
+
+    // Firmware-maintained RDMA-engine + health counters (hw_counters/): the request rates the NIC
+    // firmware actually served, plus the retransmit / out-of-sequence / ack-timeout / completion-error
+    // signals that spike when the fabric struggles. This is the "why is it slow" view perf and uprobes
+    // cannot produce -- the transfer runs off-CPU on the NIC. A counter absent on this HCA reads as a
+    // missing sysfs file and is skipped per-tick by the sampler, so this curated list is portable.
+    TelemetrySource rdma;
+    rdma.cat = "nic_rdma";
+    rdma.name = dev;
+    const std::string hw = base + "/hw_counters/";
+    for (const char* c : {"rx_write_requests", "rx_read_requests", "rx_atomic_requests",
+                          "packet_seq_err", "out_of_sequence", "duplicate_request",
+                          "rnr_nak_retry_err", "req_rnr_retries_exceeded",
+                          "req_transport_retries_exceeded", "local_ack_timeout_err",
+                          "implied_nak_seq_err", "req_cqe_error", "resp_cqe_error",
+                          "req_remote_access_errors", "resp_remote_access_errors"})
+      rdma.counters.push_back({c, hw + c, 1.0});
+    telemetry_sources.push_back(std::move(rdma));
   }
 }
 
