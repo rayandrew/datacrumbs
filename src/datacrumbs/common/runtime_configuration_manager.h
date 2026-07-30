@@ -30,6 +30,13 @@ class RuntimeConfigurationManager {
                                                const std::string& function_name) const;
   const RuntimeEventMetadata* get_runtime_event_metadata(uint64_t event_id) const;
 
+  // Inject arg specs for an event after load (tracepoints derive their fields from tracefs at
+  // attach, not from the signed probe) so the writer can name the decoded fields.
+  void set_runtime_event_arg_specs(uint64_t event_id, const std::vector<ProbeArgCaptureSpec>& specs) {
+    auto it = runtime_event_metadata.find(event_id);
+    if (it != runtime_event_metadata.end()) it->second.arg_specs = specs;
+  }
+
   std::filesystem::path data_dir;
   std::filesystem::path trace_log_dir;
   std::filesystem::path trace_file_path;

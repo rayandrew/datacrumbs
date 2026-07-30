@@ -47,7 +47,7 @@ SEC("tracepoint")
 int trace_generic_tracepoint(void* ctx) {
   const unsigned long long cookie = bpf_get_attach_cookie(ctx);
   DBG_PRINTK("tracepoint cookie=%llu", cookie);
-  return generic_point(cookie);
+  return generic_point(ctx, cookie);  // ctx = the raw tracepoint record (for field decode)
 }
 
 SEC("usdt")

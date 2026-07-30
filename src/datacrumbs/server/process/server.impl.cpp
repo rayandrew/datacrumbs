@@ -13,6 +13,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <regex>
 #include <sstream>
 #include <string>
 
@@ -151,6 +152,54 @@ static int populate_event_arg_config(
   return 0;
 }
 
+// Parse a tracepoint's tracefs `format` into arg specs (offset/size/label) so generic_point can
+// decode its fields. Done at attach (the server has tracefs open, unlike the non-root sign step).
+// Scalars -> read into args; fixed char arrays (comm[16]) -> raw bytes (c_type "char *"). Skips the
+// common_* header and __data_loc dynamic strings (mlx5_fw's message -- a later step).
+static std::vector<datacrumbs::ProbeArgCaptureSpec> parse_tracepoint_fields(
+    const std::string& category, const std::string& name) {
+  std::vector<datacrumbs::ProbeArgCaptureSpec> specs;
+  std::ifstream f;
+  for (const char* root : {"/sys/kernel/debug/tracing/events", "/sys/kernel/tracing/events"}) {
+    f.open(std::string(root) + "/" + category + "/" + name + "/format");
+    if (f.is_open()) break;
+  }
+  if (!f.is_open()) {
+    DC_LOG_WARN("tracepoint %s:%s: format unreadable -> fields not decoded", category.c_str(),
+                name.c_str());
+    return specs;
+  }
+  static const std::regex re(
+      R"(field:([^;]+?)\s+([A-Za-z_]\w*)(\[\d+\])?;\s*offset:(\d+);\s*size:(\d+);\s*signed:(\d+);)");
+  std::string line;
+  while (std::getline(f, line)) {
+    std::smatch m;
+    if (!std::regex_search(line, m, re)) continue;
+    const std::string type = m[1].str();
+    const std::string fname = m[2].str();
+    const bool is_array = m[3].matched;
+    if (fname.rfind("common_", 0) == 0) continue;                // skip the common header
+    if (type.find("__data_loc") != std::string::npos) continue;  // dynamic string -> later
+    datacrumbs::ProbeArgCaptureSpec s;
+    s.label = fname;
+    s.offset = static_cast<unsigned int>(std::stoul(m[4].str()));
+    s.num_bytes = static_cast<unsigned int>(std::stoul(m[5].str()));
+    const bool is_signed = m[6].str() != "0";
+    if (type.find("char") != std::string::npos && is_array) {  // fixed char array -> string bytes
+      s.is_pointer = true;
+      s.c_type = "char *";
+    } else if (s.num_bytes <= 8) {  // scalar
+      s.is_pointer = false;
+      s.c_type = is_signed ? "long long" : "unsigned long long";
+    } else {
+      continue;  // non-char array / oversized -> skip
+    }
+    specs.push_back(std::move(s));
+    if (specs.size() >= DATACRUMBS_MAX_CAPTURE_ARGS) break;
+  }
+  return specs;
+}
+
 #if defined(DATACRUMBS_BPFTIME_COMPATIBLE_FLAG) && (DATACRUMBS_BPFTIME_COMPATIBLE_FLAG == 1)
 // Route a hot userspace uprobe through bpftime: the handler runs in the target via a frida
 // inline-hook (~335ns) instead of the kernel trap (~1us DPU / ~17us host). Opt-in via
@@ -275,17 +324,25 @@ static int attach_runtime_probes(datacrumbs::EventProcessor* event_processor,
         total_attached += 2;
       } else if (probe->type == datacrumbs::ProbeType::TRACEPOINT) {
         total_requested += 1;  // point event -> one attach, not entry+exit
-        if (populate_event_arg_config(event_arg_config_fd, current_cookie, *event_id, probe->type,
-                                      probe->getArgSpecs(function_name), probe->system_wide) != 0) {
-          total_failed += 1;
-          continue;
-        }
         // function_name is "category:name" (e.g. "mlx5:mlx5_fw"); libbpf attaches by (cat, name).
         const auto colon = function_name.find(':');
         const std::string tp_category =
             colon == std::string::npos ? std::string() : function_name.substr(0, colon);
         const std::string tp_name =
             colon == std::string::npos ? function_name : function_name.substr(colon + 1);
+        // Decode the tracepoint's fields (offset/size from tracefs format) into the config so
+        // generic_point can read them, and register their labels so the writer names them.
+        std::vector<datacrumbs::ProbeArgCaptureSpec> tp_fields =
+            parse_tracepoint_fields(tp_category, tp_name);
+        const std::vector<datacrumbs::ProbeArgCaptureSpec>* tp_specs =
+            tp_fields.empty() ? probe->getArgSpecs(function_name) : &tp_fields;
+        if (populate_event_arg_config(event_arg_config_fd, current_cookie, *event_id, probe->type,
+                                      tp_specs, probe->system_wide) != 0) {
+          total_failed += 1;
+          continue;
+        }
+        if (!tp_fields.empty())
+          config_manager->set_runtime_event_arg_specs(*event_id, tp_fields);
         struct bpf_tracepoint_opts tp_opts = {};
         tp_opts.sz = sizeof(tp_opts);
         tp_opts.bpf_cookie = current_cookie;

@@ -928,7 +928,7 @@ static inline
 // skip the gate; a high-rate one (sched:sched_switch across all cores) left pid-gated (default) or
 // relies on hot_probe_drop (~200k/s cap) when system_wide. key.id = whatever ctx is on-CPU (may be a
 // kernel worker / swapper) -- that IS the truth for a firmware/IRQ event.
-static inline __attribute__((always_inline)) int generic_point(u64 attach_cookie) {
+static inline __attribute__((always_inline)) int generic_point(void* ctx, u64 attach_cookie) {
   const u64 now = bpf_ktime_get_ns();
   const struct runtime_event_config_t* config = resolve_event_config(attach_cookie);
   if (config == NULL) return 0;
@@ -948,8 +948,34 @@ static inline __attribute__((always_inline)) int generic_point(u64 attach_cookie
   event->event_id = event_id;
   event->ts = now;
   event->dur = 0;
-  event->arg_count = 0;
   event->ret = 0;
+  // Field decode: read the raw tracepoint record (ctx) at each field's offset (parsed from the
+  // tracepoint's tracefs `format` at attach). arg_is_pointer=1 => a byte field (fixed char array
+  // e.g. comm[16]) -> arg_data; else a scalar (pid/state/...) -> args. Sizes are clamped so the
+  // verifier is happy; ctx+offset is read via bpf_probe_read_kernel (ctx is the record pointer).
+  event->arg_count = config->arg_count;
+#pragma unroll
+  for (int i = 0; i < DATACRUMBS_MAX_CAPTURE_ARGS; ++i) {
+    if ((unsigned int)i >= config->arg_count) break;
+    event->args[i] = 0;
+    event->arg_data_len[i] = 0;
+    event->arg_data_status[i] = 0;
+    unsigned int nb = config->arg_num_bytes[i];
+    if (nb == 0) continue;
+    const void* src = (const char*)ctx + config->arg_offset[i];
+    if (config->arg_is_pointer[i]) {  // byte/char-array field -> raw bytes
+      if (nb > DATACRUMBS_MAX_CAPTURE_BYTES) nb = DATACRUMBS_MAX_CAPTURE_BYTES;
+      if (bpf_probe_read_kernel(event->arg_data[i], nb, src) == 0) {
+        event->arg_data_len[i] = nb;
+        event->arg_data_status[i] = 2;  // captured -> the writer decodes bytes as the string/value
+      }
+    } else {  // scalar field
+      unsigned long long v = 0;
+      if (nb > 8) nb = 8;
+      bpf_probe_read_kernel(&v, nb, src);
+      event->args[i] = v;
+    }
+  }
 #if defined(DATACRUMBS_ENABLE_HW_COUNTERS) && (DATACRUMBS_ENABLE_HW_COUNTERS == 1)
   event->hwc_valid_mask = 0;
   event->hwc_cpu_valid_mask = 0;
