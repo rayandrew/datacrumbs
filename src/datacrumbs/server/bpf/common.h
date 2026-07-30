@@ -964,11 +964,24 @@ static inline __attribute__((always_inline)) int generic_point(void* ctx, u64 at
     unsigned int nb = config->arg_num_bytes[i];
     if (nb == 0) continue;
     const void* src = (const char*)ctx + config->arg_offset[i];
-    if (config->arg_is_pointer[i]) {  // byte/char-array field -> raw bytes
-      if (nb > DATACRUMBS_MAX_CAPTURE_BYTES) nb = DATACRUMBS_MAX_CAPTURE_BYTES;
-      if (bpf_probe_read_kernel(event->arg_data[i], nb, src) == 0) {
-        event->arg_data_len[i] = nb;
-        event->arg_data_status[i] = 2;  // captured -> the writer decodes bytes as the string/value
+    if (config->arg_is_pointer[i]) {                                          // byte field -> bytes
+      if (config->arg_index[i] == 1) {  // __data_loc dynamic string: field holds a u32 loc
+        unsigned int loc = 0;
+        bpf_probe_read_kernel(&loc, 4, src);        // src = ctx + field offset
+        unsigned int dl_len = (loc >> 16) & 0xffff;  // [len:16 | rel_offset:16]
+        unsigned int dl_off = loc & 0xffff;
+        if (dl_len > DATACRUMBS_MAX_CAPTURE_BYTES) dl_len = DATACRUMBS_MAX_CAPTURE_BYTES;
+        if (dl_len > 0 &&
+            bpf_probe_read_kernel(event->arg_data[i], dl_len, (const char*)ctx + dl_off) == 0) {
+          event->arg_data_len[i] = dl_len;
+          event->arg_data_status[i] = 2;
+        }
+      } else {  // fixed char array (comm[16]) -> raw bytes
+        if (nb > DATACRUMBS_MAX_CAPTURE_BYTES) nb = DATACRUMBS_MAX_CAPTURE_BYTES;
+        if (bpf_probe_read_kernel(event->arg_data[i], nb, src) == 0) {
+          event->arg_data_len[i] = nb;
+          event->arg_data_status[i] = 2;  // captured -> writer decodes bytes as the string
+        }
       }
     } else {  // scalar field
       unsigned long long v = 0;

@@ -154,8 +154,8 @@ static int populate_event_arg_config(
 
 // Parse a tracepoint's tracefs `format` into arg specs (offset/size/label) so generic_point can
 // decode its fields. Done at attach (the server has tracefs open, unlike the non-root sign step).
-// Scalars -> read into args; fixed char arrays (comm[16]) -> raw bytes (c_type "char *"). Skips the
-// common_* header and __data_loc dynamic strings (mlx5_fw's message -- a later step).
+// Scalars -> read into args; fixed char arrays (comm[16]) -> raw bytes; __data_loc dynamic strings
+// (mlx5_fw's msg) -> index=1 marks a two-step read in generic_point. Skips the common_* header.
 static std::vector<datacrumbs::ProbeArgCaptureSpec> parse_tracepoint_fields(
     const std::string& category, const std::string& name) {
   std::vector<datacrumbs::ProbeArgCaptureSpec> specs;
@@ -178,14 +178,18 @@ static std::vector<datacrumbs::ProbeArgCaptureSpec> parse_tracepoint_fields(
     const std::string type = m[1].str();
     const std::string fname = m[2].str();
     const bool is_array = m[3].matched;
-    if (fname.rfind("common_", 0) == 0) continue;                // skip the common header
-    if (type.find("__data_loc") != std::string::npos) continue;  // dynamic string -> later
+    if (fname.rfind("common_", 0) == 0) continue;  // skip the common header
     datacrumbs::ProbeArgCaptureSpec s;
     s.label = fname;
     s.offset = static_cast<unsigned int>(std::stoul(m[4].str()));
     s.num_bytes = static_cast<unsigned int>(std::stoul(m[5].str()));
     const bool is_signed = m[6].str() != "0";
-    if (type.find("char") != std::string::npos && is_array) {  // fixed char array -> string bytes
+    if (type.find("__data_loc") != std::string::npos) {  // dynamic string: field holds a u32
+      s.is_pointer = true;                               // [len:16|rel_offset:16]; generic_point
+      s.c_type = "char *";                               // does the two-step read (index=1 marks it)
+      s.index = 1;
+      s.num_bytes = DATACRUMBS_MAX_CAPTURE_BYTES;
+    } else if (type.find("char") != std::string::npos && is_array) {  // fixed char array -> bytes
       s.is_pointer = true;
       s.c_type = "char *";
     } else if (s.num_bytes <= 8) {  // scalar
