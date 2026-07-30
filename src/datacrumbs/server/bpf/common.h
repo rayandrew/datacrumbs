@@ -922,14 +922,20 @@ static inline
 // Tracepoint handler: a tracepoint fires ONCE (no entry/exit pairing like kprobes), so emit a single
 // point event (dur=0). ctx is the tracepoint context, not pt_regs -- we read nothing from it here (v1
 // captures timing + which tracepoint + pid/tid; the tracepoint's own fields are not decoded yet).
+//
+// SYSTEM-WIDE (no pid gate): global NIC/firmware tracepoints (mlx5:mlx5_fw, mlx5:mlx5_cmd) fire in
+// kernel-worker/IRQ context, OFF any traced pid, so gating by pid_map would drop exactly the events
+// we want. hot_probe_drop caps a high-rate tracepoint (e.g. sched:sched_switch, ~all cores) so
+// system-wide capture can't flood the writer. key.id = whatever context is on-CPU (may be a kernel
+// worker / swapper) -- that IS the truth for a firmware/IRQ event.
 static inline __attribute__((always_inline)) int generic_point(u64 attach_cookie) {
-  struct fn_key_t key = {};
-  u64 start_ts = 0;
-  if (!need_tracing(&key, &start_ts)) return 0;  // pid gate: tracepoints fire system-wide
   const u64 now = bpf_ktime_get_ns();
   const struct runtime_event_config_t* config = resolve_event_config(attach_cookie);
   if (config == NULL) return 0;
   const u64 event_id = config->event_id;
+  if (hot_probe_drop(event_id, now)) return 0;  // rate-limit a high-rate system-wide tracepoint
+  struct fn_key_t key = {};
+  key.id = bpf_get_current_pid_tgid();
   struct generic_event_t* event;
   DATACRUMBS_RB_RESERVE(output, struct generic_event_t, event);
   event->type = config->probe_kind;
