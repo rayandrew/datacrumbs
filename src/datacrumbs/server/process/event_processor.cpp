@@ -207,7 +207,7 @@ int EventProcessor::update_filename(const char* filename, unsigned int hash) {
   auto event =
       new datacrumbs::EventWithId(METADATA_EVENT, event_index.fetch_add(1), 0, 0, 0, 0, 0, args);
   if (writer_) {
-    writer_->write_event(event);
+    writer_->push_event(event);  // async path; metadata is order-independent
   }
   return 0;
 }

@@ -3,58 +3,52 @@
 #include <datacrumbs/datacrumbs_config.h>
 // Other headers
 #include <datacrumbs/common/data_structures.h>
-#include <datacrumbs/server/process/compress/zlib_compressor.h>
 // std headers
-#include <pwd.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <unistd.h>
-
-#include <any>
-#include <cmath>
-#include <condition_variable>
+#include <cstddef>
 #include <cstdio>
+#include <condition_variable>
 #include <deque>
 #include <mutex>
 #include <string>
 #include <thread>
-#include <type_traits>
-#include <utility>
-#include <vector>
 
 namespace datacrumbs {
 
+// Writes events as a multi-member gzip .pfw: each drained batch is coalesced into ~1MB chunks and
+// each chunk is a self-contained gzip member. Concatenated members are a valid gzip stream, so a
+// killed server still leaves every completed member readable (truncation-tolerant). Events cross a
+// bounded queue to a single worker; a producer outrunning the writer is blocked, never dropped.
 class ChromeWriter {
  public:
-  // Create a ChromeWriter that writes to the given filename.
   ChromeWriter();
-
-  // Destructor flushes and closes the file, and joins the worker thread.
   ~ChromeWriter();
 
+  // Enqueue an event; takes ownership of the event and its args and frees them after writing.
+  // Blocks while the queue is at its backpressure bound.
   void push_event(EventWithId* event);
 
-  // Serialize and write a single event to the file, including event_id as "id".
-  void write_event(EventWithId* event_with_id);
-
+  // Drain the queue, emit the closing member, close the file, and join the worker. Idempotent.
   void finalize();
 
  private:
   void worker_loop();
+  std::string serialize_event(EventWithId* event);  // one event -> JSON line; frees the event
+  void write_member(const std::string& data);       // gzip `data` as one member, append to file
 
-  bool first_event_ = true;
-
-  std::mutex file_mutex_;
+  FILE* file_ = nullptr;
 
   std::deque<EventWithId*> event_queue_;
   std::mutex queue_mutex_;
-  std::condition_variable queue_cv_;
+  std::condition_variable queue_cv_;     // worker wakes on nonempty / stop
+  std::condition_variable not_full_cv_;  // producer wakes when the queue drains below the bound
+  size_t max_queue_events_;              // backpressure bound (0 = unbounded)
+
   std::thread worker_;
-  bool stop_flag_;
-  bool finalized_;
-  unsigned long index_;
-  ZlibCompression* compressor_;
-  size_t chunk_size_;
+  bool stop_flag_ = false;
+  bool finalized_ = false;
+  unsigned long index_ = 0;  // unique event id; only the worker touches it
+  size_t flush_bytes_;       // coalesce serialized JSON to ~this many bytes per gzip member
+  int zlib_level_;
 };
 
 }  // namespace datacrumbs
