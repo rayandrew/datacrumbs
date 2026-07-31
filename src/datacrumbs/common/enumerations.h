@@ -105,6 +105,19 @@ inline void convert(const std::string& s, CaptureType& type) {
   DC_LOG_TRACE("Exiting convert for CaptureType");
 }
 
+// dftracer .pfw numeric "ph" (Chrome phase letter shown). Append-only, never renumber.
+enum class TracePhase : uint8_t {
+  UNKNOWN = 0,
+  COMPLETE = 1,    // X
+  COUNTER = 2,     // C
+  AGGREGATED = 3,  // A
+  METADATA = 4,    // M
+};
+
+// The .pfw "type" (coarse probe domain) is a free-form string, not an enum: a probe group declares
+// it in config and a plugin can contribute its own (e.g. "doca") without any core change. Core's
+// built-in domains are "syscall"/"kernel"/"sched"/"net"/"user"; unset emits an empty string.
+
 }  // namespace datacrumbs
 
 #endif  // DATACRUMBS_COMMON_ENUMERATIONS_H__

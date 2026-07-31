@@ -646,6 +646,7 @@ void RuntimeConfigurationManager::load_runtime_probe_file() {
       runtime_event_ids[runtime_event_key(probe->name, function_name)] = assigned_event_id;
       RuntimeEventMetadata metadata;
       metadata.probe_type = probe->type;
+      metadata.trace_event_type = probe->trace_event_type;
       metadata.probe_name = probe->name;
       metadata.function_name = function_name;
       if (const auto* arg_specs = probe->getArgSpecs(function_name); arg_specs != nullptr) {

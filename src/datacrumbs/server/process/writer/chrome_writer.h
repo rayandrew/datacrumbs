@@ -3,6 +3,7 @@
 #include <datacrumbs/datacrumbs_config.h>
 // Other headers
 #include <datacrumbs/common/data_structures.h>
+#include <datacrumbs/common/enumerations.h>
 // std headers
 #include <cstddef>
 #include <cstdio>
@@ -36,6 +37,9 @@ class ChromeWriter {
   void write_member(const std::string& data);       // gzip `data` as one member, append to file
 
   FILE* file_ = nullptr;
+
+  std::string hostname_;  // this node's hostname, resolved once at construction
+  std::string hhash_;     // md5(hostname) as dftracer's 16-hex host key; first key of every args
 
   std::deque<EventWithId*> event_queue_;
   std::mutex queue_mutex_;

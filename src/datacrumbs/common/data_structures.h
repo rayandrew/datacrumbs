@@ -57,6 +57,7 @@ struct ProbeArgCaptureSpec {
 
 struct RuntimeEventMetadata {
   ProbeType probe_type = ProbeType::KPROBE;
+  std::string trace_event_type;  // .pfw "type" domain string (empty = unset)
   std::string probe_name;
   std::string function_name;
   std::vector<ProbeArgCaptureSpec> arg_specs;
@@ -113,6 +114,7 @@ class Probe {
   // Copy constructor
   Probe(const Probe& other)
       : type(other.type),
+        trace_event_type(other.trace_event_type),
         name(other.name),
         functions(other.functions),
         function_arguments(other.function_arguments) {
@@ -122,6 +124,7 @@ class Probe {
   // Move constructor
   Probe(Probe&& other) noexcept
       : type(other.type),
+        trace_event_type(std::move(other.trace_event_type)),
         name(std::move(other.name)),
         functions(std::move(other.functions)),
         function_arguments(std::move(other.function_arguments)) {
@@ -130,7 +133,8 @@ class Probe {
   // Constructor initializing the probe type
   Probe(ProbeType _type) : type(_type) { DC_LOG_TRACE("Probe constructor called"); }
 
-  ProbeType type;                      // The type of probe (e.g., SYSCALLS, KPROBE, etc.)
+  ProbeType type;                 // The type of probe (e.g., SYSCALLS, KPROBE, etc.)
+  std::string trace_event_type;   // .pfw "type" domain string, from config (empty = unset)
   std::string name;                    // Name of the probe
   std::vector<std::string> functions;  // List of functions or arguments for the probe
   std::unordered_map<std::string, std::vector<ProbeArgCaptureSpec>>
@@ -155,6 +159,8 @@ class Probe {
     DC_LOG_TRACE("Probe::toJson called");
     json_object* j = json_object_new_object();
     json_object_object_add(j, "type", json_object_new_int(static_cast<int>(type)));
+    json_object_object_add(j, "trace_event_type",
+                           json_object_new_string(trace_event_type.c_str()));
     json_object_object_add(j, "name", json_object_new_string(name.c_str()));
 
     json_object* funcs = json_object_new_array();
@@ -187,6 +193,9 @@ class Probe {
   static Probe fromJson(const json_object* j) {
     DC_LOG_TRACE("Probe::fromJson called");
     Probe p(static_cast<ProbeType>(json_object_get_int(json_object_object_get(j, "type"))));
+    if (json_object* et = json_object_object_get(j, "trace_event_type")) {
+      p.trace_event_type = json_object_get_string(et);
+    }
     json_object* name_obj = json_object_object_get(j, "name");
     if (name_obj) p.name = json_object_get_string(name_obj);
 

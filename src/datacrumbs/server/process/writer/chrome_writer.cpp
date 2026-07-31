@@ -6,6 +6,7 @@
 #include <datacrumbs/common/singleton.h>
 #include <datacrumbs/common/typedefs.h>
 #include <datacrumbs/server/bpf/shared.h>
+#include <openssl/evp.h>
 #include <pwd.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -197,9 +198,8 @@ long env_num(const char* name, long dflt) {
   return dflt;
 }
 
-// Compress `in` into one self-contained gzip member. Concatenated members form a valid multi-member
-// gzip that gunzip/Perfetto read as a single stream, so a member completed before a crash stays
-// readable regardless of what follows.
+// One self-contained gzip member; concatenated members are a valid gzip stream, so a member
+// completed before a crash stays readable.
 std::vector<uint8_t> gzip_block(const std::string& in, int level) {
   z_stream s{};
   if (deflateInit2(&s, level, Z_DEFLATED, 15 + 16, 8, Z_DEFAULT_STRATEGY) != Z_OK) {
@@ -215,6 +215,17 @@ std::vector<uint8_t> gzip_block(const std::string& in, int level) {
   if (r != Z_STREAM_END) throw std::runtime_error("deflate failed");
   out.resize(out.size() - s.avail_out);
   return out;
+}
+
+// dftracer host key: md5(hostname), even-indexed digest bytes in %02x (matches df_logger.h get_hash).
+std::string dftracer_hhash(const std::string& hostname) {
+  unsigned char digest[EVP_MAX_MD_SIZE];
+  unsigned int dlen = 0;
+  EVP_Digest(hostname.data(), hostname.size(), digest, &dlen, EVP_md5(), nullptr);
+  char hex[17];
+  for (int i = 0; i < 16; i += 2) std::snprintf(hex + i, 3, "%02x", digest[i]);
+  hex[16] = '\0';
+  return std::string(hex, 16);
 }
 
 }  // namespace
@@ -245,6 +256,16 @@ ChromeWriter::ChromeWriter() : flush_bytes_(1 << 20) {
   gid_t gid = pwd ? pwd->pw_gid : static_cast<gid_t>(-1);
   chown(configManager_->trace_file_path.c_str(), uid, gid);
   chmod(configManager_->trace_file_path.c_str(), 0660);
+
+  char host[256] = {0};
+  gethostname(host, sizeof(host) - 1);
+  hostname_ = host;
+  hhash_ = dftracer_hhash(hostname_);
+  // dftracer "HH" record: lets the reader resolve this hhash back to the hostname.
+  write_member("{\"name\":\"HH\",\"cat\":\"dftracer\",\"type\":\"metadata\",\"ph\":" +
+               std::to_string(static_cast<unsigned>(TracePhase::METADATA)) +
+               ",\"args\":{\"hhash\":\"" + hhash_ + "\",\"name\":\"" + json_escape(hostname_) +
+               "\",\"value\":\"" + hhash_ + "\"}}\n");
 
   worker_ = std::thread([this]() { this->worker_loop(); });
 }
@@ -330,34 +351,41 @@ std::string ChromeWriter::serialize_event(EventWithId* event_with_id) {
     } else {
       dur_us = static_cast<unsigned long long>(std::ceil(event_with_id->dur / 1000.0));
     }
+    // "id" and "dur" are complete-event only; "type" is the probe's config domain string ("unknown"
+    // if unset -- a free-form string so a plugin can contribute its own domain without a core change).
+    const auto* rmeta = configManager_->get_runtime_event_metadata(event_with_id->event_id);
+    const char* type =
+        (rmeta && !rmeta->trace_event_type.empty()) ? rmeta->trace_event_type.c_str() : "unknown";
     int len = 0;
     if (event_with_id->event_type == COUNTER_EVENT) {
       len = std::snprintf(
-          buffer, sizeof(buffer), R"({"id":%lu,"name":"%s","cat":"%s","ph":"%c","ts":%llu)", index_,
-          function_name.c_str(), probe_name.c_str(), event_with_id->event_type, ts_us);
+          buffer, sizeof(buffer),
+          R"({"name":"%s","cat":"%s","type":"%s","pid":%d,"tid":%d,"ts":%llu,"ph":%u)",
+          function_name.c_str(), probe_name.c_str(), type, pid, tid, ts_us,
+          static_cast<unsigned>(TracePhase::COUNTER));
     } else if (event_with_id->event_type == METADATA_EVENT) {
-      len = std::snprintf(buffer, sizeof(buffer), R"({"id":%lu,"name":"%s","cat":"%s","ph":"%c")",
-                          index_, function_name.c_str(), probe_name.c_str(),
-                          event_with_id->event_type);
+      // Metadata records are self-typed; the probe-domain lookup does not apply to them.
+      len = std::snprintf(buffer, sizeof(buffer),
+                          R"({"name":"%s","cat":"%s","type":"metadata","ph":%u)",
+                          function_name.c_str(), probe_name.c_str(),
+                          static_cast<unsigned>(TracePhase::METADATA));
     } else if (event_with_id->event_type == NORMAL_EVENT) {
       len = std::snprintf(
           buffer, sizeof(buffer),
-          R"({"id":%lu,"name":"%s","cat":"%s","ph":"%c","ts":%llu,"dur":%llu,"pid":%d,"tid":%d)",
-          index_, function_name.c_str(), probe_name.c_str(), event_with_id->event_type, ts_us,
-          dur_us, pid, tid);
+          R"({"id":%lu,"name":"%s","cat":"%s","type":"%s","pid":%d,"tid":%d,"ts":%llu,"dur":%llu,"ph":%u)",
+          index_, function_name.c_str(), probe_name.c_str(), type, pid, tid, ts_us, dur_us,
+          static_cast<unsigned>(TracePhase::COMPLETE));
     }
 
     if (len > 0) {
-      std::string args_json = "{";
-      bool first = true;
+      // hhash first, so every event carries this node's host key for the reader.
+      std::string args_json = "{\"hhash\":\"" + hhash_ + "\"";
       if (args != nullptr && !args->empty()) {
         for (auto pair : *args) {
-          if (!first) args_json += ",";
-          args_json += "\"";
+          args_json += ",\"";
           args_json += pair.first;
           args_json += "\":";
           args_json += serialize_any_value(pair.second);
-          first = false;
         }
       }
       args_json += "}";
