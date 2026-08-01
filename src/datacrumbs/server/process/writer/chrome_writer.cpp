@@ -2,6 +2,7 @@
 // internal headers
 #include <datacrumbs/common/constants.h>
 #include <datacrumbs/common/logging.h>
+#include <datacrumbs/common/pfw_format.h>
 #include <datacrumbs/common/runtime_configuration_manager.h>
 #include <datacrumbs/common/singleton.h>
 #include <datacrumbs/common/typedefs.h>
@@ -199,35 +200,6 @@ long env_num(const char* name, long dflt) {
   return dflt;
 }
 
-// One self-contained gzip member; concatenated members are a valid gzip stream, so a member
-// completed before a crash stays readable.
-std::vector<uint8_t> gzip_block(const std::string& in, int level) {
-  z_stream s{};
-  if (deflateInit2(&s, level, Z_DEFLATED, 15 + 16, 8, Z_DEFAULT_STRATEGY) != Z_OK) {
-    throw std::runtime_error("deflateInit2 failed");
-  }
-  std::vector<uint8_t> out(deflateBound(&s, in.size()));
-  s.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(in.data()));
-  s.avail_in = static_cast<uInt>(in.size());
-  s.next_out = out.data();
-  s.avail_out = static_cast<uInt>(out.size());
-  int r = deflate(&s, Z_FINISH);
-  deflateEnd(&s);
-  if (r != Z_STREAM_END) throw std::runtime_error("deflate failed");
-  out.resize(out.size() - s.avail_out);
-  return out;
-}
-
-// dftracer host key: md5(hostname), even-indexed digest bytes in %02x (matches df_logger.h get_hash).
-std::string dftracer_hhash(const std::string& hostname) {
-  unsigned char digest[EVP_MAX_MD_SIZE];
-  unsigned int dlen = 0;
-  EVP_Digest(hostname.data(), hostname.size(), digest, &dlen, EVP_md5(), nullptr);
-  char hex[17];
-  for (int i = 0; i < 16; i += 2) std::snprintf(hex + i, 3, "%02x", digest[i]);
-  hex[16] = '\0';
-  return std::string(hex, 16);
-}
 
 }  // namespace
 
@@ -261,7 +233,7 @@ ChromeWriter::ChromeWriter() : flush_bytes_(1 << 20) {
   char host[256] = {0};
   gethostname(host, sizeof(host) - 1);
   hostname_ = host;
-  hhash_ = dftracer_hhash(hostname_);
+  hhash_ = datacrumbs::pfw::hhash(hostname_);
   // dftracer "HH" record: lets the reader resolve this hhash back to the hostname.
   write_member("{\"name\":\"HH\",\"cat\":\"dftracer\",\"type\":\"metadata\",\"ph\":" +
                std::to_string(static_cast<unsigned>(TracePhase::METADATA)) +
@@ -309,7 +281,7 @@ void ChromeWriter::push_event(EventWithId* event) {
 
 void ChromeWriter::write_member(const std::string& data) {
   if (data.empty() || !file_) return;
-  std::vector<uint8_t> member = gzip_block(data, zlib_level_);
+  std::vector<uint8_t> member = datacrumbs::pfw::gzip_block(data, zlib_level_);
   if (std::fwrite(member.data(), 1, member.size(), file_) != member.size()) {
     perror("Failed to write gzip member to trace file");
   }

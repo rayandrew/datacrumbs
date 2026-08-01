@@ -269,6 +269,7 @@ set(DATACRUMBS_PUBLIC_COMMON_HEADERS
     ${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/common/dc_timesync_snapshot.h
     ${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/common/enumerations.h
     ${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/common/logging.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/common/pfw_format.h
     ${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/common/plugin_api.h
     ${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/common/probe_file.h
     ${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/common/singleton.h
