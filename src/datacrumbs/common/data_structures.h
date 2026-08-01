@@ -67,7 +67,7 @@ struct RuntimeEventMetadata {
 };
 
 struct EventWithId {
-  char event_type;
+  TracePhase event_type;  // the trace phase (COMPLETE/COUNTER/AGGREGATED/METADATA); ph in the .pfw
   unsigned long long index;
   unsigned int type;
   unsigned long long tgid_pid;
@@ -77,7 +77,7 @@ struct EventWithId {
   DataCrumbsArgs* args;
   unsigned int pmu_count = 0;                     // hardware counters captured (0 = none)
   unsigned long long pmu[DATACRUMBS_MAX_PMU] = {};  // per-counter entry->exit delta; named by a plugin
-  EventWithId(char _event_type, unsigned long long _index, unsigned int _type,
+  EventWithId(TracePhase _event_type, unsigned long long _index, unsigned int _type,
               unsigned long long _tgid_pid, unsigned long long _event_id, unsigned long long _ts,
               unsigned long long _dur, DataCrumbsArgs* _args)
       : event_type(_event_type),
@@ -127,6 +127,7 @@ class Probe {
       : type(other.type),
         trace_event_type(other.trace_event_type),
         system_wide(other.system_wide),
+        aggregate(other.aggregate),
         name(other.name),
         functions(other.functions),
         function_arguments(other.function_arguments) {
@@ -138,6 +139,7 @@ class Probe {
       : type(other.type),
         trace_event_type(std::move(other.trace_event_type)),
         system_wide(other.system_wide),
+        aggregate(other.aggregate),
         name(std::move(other.name)),
         functions(std::move(other.functions)),
         function_arguments(std::move(other.function_arguments)) {
@@ -149,6 +151,7 @@ class Probe {
   ProbeType type;                 // The type of probe (e.g., SYSCALLS, KPROBE, etc.)
   std::string trace_event_type;   // .pfw "type" domain string, from config (empty = unset)
   bool system_wide = false;       // tracepoints: capture on all pids (skip the pid gate)
+  bool aggregate = false;         // accumulate count/duration instead of emitting per-event records
   std::string name;                    // Name of the probe
   std::vector<std::string> functions;  // List of functions or arguments for the probe
   std::unordered_map<std::string, std::vector<ProbeArgCaptureSpec>>
@@ -176,6 +179,7 @@ class Probe {
     json_object_object_add(j, "trace_event_type",
                            json_object_new_string(trace_event_type.c_str()));
     if (system_wide) json_object_object_add(j, "system_wide", json_object_new_boolean(true));
+    if (aggregate) json_object_object_add(j, "aggregate", json_object_new_boolean(true));
     json_object_object_add(j, "name", json_object_new_string(name.c_str()));
 
     json_object* funcs = json_object_new_array();
@@ -213,6 +217,9 @@ class Probe {
     }
     if (json_object* sw = json_object_object_get(j, "system_wide")) {
       p.system_wide = json_object_get_boolean(sw);
+    }
+    if (json_object* ag = json_object_object_get(j, "aggregate")) {
+      p.aggregate = json_object_get_boolean(ag);
     }
     json_object* name_obj = json_object_object_get(j, "name");
     if (name_obj) p.name = json_object_get_string(name_obj);
@@ -286,6 +293,7 @@ struct SysCallProbe : public Probe {
     p.name = base.name;
     p.functions = base.functions;
     p.function_arguments = base.function_arguments;
+    p.aggregate = base.aggregate;
     return p;
   }
 };
@@ -319,6 +327,7 @@ struct KProbe : public Probe {
     p.name = base.name;
     p.functions = base.functions;
     p.function_arguments = base.function_arguments;
+    p.aggregate = base.aggregate;
     return p;
   }
 };
@@ -364,6 +373,7 @@ struct UProbe : public Probe {
     p.name = base.name;
     p.functions = base.functions;
     p.function_arguments = base.function_arguments;
+    p.aggregate = base.aggregate;
     json_object* bin_obj = json_object_object_get(j, "binary_path");
     if (bin_obj) p.binary_path = json_object_get_string(bin_obj);
 
@@ -420,6 +430,7 @@ struct USDTProbe : public Probe {
     p.name = base.name;
     p.functions = base.functions;
     p.function_arguments = base.function_arguments;
+    p.aggregate = base.aggregate;
 
     json_object* bin_obj = json_object_object_get(j, "binary_path");
     if (bin_obj) p.binary_path = json_object_get_string(bin_obj);
@@ -450,6 +461,7 @@ struct TracepointProbe : public Probe {
     p.name = base.name;
     p.functions = base.functions;
     p.function_arguments = base.function_arguments;
+    p.aggregate = base.aggregate;
     return p;
   }
 };
@@ -518,6 +530,7 @@ struct CustomProbe : public Probe {
     p.name = base.name;
     p.functions = base.functions;
     p.function_arguments = base.function_arguments;
+    p.aggregate = base.aggregate;
 
     json_object* bpf_obj = json_object_object_get(j, "bpf_path");
     if (bpf_obj) p.bpf_path = json_object_get_string(bpf_obj);
@@ -547,6 +560,7 @@ class CaptureProbe {
   bool enable_explorer;  // Flag to enable explorer for this capture probe
   std::string trace_event_type;  // .pfw "type" domain, propagated to the emitted Probe
   bool system_wide = false;      // tracepoints: capture on all pids, propagated to the emitted Probe
+  bool aggregate = false;        // accumulate count/duration, propagated to the emitted Probe
   std::unordered_map<std::string, std::vector<ProbeArgCaptureSpec>>
       function_arguments;  // Optional per-function arg capture specification from YAML
 

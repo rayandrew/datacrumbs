@@ -85,7 +85,7 @@ inline static int lookup_3(int map_fd, unsigned long long latest_timestamp,
 static datacrumbs::EventWithId* get_data_3(void* data, uint64_t index) {
 #if defined(DATACRUMBS_MODE) && (DATACRUMBS_MODE == 1)
   struct usdt_event_t* base = (usdt_event_t*)data;
-  auto event = new datacrumbs::EventWithId(NORMAL_EVENT, index, base->type, base->id,
+  auto event = new datacrumbs::EventWithId(datacrumbs::TracePhase::COMPLETE, index, base->type, base->id,
                                            base->event_id, base->ts, base->dur, nullptr);
 #else
   struct usdt_counter_event_t* base = (usdt_counter_event_t*)data;
@@ -94,7 +94,7 @@ static datacrumbs::EventWithId* get_data_3(void* data, uint64_t index) {
   args->emplace("frequency", base->value->frequency);
   args->emplace("clazz", base->key->class_hash);
   args->emplace("method", base->key->method_hash);
-  auto event = new datacrumbs::EventWithId(COUNTER_EVENT, index, base->key->type, base->key->id,
+  auto event = new datacrumbs::EventWithId(datacrumbs::TracePhase::COUNTER, index, base->key->type, base->key->id,
                                            base->key->event_id, base->key->time_interval, 0, args);
 #endif
   return event;

@@ -43,6 +43,7 @@ extern struct {
 
 #if defined(DATACRUMBS_MODE) && (DATACRUMBS_MODE == 1)
 DATACRUMBS_MAP_EXTERN(failed_request, u32, u32, 128);
+DATACRUMBS_MAP_EXTERN(agg_map, struct agg_key_t, struct agg_value_t, 4096);
 DATACRUMBS_RINGBUF_EXTERN(output, 1024 * 1024U * DATACRUMBS_TRACE_RINGBUF_SIZE_MB);
 #else
 DATACRUMBS_MAP_EXTERN(profile, struct profile_key_t, struct profile_value_t, 1024);
@@ -228,6 +229,23 @@ static inline __attribute__((always_inline)) void pmu_delta_exit(const struct fn
 #pragma unroll
   for (int i = 0; i < DATACRUMBS_MAX_PMU; ++i) event->pmu[i] = now[i] - fn->pmu_start[i];
 }
+
+#if defined(DATACRUMBS_MODE) && (DATACRUMBS_MODE == 1)
+// Accumulate a hit into agg_map instead of emitting an event (config->aggregate probes). The server
+// drains this into periodic COUNTER records. Concurrent updates race benignly (last-writer init).
+static inline __attribute__((always_inline)) void aggregate_hit(u64 event_id, u64 pid_tgid, u64 ts,
+                                                                u64 te) {
+  struct agg_key_t k = {.event_id = event_id, .time_interval = te / DATACRUMBS_TIME_INTERVAL_NS};
+  struct agg_value_t* v = bpf_map_lookup_elem(&agg_map, &k);
+  if (v != NULL) {
+    __sync_fetch_and_add(&v->count, 1);
+    __sync_fetch_and_add(&v->duration_ns, te - ts);
+    return;
+  }
+  struct agg_value_t nv = {.count = 1, .duration_ns = te - ts, .pid_tgid = pid_tgid};
+  bpf_map_update_elem(&agg_map, &k, &nv, BPF_ANY);
+}
+#endif
 
 static inline __attribute__((always_inline)) int mark_current_pid_traced(void) {
   const u64 tsp = bpf_ktime_get_ns();
@@ -493,6 +511,10 @@ static inline __attribute__((always_inline)) int generic_exit(struct pt_regs* ct
   key.event_id = event_id;
   struct fn_value_t* fn = bpf_map_lookup_elem(&fn_pid_map, &key);
   if (fn == 0) return 0;  // missed entry
+  if (config->aggregate) {  // count+duration only, no per-event record
+    aggregate_hit(event_id, key.id, fn->ts, te);
+    return 0;
+  }
   DATACRUMBS_SKIP_SMALL_EVENTS(fn, te);
   if (hot_probe_drop(event_id, te)) return 0;  // rate-limit a runaway (busy-poll) probe
   struct generic_event_t* event;
@@ -642,6 +664,10 @@ static inline __attribute__((always_inline)) int usdt_exit(struct pt_regs* ctx, 
   key.event_id = event_id;
   struct fn_value_t* fn = bpf_map_lookup_elem(&fn_pid_map, &key);
   if (fn == 0) return 0;  // missed entry
+  if (config->aggregate) {  // count+duration only, no per-event record
+    aggregate_hit(event_id, key.id, fn->ts, te);
+    return 0;
+  }
   DATACRUMBS_SKIP_SMALL_EVENTS(fn, te);
   if (hot_probe_drop(event_id, te)) return 0;  // rate-limit a runaway (busy-poll) probe
   struct generic_event_t* event;

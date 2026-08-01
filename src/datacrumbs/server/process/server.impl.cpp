@@ -101,11 +101,13 @@ static unsigned int runtime_probe_kind(datacrumbs::ProbeType probe_type) {
 
 static int populate_event_arg_config(
     int map_fd, uint64_t cookie, uint64_t event_id, datacrumbs::ProbeType probe_type,
-    const std::vector<datacrumbs::ProbeArgCaptureSpec>* arg_specs, bool system_wide = false) {
+    const std::vector<datacrumbs::ProbeArgCaptureSpec>* arg_specs, bool system_wide = false,
+    bool aggregate = false) {
   runtime_event_config_t config = {};
   config.event_id = event_id;
   config.probe_kind = runtime_probe_kind(probe_type);
   config.system_wide = system_wide ? 1u : 0u;
+  config.aggregate = aggregate ? 1u : 0u;
   if (arg_specs != nullptr) {
     config.arg_count = std::min<unsigned int>(arg_specs->size(), DATACRUMBS_MAX_CAPTURE_ARGS);
     for (unsigned int index = 0; index < config.arg_count; ++index) {
@@ -224,6 +226,38 @@ static void poll_auto_detach(int probe_guard_fd, datacrumbs::EventProcessor* eve
   for (uint64_t event_id : detached) g_runtime_links.erase(event_id);
 }
 
+#if defined(DATACRUMBS_MODE) && (DATACRUMBS_MODE == 1)
+// Drain agg_map into COUNTER records for aggregate probes: one record per (event_id, interval)
+// bucket with count + summed duration (us). Buckets are deleted as consumed. Keys are snapshotted
+// before deleting so concurrent BPF updates don't invalidate the walk.
+static void drain_agg_map(int agg_fd, datacrumbs::EventProcessor* event_processor) {
+  if (agg_fd < 0 || !event_processor->writer_) return;
+  auto config_manager = event_processor->configManager_;
+  std::vector<struct agg_key_t> keys;
+  struct agg_key_t key = {};
+  struct agg_key_t next = {};
+  int err = bpf_map_get_next_key(agg_fd, nullptr, &next);
+  while (err == 0) {
+    keys.push_back(next);
+    key = next;
+    err = bpf_map_get_next_key(agg_fd, &key, &next);
+  }
+  for (const auto& k : keys) {
+    struct agg_value_t v = {};
+    if (bpf_map_lookup_elem(agg_fd, &k, &v) != 0) continue;
+    bpf_map_delete_elem(agg_fd, &k);
+    if (config_manager->category_map.find(k.event_id) == config_manager->category_map.end()) continue;
+    auto* args = new DataCrumbsArgs();
+    (*args)["count"] = static_cast<unsigned long long>(v.count);
+    (*args)["dur"] = static_cast<unsigned long long>(v.duration_ns / 1000);  // summed us (dftracer key)
+    auto* aggregated =
+        new datacrumbs::EventWithId(datacrumbs::TracePhase::AGGREGATED, 0, 0, v.pid_tgid, k.event_id,
+                                    k.time_interval * DATACRUMBS_TIME_INTERVAL_NS, 0, args);
+    event_processor->writer_->push_event(aggregated);
+  }
+}
+#endif
+
 static int attach_runtime_probes(datacrumbs::EventProcessor* event_processor,
                                  struct datacrumbs_bpf* skel) {
   auto config_manager = event_processor->configManager_;
@@ -304,7 +338,8 @@ static int attach_runtime_probes(datacrumbs::EventProcessor* event_processor,
       if (probe->type == datacrumbs::ProbeType::KPROBE) {
         total_requested += 2;
         if (populate_event_arg_config(event_arg_config_fd, current_cookie, *event_id, probe->type,
-                                      probe->getArgSpecs(function_name)) != 0) {
+                                      probe->getArgSpecs(function_name), false,
+                                      probe->aggregate) != 0) {
           total_failed += 2;
           continue;
         }
@@ -334,7 +369,8 @@ static int attach_runtime_probes(datacrumbs::EventProcessor* event_processor,
         total_requested += 2;
         const std::string syscall_name = normalize_syscall_name_for_attach(function_name);
         if (populate_event_arg_config(event_arg_config_fd, current_cookie, *event_id, probe->type,
-                                      probe->getArgSpecs(function_name)) != 0) {
+                                      probe->getArgSpecs(function_name), false,
+                                      probe->aggregate) != 0) {
           total_failed += 2;
           continue;
         }
@@ -373,7 +409,8 @@ static int attach_runtime_probes(datacrumbs::EventProcessor* event_processor,
           continue;
         }
         if (populate_event_arg_config(event_arg_config_fd, current_cookie, *event_id, probe->type,
-                                      probe->getArgSpecs(function_name)) != 0) {
+                                      probe->getArgSpecs(function_name), false,
+                                      probe->aggregate) != 0) {
           total_failed += 2;
           continue;
         }
@@ -407,7 +444,8 @@ static int attach_runtime_probes(datacrumbs::EventProcessor* event_processor,
         total_requested += 2;
         auto usdt = std::dynamic_pointer_cast<datacrumbs::USDTProbe>(probe);
         if (populate_event_arg_config(event_arg_config_fd, current_cookie, *event_id, probe->type,
-                                      probe->getArgSpecs(function_name)) != 0) {
+                                      probe->getArgSpecs(function_name), false,
+                                      probe->aggregate) != 0) {
           total_failed += 2;
           continue;
         }
@@ -700,6 +738,9 @@ static int main_process(datacrumbs::EventProcessor* event_processor) {
   const char* autodetach_env = std::getenv("DATACRUMBS_AUTODETACH");
   const bool autodetach = autodetach_env == nullptr || std::strcmp(autodetach_env, "0") != 0;
   time_t last_autodetach = time(nullptr);
+#if defined(DATACRUMBS_MODE) && (DATACRUMBS_MODE == 1)
+  const int agg_fd = bpf_map__fd(skel->maps.agg_map);
+#endif
 
   unsigned long long last_processed_timestamp = 0;
   while (!stop) {
@@ -720,9 +761,10 @@ static int main_process(datacrumbs::EventProcessor* event_processor) {
     }
     // wall-clock cadence: under load ring_buffer__poll returns immediately, so an iteration count
     // would fire far faster than 1s and shrink each check's drop delta below the threshold.
-    if (autodetach && time(nullptr) - last_autodetach >= 1) {
+    if (time(nullptr) - last_autodetach >= 1) {
       last_autodetach = time(nullptr);
-      poll_auto_detach(probe_guard_fd, event_processor);
+      if (autodetach) poll_auto_detach(probe_guard_fd, event_processor);
+      drain_agg_map(agg_fd, event_processor);
     }
     err = ring_buffer__poll(rb, 10);
     if (err == -EINTR) {
@@ -774,6 +816,9 @@ static int main_process(datacrumbs::EventProcessor* event_processor) {
 
   batch_size = 1024 * 1024;
   DC_LOG_INFO("");
+#if defined(DATACRUMBS_MODE) && (DATACRUMBS_MODE == 1)
+  drain_agg_map(agg_fd, event_processor);  // flush the final interval buckets before shutdown
+#endif
 #if defined(DATACRUMBS_MODE) && (DATACRUMBS_MODE == 2)
   DC_LOG_INFO("Collecting remaining profiling events");
   while (LOOKUP_1_CALL() != -1);

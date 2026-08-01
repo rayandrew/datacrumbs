@@ -66,10 +66,22 @@ struct fn_value_t {
   unsigned long long pmu_start[DATACRUMBS_MAX_PMU];  // entry counter values
 };
 
+struct agg_key_t {
+  unsigned long long event_id;
+  unsigned long long time_interval;
+};
+
+struct agg_value_t {
+  unsigned long long count;
+  unsigned long long duration_ns;  // summed entry->exit duration
+  unsigned long long pid_tgid;     // a representative pid_tgid for the counter record
+};
+
 struct runtime_event_config_t {
   unsigned long long event_id;
   unsigned int probe_kind;
   unsigned int system_wide;  // tracepoints: 1 => skip the pid gate (capture on all pids)
+  unsigned int aggregate;    // 1 => accumulate count/duration instead of emitting per-event
   unsigned int arg_count;
   unsigned int arg_index[DATACRUMBS_MAX_CAPTURE_ARGS];
   unsigned int arg_num_bytes[DATACRUMBS_MAX_CAPTURE_ARGS];

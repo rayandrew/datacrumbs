@@ -85,14 +85,14 @@ static datacrumbs::EventWithId* get_data_1(void* data, uint64_t index) {
 #if defined(DATACRUMBS_MODE) && (DATACRUMBS_MODE == 1)
   general_event_t* base = (general_event_t*)data;
 
-  auto event = new datacrumbs::EventWithId(NORMAL_EVENT, index, base->type, base->id,
+  auto event = new datacrumbs::EventWithId(datacrumbs::TracePhase::COMPLETE, index, base->type, base->id,
                                            base->event_id, base->ts, base->dur, nullptr);
 #else
   struct counter_event_t* base = (counter_event_t*)data;
   auto args = new DataCrumbsArgs();
   args->emplace("duration", base->value->duration);
   args->emplace("frequency", base->value->frequency);
-  auto event = new datacrumbs::EventWithId(COUNTER_EVENT, index, base->key->type, base->key->id,
+  auto event = new datacrumbs::EventWithId(datacrumbs::TracePhase::COUNTER, index, base->key->type, base->key->id,
                                            base->key->event_id, base->key->time_interval, 0, args);
 #endif
   return event;

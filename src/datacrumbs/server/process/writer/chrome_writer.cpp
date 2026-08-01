@@ -329,7 +329,7 @@ std::string ChromeWriter::serialize_event(EventWithId* event_with_id) {
     index_++;
     std::string probe_name = it->second.first;
     std::string function_name = it->second.second;
-    if (args != nullptr && event_with_id->event_type == COUNTER_EVENT &&
+    if (args != nullptr && event_with_id->event_type == TracePhase::COUNTER &&
         args->find("duration") != args->end()) {
       unsigned long long duration = std::any_cast<unsigned int>((*args)["duration"]);
       if (duration > std::numeric_limits<unsigned long long>::max() / 1000) {
@@ -350,25 +350,25 @@ std::string ChromeWriter::serialize_event(EventWithId* event_with_id) {
     const auto* rmeta = configManager_->get_runtime_event_metadata(event_with_id->event_id);
     const char* type =
         (rmeta && !rmeta->trace_event_type.empty()) ? rmeta->trace_event_type.c_str() : "unknown";
+    const unsigned ph = static_cast<unsigned>(event_with_id->event_type);
     int len = 0;
-    if (event_with_id->event_type == COUNTER_EVENT) {
+    if (event_with_id->event_type == TracePhase::COUNTER ||
+        event_with_id->event_type == TracePhase::AGGREGATED) {
+      // COUNTER and AGGREGATED share dftracer's series schema; only the phase differs.
       len = std::snprintf(
           buffer, sizeof(buffer),
           R"({"name":"%s","cat":"%s","type":"%s","pid":%d,"tid":%d,"ts":%llu,"ph":%u)",
-          function_name.c_str(), probe_name.c_str(), type, pid, tid, ts_us,
-          static_cast<unsigned>(TracePhase::COUNTER));
-    } else if (event_with_id->event_type == METADATA_EVENT) {
+          function_name.c_str(), probe_name.c_str(), type, pid, tid, ts_us, ph);
+    } else if (event_with_id->event_type == TracePhase::METADATA) {
       // Metadata records are self-typed; the probe-domain lookup does not apply to them.
       len = std::snprintf(buffer, sizeof(buffer),
                           R"({"name":"%s","cat":"%s","type":"metadata","ph":%u)",
-                          function_name.c_str(), probe_name.c_str(),
-                          static_cast<unsigned>(TracePhase::METADATA));
-    } else if (event_with_id->event_type == NORMAL_EVENT) {
+                          function_name.c_str(), probe_name.c_str(), ph);
+    } else if (event_with_id->event_type == TracePhase::COMPLETE) {
       len = std::snprintf(
           buffer, sizeof(buffer),
           R"({"id":%lu,"name":"%s","cat":"%s","type":"%s","pid":%d,"tid":%d,"ts":%llu,"dur":%llu,"ph":%u)",
-          index_, function_name.c_str(), probe_name.c_str(), type, pid, tid, ts_us, dur_us,
-          static_cast<unsigned>(TracePhase::COMPLETE));
+          index_, function_name.c_str(), probe_name.c_str(), type, pid, tid, ts_us, dur_us, ph);
     }
 
     if (len > 0) {

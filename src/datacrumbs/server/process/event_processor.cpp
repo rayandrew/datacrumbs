@@ -120,7 +120,7 @@ int EventProcessor::handle_event(void* data, size_t data_sz) {
     auto metadata = configManager_->get_runtime_event_metadata(event->event_id);
     auto runtime_args = build_runtime_args(event, metadata);
     auto write_event =
-        new datacrumbs::EventWithId(NORMAL_EVENT, event_index.fetch_add(1), event->type, event->id,
+        new datacrumbs::EventWithId(datacrumbs::TracePhase::COMPLETE, event_index.fetch_add(1), event->type, event->id,
                                     event->event_id, event->ts, event->dur, runtime_args.release());
     write_event->pmu_count = std::min<unsigned int>(event->pmu_count, DATACRUMBS_MAX_PMU);
     for (unsigned int i = 0; i < write_event->pmu_count; ++i) write_event->pmu[i] = event->pmu[i];
@@ -207,7 +207,7 @@ int EventProcessor::update_filename(const char* filename, unsigned int hash) {
   args->emplace("value", file_str);
   args->emplace("hash", hash);
   auto event =
-      new datacrumbs::EventWithId(METADATA_EVENT, event_index.fetch_add(1), 0, 0, 0, 0, 0, args);
+      new datacrumbs::EventWithId(datacrumbs::TracePhase::METADATA, event_index.fetch_add(1), 0, 0, 0, 0, 0, args);
   if (writer_) {
     writer_->push_event(event);  // async path; metadata is order-independent
   }

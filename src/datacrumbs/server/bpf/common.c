@@ -42,6 +42,7 @@ struct {
 
 #if defined(DATACRUMBS_MODE) && (DATACRUMBS_MODE == 1)
 DATACRUMBS_MAP(failed_request, u32, u32, 128);
+DATACRUMBS_MAP(agg_map, struct agg_key_t, struct agg_value_t, 4096);
 DATACRUMBS_RINGBUF(output, 1024 * 1024U * DATACRUMBS_TRACE_RINGBUF_SIZE_MB);
 #else
 DATACRUMBS_MAP(profile, struct profile_key_t, struct profile_value_t, 1024);
