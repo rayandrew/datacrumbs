@@ -6,6 +6,7 @@
 #include <datacrumbs/common/singleton.h>
 #include <datacrumbs/common/typedefs.h>
 #include <datacrumbs/server/bpf/shared.h>
+#include <datacrumbs/server/process/event_enrichment.h>
 #include <openssl/evp.h>
 #include <pwd.h>
 #include <sys/stat.h>
@@ -411,6 +412,7 @@ void ChromeWriter::worker_loop() {
     }
     not_full_cv_.notify_all();  // queue drained -> release backpressured producers
     for (EventWithId* event : batch) {
+      run_event_enrichers(event);
       member += serialize_event(event);
       if (member.size() >= flush_bytes_) {
         write_member(member);
