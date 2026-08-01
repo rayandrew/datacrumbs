@@ -37,6 +37,14 @@ struct dc_timesync_snapshot {
     int64_t delta_to_synced_ns;  // ADD to this PHC's ns -> synced PHC ns
     uint64_t updated_mono_ns;
   } clocks[DC_TIMESYNC_MAX_CLOCKS];
+  // HCA free-running raw clock (ibv raw_clock, == the DOCA fabric CQE hw ts) -> synced PHC sliding
+  // fit, so an unprivileged consumer maps a CQE ts straight onto the global epoch with no local
+  // anchor: t_synced = raw + raw_to_synced_ns + raw_skew_ppb*(raw - raw_anchor_ns)/1e9. Drift-free -
+  // the skew absorbs the HCA<->PHC servo. valid=0 unless the daemon is given the fabric ib device.
+  uint32_t raw_valid;
+  int64_t raw_anchor_ns;
+  int64_t raw_to_synced_ns;
+  int64_t raw_skew_ppb;
 };
 
 #ifdef __cplusplus
