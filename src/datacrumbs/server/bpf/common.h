@@ -14,6 +14,7 @@
 
 DATACRUMBS_MAP_EXTERN(pid_map, u32, u64, 1024);
 DATACRUMBS_MAP_EXTERN(fn_pid_map, struct fn_key_t, struct fn_value_t);
+DATACRUMBS_MAP_EXTERN(probe_guard, u64, struct probe_guard_t, DATACRUMBS_MAX_RUNTIME_FUNCTIONS);
 DATACRUMBS_MAP_EXTERN(event_arg_config_map, u64, struct runtime_event_config_t,
                       DATACRUMBS_MAX_RUNTIME_FUNCTIONS);
 extern struct {
@@ -135,6 +136,34 @@ static inline __attribute__((always_inline)) int need_tracing(struct fn_key_t* k
   return 1;
 }
 #endif
+
+#ifndef DATACRUMBS_HOT_PROBE_WINDOW_NS
+#define DATACRUMBS_HOT_PROBE_WINDOW_NS 100000000ULL  // 100ms window
+#endif
+#ifndef DATACRUMBS_HOT_PROBE_MAX_PER_WINDOW
+#define DATACRUMBS_HOT_PROBE_MAX_PER_WINDOW 20000ULL  // ~200k events/s/probe cap
+#endif
+
+// Rate-limit a runaway (e.g. busy-poll) probe: returns 1 to drop this hit once a probe exceeds the
+// per-window cap, so one hot symbol cannot flood the ring. Per-event_id sliding window.
+static inline __attribute__((always_inline)) int hot_probe_drop(u64 event_id, u64 te) {
+  struct probe_guard_t* g = (struct probe_guard_t*)bpf_map_lookup_elem(&probe_guard, &event_id);
+  if (g == NULL) {
+    struct probe_guard_t init = {.win_ts = te, .count = 1, .dropped = 0};
+    bpf_map_update_elem(&probe_guard, &event_id, &init, BPF_ANY);
+    return 0;
+  }
+  if (te - g->win_ts >= DATACRUMBS_HOT_PROBE_WINDOW_NS) {
+    g->win_ts = te;
+    g->count = 0;
+  }
+  g->count += 1;
+  if (g->count > DATACRUMBS_HOT_PROBE_MAX_PER_WINDOW) {
+    g->dropped += 1;
+    return 1;
+  }
+  return 0;
+}
 
 static inline __attribute__((always_inline)) const struct runtime_event_config_t*
 resolve_event_config(u64 attach_cookie) {
@@ -411,6 +440,7 @@ static inline __attribute__((always_inline)) int generic_exit(struct pt_regs* ct
   struct fn_value_t* fn = bpf_map_lookup_elem(&fn_pid_map, &key);
   if (fn == 0) return 0;  // missed entry
   DATACRUMBS_SKIP_SMALL_EVENTS(fn, te);
+  if (hot_probe_drop(event_id, te)) return 0;  // rate-limit a runaway (busy-poll) probe
   struct generic_event_t* event;
   DATACRUMBS_RB_RESERVE(output, struct generic_event_t, event);
   event->type = config->probe_kind;
@@ -556,6 +586,7 @@ static inline __attribute__((always_inline)) int usdt_exit(struct pt_regs* ctx, 
   struct fn_value_t* fn = bpf_map_lookup_elem(&fn_pid_map, &key);
   if (fn == 0) return 0;  // missed entry
   DATACRUMBS_SKIP_SMALL_EVENTS(fn, te);
+  if (hot_probe_drop(event_id, te)) return 0;  // rate-limit a runaway (busy-poll) probe
   struct generic_event_t* event;
   DATACRUMBS_RB_RESERVE(output, struct generic_event_t, event);
   event->type = config->probe_kind;

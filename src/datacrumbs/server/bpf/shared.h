@@ -45,6 +45,12 @@ struct fn_key_t {
   unsigned long long event_id;
 };
 
+struct probe_guard_t {
+  unsigned long long win_ts;
+  unsigned long long count;
+  unsigned long long dropped;  // cumulative events suppressed; userspace can read to warn
+};
+
 struct fn_value_t {
   unsigned long long ts;
   unsigned int arg_count;
