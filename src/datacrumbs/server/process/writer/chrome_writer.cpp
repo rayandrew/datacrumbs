@@ -340,18 +340,11 @@ std::string ChromeWriter::serialize_event(EventWithId* event_with_id) {
       (*args)["duration"] = duration;
     }
     char buffer[1024];
-    unsigned long long ts_us = 0;
-    if (event_with_id->ts > std::numeric_limits<unsigned long long>::max() / 1000) {
-      ts_us = std::numeric_limits<unsigned long long>::max();
-    } else {
-      ts_us = static_cast<unsigned long long>(std::floor(event_with_id->ts / 1000.0));
-    }
-    unsigned long long dur_us = 0;
-    if (event_with_id->dur > std::numeric_limits<unsigned long long>::max() / 1000) {
-      dur_us = std::numeric_limits<unsigned long long>::max();
-    } else {
-      dur_us = static_cast<unsigned long long>(std::ceil(event_with_id->dur / 1000.0));
-    }
+    // ns -> us by integer math: exact and overflow-free (a global-epoch ts exceeds double's 2^53
+    // exact range, and floor(ts/1e3) would lose ~256ns there). dur rounds up so sub-us stays nonzero.
+    const unsigned long long ts_us = event_with_id->ts / 1000;
+    const unsigned long long dur_us =
+        event_with_id->dur / 1000 + (event_with_id->dur % 1000 != 0 ? 1 : 0);
     // "id" and "dur" are complete-event only; "type" is the probe's config domain string ("unknown"
     // if unset -- a free-form string so a plugin can contribute its own domain without a core change).
     const auto* rmeta = configManager_->get_runtime_event_metadata(event_with_id->event_id);
