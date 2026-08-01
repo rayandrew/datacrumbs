@@ -9,11 +9,17 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <regex>
 #include <sstream>
 #include <string>
+#include <unordered_map>
+#include <vector>
+
+// event_id -> its attached links, so a runaway probe can be fully detached at runtime (auto-detach).
+static std::unordered_map<uint64_t, std::vector<struct bpf_link*>> g_runtime_links;
 
 static int libbpf_print_fn(enum libbpf_print_level level, const char* format, va_list args) {
   if (level >= LIBBPF_DEBUG) return 0;
@@ -183,6 +189,41 @@ static std::vector<datacrumbs::ProbeArgCaptureSpec> parse_tracepoint_fields(
   return specs;
 }
 
+// Destroy the links of a runaway probe: one whose dropped counter keeps climbing past the rate limit
+// for kHotChecks consecutive checks. hot_probe_drop only rate-limits it (still fires); this removes
+// it. Irreversible for the run; logged. Off with DATACRUMBS_AUTODETACH=0.
+static void poll_auto_detach(int probe_guard_fd, datacrumbs::EventProcessor* event_processor) {
+  static constexpr unsigned long long kDropsPerCheck = 200000;  // >200k drops/check = runaway
+  static constexpr int kHotChecks = 3;                          // sustained over N checks, not a burst
+  static std::unordered_map<uint64_t, unsigned long long> last_dropped;
+  static std::unordered_map<uint64_t, int> hot_checks;
+  if (probe_guard_fd < 0) return;
+  auto config_manager = event_processor->configManager_;
+  std::vector<uint64_t> detached;
+  for (auto& [event_id, links] : g_runtime_links) {
+    struct probe_guard_t guard = {};
+    uint64_t key = event_id;
+    if (bpf_map_lookup_elem(probe_guard_fd, &key, &guard) != 0) continue;
+    const unsigned long long prev = last_dropped[event_id];
+    last_dropped[event_id] = guard.dropped;
+    if (guard.dropped - prev < kDropsPerCheck) {
+      hot_checks[event_id] = 0;
+      continue;
+    }
+    if (++hot_checks[event_id] < kHotChecks) continue;
+    for (auto* link : links)
+      if (link) bpf_link__destroy(link);
+    const auto it = config_manager->category_map.find(event_id);
+    const std::string name = it != config_manager->category_map.end()
+                                 ? it->second.first + "." + it->second.second
+                                 : std::to_string(event_id);
+    DC_LOG_WARN("auto-detached runaway probe %s (event_id=%llu dropped=%llu)", name.c_str(),
+                static_cast<unsigned long long>(event_id), guard.dropped);
+    detached.push_back(event_id);
+  }
+  for (uint64_t event_id : detached) g_runtime_links.erase(event_id);
+}
+
 static int attach_runtime_probes(datacrumbs::EventProcessor* event_processor,
                                  struct datacrumbs_bpf* skel) {
   auto config_manager = event_processor->configManager_;
@@ -284,6 +325,8 @@ static int attach_runtime_probes(datacrumbs::EventProcessor* event_processor,
           total_failed += 2;
           continue;
         }
+        g_runtime_links[*event_id].push_back(entry_link);
+        g_runtime_links[*event_id].push_back(exit_link);
         config_manager->record_successful_runtime_probe(probe, function_name);
         runtime_probe_state_updated = true;
         total_attached += 2;
@@ -312,6 +355,8 @@ static int attach_runtime_probes(datacrumbs::EventProcessor* event_processor,
           total_failed += 2;
           continue;
         }
+        g_runtime_links[*event_id].push_back(entry_link);
+        g_runtime_links[*event_id].push_back(exit_link);
         config_manager->record_successful_runtime_probe(probe, function_name);
         runtime_probe_state_updated = true;
         total_attached += 2;
@@ -353,6 +398,8 @@ static int attach_runtime_probes(datacrumbs::EventProcessor* event_processor,
           total_failed += 2;
           continue;
         }
+        g_runtime_links[*event_id].push_back(entry_link);
+        g_runtime_links[*event_id].push_back(exit_link);
         config_manager->record_successful_runtime_probe(probe, function_name);
         runtime_probe_state_updated = true;
         total_attached += 2;
@@ -384,6 +431,8 @@ static int attach_runtime_probes(datacrumbs::EventProcessor* event_processor,
           total_failed += 2;
           continue;
         }
+        g_runtime_links[*event_id].push_back(entry_link);
+        g_runtime_links[*event_id].push_back(exit_link);
         config_manager->record_successful_runtime_probe(probe, function_name);
         runtime_probe_state_updated = true;
         total_attached += 2;
@@ -420,6 +469,7 @@ static int attach_runtime_probes(datacrumbs::EventProcessor* event_processor,
           total_failed += 1;
           continue;
         }
+        g_runtime_links[*event_id].push_back(tp_link);
         config_manager->record_successful_runtime_probe(probe, function_name);
         runtime_probe_state_updated = true;
         total_attached += 1;
@@ -646,6 +696,11 @@ static int main_process(datacrumbs::EventProcessor* event_processor) {
 #endif
 #endif
 
+  const int probe_guard_fd = bpf_map__fd(skel->maps.probe_guard);
+  const char* autodetach_env = std::getenv("DATACRUMBS_AUTODETACH");
+  const bool autodetach = autodetach_env == nullptr || std::strcmp(autodetach_env, "0") != 0;
+  time_t last_autodetach = time(nullptr);
+
   unsigned long long last_processed_timestamp = 0;
   while (!stop) {
     err = 0;
@@ -662,6 +717,12 @@ static int main_process(datacrumbs::EventProcessor* event_processor) {
     err = bpf_map_lookup_elem(failed_events_fd, &DATACRUMBS_FAILED_EVENTS_KEY, &failed_events);
     if (err == 0) {
       event_processor->failed_events = failed_events;
+    }
+    // wall-clock cadence: under load ring_buffer__poll returns immediately, so an iteration count
+    // would fire far faster than 1s and shrink each check's drop delta below the threshold.
+    if (autodetach && time(nullptr) - last_autodetach >= 1) {
+      last_autodetach = time(nullptr);
+      poll_auto_detach(probe_guard_fd, event_processor);
     }
     err = ring_buffer__poll(rb, 10);
     if (err == -EINTR) {
