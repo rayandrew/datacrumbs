@@ -3,6 +3,7 @@
 #include <datacrumbs/common/runtime_configuration_manager.h>
 #include <datacrumbs/common/singleton.h>
 #include <datacrumbs/server/process/event_processor.h>
+#include <datacrumbs/server/process/plugin_loader.h>
 
 // std headers
 #include <algorithm>
@@ -789,6 +790,7 @@ static int main_call(int argc, char** argv) {
     DC_LOG_ERROR("Failed to initialize runtime configuration manager");
     return 1;
   }
+  datacrumbs::load_plugins();
   auto event_processor = datacrumbs::EventProcessor(argv[1]);
   event_processor.configManager_->print_configurations();
   return main_process(&event_processor);

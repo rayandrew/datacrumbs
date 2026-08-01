@@ -269,6 +269,7 @@ set(DATACRUMBS_PUBLIC_COMMON_HEADERS
     ${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/common/dc_timesync_snapshot.h
     ${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/common/enumerations.h
     ${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/common/logging.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/common/plugin_api.h
     ${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/common/probe_file.h
     ${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/common/singleton.h
     ${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/common/typedefs.h
@@ -477,7 +478,7 @@ add_dependencies(datacrumbs_obj datacrumbs_bpf_skel)
 
 # Build the final executable by linking server.cpp and the object library
 add_executable(${PROJECT_NAME} ${DATACRUMBS_SERVER_SRC})
-target_link_libraries(${PROJECT_NAME} datacrumbs_obj ${DEPENDENCY_LIB})
+target_link_libraries(${PROJECT_NAME} datacrumbs_obj ${DEPENDENCY_LIB} ${CMAKE_DL_LIBS})
 add_dependencies(${PROJECT_NAME} datacrumbs_bpf_skel datacrumbs_obj)
 
 # Install the main processing executable into DATACRUMBS_INSTALL_BINARYDIR

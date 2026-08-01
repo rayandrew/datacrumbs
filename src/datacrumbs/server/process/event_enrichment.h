@@ -1,15 +1,13 @@
 #pragma once
-#include <functional>
+#include <datacrumbs/common/plugin_api.h>
+
 #include <vector>
 
 namespace datacrumbs {
-struct EventWithId;
 
-// An enricher may modify an event (its ts or args) before serialization. It runs on every event in
-// the writer, whatever backend produced it. Register at startup; registration is not synchronized
-// with the running writer.
-using EventEnricher = std::function<void(EventWithId*)>;
-
+// The server's enricher registry (EventEnricher defined in plugin_api.h). Enrichers run on every
+// event in the writer; registration is not synchronized with the running writer, so register at
+// startup only.
 inline std::vector<EventEnricher>& event_enrichers() {
   static std::vector<EventEnricher> registry;
   return registry;
