@@ -20,4 +20,18 @@ inline void register_event_enricher(EventEnricher enricher) {
 inline void run_event_enrichers(EventWithId* event) {
   for (const auto& enricher : event_enrichers()) enricher(event);
 }
+
+// Hooks a plugin registers to prime BPF maps once the skeleton is loaded (see plugin_api.h).
+inline std::vector<PluginBpfReady>& bpf_ready_hooks() {
+  static std::vector<PluginBpfReady> registry;
+  return registry;
+}
+
+inline void register_bpf_ready(PluginBpfReady hook) {
+  bpf_ready_hooks().push_back(std::move(hook));
+}
+
+inline void run_bpf_ready(const PluginBpfContext& ctx) {
+  for (const auto& hook : bpf_ready_hooks()) hook(ctx);
+}
 }  // namespace datacrumbs

@@ -15,10 +15,19 @@ struct EventWithId;
 // Modifies an event (ts/dur/args) in the writer before serialization, whatever backend produced it.
 using EventEnricher = std::function<void(EventWithId*)>;
 
+// Handed to a bpf-ready hook: lets a plugin reach the loaded BPF objects (e.g. to populate a map).
+struct PluginBpfContext {
+  std::function<int(const char*)> get_map_fd;  // core BPF map fd by name, -1 if absent
+};
+
+// Runs once after the skeleton is loaded but before probes attach, so a plugin can prime BPF maps.
+using PluginBpfReady = std::function<void(const PluginBpfContext&)>;
+
 struct PluginApi {
   static constexpr uint32_t kAbiVersion = 1;
   uint32_t abi_version;
   void (*register_event_enricher)(EventEnricher);
+  void (*register_bpf_ready)(PluginBpfReady);
 };
 }  // namespace datacrumbs
 

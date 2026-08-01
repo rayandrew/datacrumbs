@@ -21,6 +21,25 @@ struct {
   __type(value, struct fn_value_t);
 } scratch_fn_value_map SEC(".maps");
 
+// PMU: one PERF_EVENT_ARRAY per counter (indexed by cpu; populated by the pmu plugin), and a 1-entry
+// control array holding the active counter count. Reading pmu_ctl gates all perf reads (0 => off).
+#define DATACRUMBS_PMU_ARRAY(name)         \
+  struct {                                 \
+    __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY); \
+    __uint(key_size, sizeof(u32));         \
+    __uint(value_size, sizeof(u32));       \
+    __uint(max_entries, 256);              \
+  } name SEC(".maps");
+DATACRUMBS_PMU_ARRAY(pmu_counter0)
+DATACRUMBS_PMU_ARRAY(pmu_counter1)
+DATACRUMBS_PMU_ARRAY(pmu_counter2)
+struct {
+  __uint(type, BPF_MAP_TYPE_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, u32);
+  __type(value, u32);
+} pmu_ctl SEC(".maps");
+
 #if defined(DATACRUMBS_MODE) && (DATACRUMBS_MODE == 1)
 DATACRUMBS_MAP(failed_request, u32, u32, 128);
 DATACRUMBS_RINGBUF(output, 1024 * 1024U * DATACRUMBS_TRACE_RINGBUF_SIZE_MB);

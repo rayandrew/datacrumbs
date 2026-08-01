@@ -75,6 +75,8 @@ struct EventWithId {
   unsigned long long ts;
   unsigned long long dur;
   DataCrumbsArgs* args;
+  unsigned int pmu_count = 0;                     // hardware counters captured (0 = none)
+  unsigned long long pmu[DATACRUMBS_MAX_PMU] = {};  // per-counter entry->exit delta; named by a plugin
   EventWithId(char _event_type, unsigned long long _index, unsigned int _type,
               unsigned long long _tgid_pid, unsigned long long _event_id, unsigned long long _ts,
               unsigned long long _dur, DataCrumbsArgs* _args)
@@ -95,7 +97,10 @@ struct EventWithId {
         event_id(other.event_id),
         ts(other.ts),
         dur(other.dur),
-        args(other.args) {}
+        args(other.args),
+        pmu_count(other.pmu_count) {
+    for (unsigned int i = 0; i < DATACRUMBS_MAX_PMU; ++i) pmu[i] = other.pmu[i];
+  }
 
   // Move constructor
   EventWithId(EventWithId&& other) noexcept
@@ -106,7 +111,10 @@ struct EventWithId {
         event_id(other.event_id),
         ts(other.ts),
         dur(other.dur),
-        args(other.args) {}
+        args(other.args),
+        pmu_count(other.pmu_count) {
+    for (unsigned int i = 0; i < DATACRUMBS_MAX_PMU; ++i) pmu[i] = other.pmu[i];
+  }
 };
 
 // Base class representing a generic probe

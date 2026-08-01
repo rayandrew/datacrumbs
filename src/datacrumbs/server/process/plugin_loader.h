@@ -17,7 +17,7 @@ inline void load_plugins() {
   const char* list = std::getenv("DATACRUMBS_PLUGINS");
   if (list == nullptr || *list == '\0') return;
 
-  static const PluginApi api{PluginApi::kAbiVersion, &register_event_enricher};
+  static const PluginApi api{PluginApi::kAbiVersion, &register_event_enricher, &register_bpf_ready};
 
   const std::string spec(list);
   for (std::size_t start = 0; start <= spec.size();) {

@@ -456,6 +456,14 @@ static int main_process(datacrumbs::EventProcessor* event_processor) {
     return 1;
   }
 
+  // Let plugins prime BPF maps before probes fire (e.g. the pmu plugin fills the perf-event arrays).
+  datacrumbs::PluginBpfContext bpf_ctx;
+  bpf_ctx.get_map_fd = [skel](const char* name) -> int {
+    struct bpf_map* m = bpf_object__find_map_by_name(skel->obj, name);
+    return m != nullptr ? bpf_map__fd(m) : -1;
+  };
+  datacrumbs::run_bpf_ready(bpf_ctx);
+
   err = datacrumbs_bpf__attach(skel);
   if (err) {
     DC_LOG_ERROR("Failed to attach BPF skeleton: %d", err);

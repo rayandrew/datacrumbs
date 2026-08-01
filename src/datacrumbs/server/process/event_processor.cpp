@@ -122,6 +122,8 @@ int EventProcessor::handle_event(void* data, size_t data_sz) {
     auto write_event =
         new datacrumbs::EventWithId(NORMAL_EVENT, event_index.fetch_add(1), event->type, event->id,
                                     event->event_id, event->ts, event->dur, runtime_args.release());
+    write_event->pmu_count = std::min<unsigned int>(event->pmu_count, DATACRUMBS_MAX_PMU);
+    for (unsigned int i = 0; i < write_event->pmu_count; ++i) write_event->pmu[i] = event->pmu[i];
     writer->push_event(write_event);
 #else
     if (event->type > 0) {

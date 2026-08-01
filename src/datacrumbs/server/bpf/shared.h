@@ -2,6 +2,7 @@
 #define DATACRUMBS_SERVER_BPF_SHARED_H
 
 #include <custom_probes_process.h>
+#include <datacrumbs/common/constants.h>
 #include <datacrumbs/datacrumbs_config.h>
 
 static int DATACRUMBS_TS_KEY = 1;
@@ -29,6 +30,8 @@ struct generic_event_t {
   unsigned int arg_data_len[DATACRUMBS_MAX_CAPTURE_ARGS];
   unsigned int arg_data_status[DATACRUMBS_MAX_CAPTURE_ARGS];
   unsigned char arg_data[DATACRUMBS_MAX_CAPTURE_ARGS][DATACRUMBS_MAX_CAPTURE_BYTES];
+  unsigned int pmu_count;                     // hardware counters read (0 = PMU off)
+  unsigned long long pmu[DATACRUMBS_MAX_PMU];  // per-counter entry->exit delta
 };
 typedef struct generic_event_t general_event_t;
 struct usdt_event_t {
@@ -59,6 +62,8 @@ struct fn_value_t {
   unsigned int arg_data_len[DATACRUMBS_MAX_CAPTURE_ARGS];
   unsigned int arg_data_status[DATACRUMBS_MAX_CAPTURE_ARGS];
   unsigned char arg_data[DATACRUMBS_MAX_CAPTURE_ARGS][DATACRUMBS_MAX_CAPTURE_BYTES];
+  unsigned int pmu_count;                            // counters snapshotted at entry (0 = PMU off)
+  unsigned long long pmu_start[DATACRUMBS_MAX_PMU];  // entry counter values
 };
 
 struct runtime_event_config_t {

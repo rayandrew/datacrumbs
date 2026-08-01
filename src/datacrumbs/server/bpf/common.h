@@ -24,6 +24,23 @@ extern struct {
   __type(value, struct fn_value_t);
 } scratch_fn_value_map SEC(".maps");
 
+#define DATACRUMBS_PMU_ARRAY_EXTERN(name)      \
+  extern struct {                              \
+    __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY); \
+    __uint(key_size, sizeof(u32));             \
+    __uint(value_size, sizeof(u32));           \
+    __uint(max_entries, 256);                  \
+  } name SEC(".maps");
+DATACRUMBS_PMU_ARRAY_EXTERN(pmu_counter0)
+DATACRUMBS_PMU_ARRAY_EXTERN(pmu_counter1)
+DATACRUMBS_PMU_ARRAY_EXTERN(pmu_counter2)
+extern struct {
+  __uint(type, BPF_MAP_TYPE_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, u32);
+  __type(value, u32);
+} pmu_ctl SEC(".maps");
+
 #if defined(DATACRUMBS_MODE) && (DATACRUMBS_MODE == 1)
 DATACRUMBS_MAP_EXTERN(failed_request, u32, u32, 128);
 DATACRUMBS_RINGBUF_EXTERN(output, 1024 * 1024U * DATACRUMBS_TRACE_RINGBUF_SIZE_MB);
@@ -174,6 +191,42 @@ resolve_event_config(u64 attach_cookie) {
 static inline __attribute__((always_inline)) struct fn_value_t* get_scratch_fn_value(void) {
   u32 key = 0;
   return (struct fn_value_t*)bpf_map_lookup_elem(&scratch_fn_value_map, &key);
+}
+
+// Active PMU counter count (0 = off); one cheap array lookup, so the off path stays lookup-only.
+static inline __attribute__((always_inline)) u32 pmu_active_count(void) {
+  u32 k = 0;
+  u32* n = (u32*)bpf_map_lookup_elem(&pmu_ctl, &k);
+  return n ? *n : 0;
+}
+
+// Read the current cpu's value for each active counter into out[]. n is pmu_active_count().
+static inline __attribute__((always_inline)) void pmu_read(u64* out, u32 n) {
+  struct bpf_perf_event_value v = {};
+  if (n > 0 && !bpf_perf_event_read_value(&pmu_counter0, BPF_F_CURRENT_CPU, &v, sizeof(v)))
+    out[0] = v.counter;
+  if (n > 1 && !bpf_perf_event_read_value(&pmu_counter1, BPF_F_CURRENT_CPU, &v, sizeof(v)))
+    out[1] = v.counter;
+  if (n > 2 && !bpf_perf_event_read_value(&pmu_counter2, BPF_F_CURRENT_CPU, &v, sizeof(v)))
+    out[2] = v.counter;
+}
+
+// Snapshot counters at entry into the scratch fn_value (no-op when PMU is off).
+static inline __attribute__((always_inline)) void pmu_snapshot_entry(struct fn_value_t* fn) {
+  u32 n = pmu_active_count();
+  fn->pmu_count = n;
+  if (n) pmu_read(fn->pmu_start, n);
+}
+
+// At exit, write per-counter (exit-entry) deltas into the event (no-op when PMU is off).
+static inline __attribute__((always_inline)) void pmu_delta_exit(const struct fn_value_t* fn,
+                                                                 struct generic_event_t* event) {
+  event->pmu_count = fn->pmu_count;
+  if (!fn->pmu_count) return;
+  u64 now[DATACRUMBS_MAX_PMU] = {};
+  pmu_read(now, fn->pmu_count);
+#pragma unroll
+  for (int i = 0; i < DATACRUMBS_MAX_PMU; ++i) event->pmu[i] = now[i] - fn->pmu_start[i];
 }
 
 static inline __attribute__((always_inline)) int mark_current_pid_traced(void) {
@@ -389,6 +442,7 @@ static inline __attribute__((always_inline)) int generic_entry(struct pt_regs* c
   __builtin_memset(fn, 0, sizeof(*fn));
   fn->ts = bpf_ktime_get_ns();
   capture_runtime_args(ctx, config, fn);
+  pmu_snapshot_entry(fn);
   bpf_map_update_elem(&fn_pid_map, &key, fn, BPF_ANY);
   DBG_PRINTK("Pushed pid:%d, event_id:%llu to map\n", (u32)key.id, event_id);
   return 0;
@@ -448,6 +502,7 @@ static inline __attribute__((always_inline)) int generic_exit(struct pt_regs* ct
   event->event_id = event_id;
   DATACRUMBS_COLLECT_TIME(event);
   copy_captured_args_to_event(fn, event);
+  pmu_delta_exit(fn, event);
   DATACRUMBS_EVENT_SUBMIT(event, key.id, event_id);
   return 0;
 }
@@ -519,6 +574,7 @@ static inline __attribute__((always_inline)) int generic_syscall_entry(
   __builtin_memset(fn, 0, sizeof(*fn));
   fn->ts = bpf_ktime_get_ns();
   capture_runtime_raw_args(config, fn, arg0, arg1, arg2, arg3, arg4, true);
+  pmu_snapshot_entry(fn);
   bpf_map_update_elem(&fn_pid_map, &key, fn, BPF_ANY);
   DBG_PRINTK("Pushed syscall pid:%d, event_id:%llu to map\n", (u32)key.id, event_id);
   return 0;
@@ -556,6 +612,7 @@ static inline __attribute__((always_inline)) int usdt_entry(struct pt_regs* ctx,
   __builtin_memset(fn, 0, sizeof(*fn));
   fn->ts = bpf_ktime_get_ns();
   capture_runtime_usdt_args(ctx, config, fn);
+  pmu_snapshot_entry(fn);
   bpf_map_update_elem(&fn_pid_map, &key, fn, BPF_ANY);
   DBG_PRINTK("USDT  Pushed pid:%d, event_id:%llu to map\n", (u32)key.id, event_id);
   return 0;
@@ -594,6 +651,7 @@ static inline __attribute__((always_inline)) int usdt_exit(struct pt_regs* ctx, 
   event->event_id = event_id;
   DATACRUMBS_COLLECT_TIME(event);
   copy_captured_args_to_event(fn, event);
+  pmu_delta_exit(fn, event);
   DATACRUMBS_EVENT_SUBMIT(event, key.id, event_id);
   return 0;
 }
