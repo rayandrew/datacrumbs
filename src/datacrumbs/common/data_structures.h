@@ -537,6 +537,8 @@ class CaptureProbe {
   std::string name;      // Name of the capture probe
   ProbeType probe_type;  // Type of probe associated with the capture
   bool enable_explorer;  // Flag to enable explorer for this capture probe
+  std::string trace_event_type;  // .pfw "type" domain, propagated to the emitted Probe
+  bool system_wide = false;      // tracepoints: capture on all pids, propagated to the emitted Probe
   std::unordered_map<std::string, std::vector<ProbeArgCaptureSpec>>
       function_arguments;  // Optional per-function arg capture specification from YAML
 
@@ -579,9 +581,11 @@ class CaptureProbe {
 };
 
 // Capture probe for kernel symbols
+// Regex-matched kernel-side capture: KSYM (kallsyms -> kprobe) or TRACEPOINT (tracefs). Same shape
+// (regex + name), so one class tagged by capture type rather than a near-empty subclass each.
 class KernelCaptureProbe : public CaptureProbe {
  public:
-  KernelCaptureProbe() : CaptureProbe(CaptureType::KSYM) {
+  explicit KernelCaptureProbe(CaptureType capture = CaptureType::KSYM) : CaptureProbe(capture) {
     DC_LOG_TRACE("KernelCaptureProbe constructor called");
   }
 };

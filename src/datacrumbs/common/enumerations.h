@@ -82,6 +82,7 @@ enum class CaptureType : uint8_t {
   KSYM = 2,
   USDT = 3,
   CUSTOM = 4,  // Custom capture type for user-defined probes
+  TRACEPOINT = 5,
 };
 
 // Converts string to CaptureType enum. Throws if invalid.
@@ -102,10 +103,14 @@ inline void convert(const std::string& s, CaptureType& type) {
   } else if (s == "custom") {
     type = CaptureType::CUSTOM;
     DC_LOG_DEBUG("Converted string '%s' to CaptureType::CUSTOM", s.c_str());
+  } else if (s == "tracepoint") {
+    type = CaptureType::TRACEPOINT;
+    DC_LOG_DEBUG("Converted string '%s' to CaptureType::TRACEPOINT", s.c_str());
   } else {
     DC_LOG_INFO("Unknown CaptureType string: '%s'", s.c_str());
     throw std::invalid_argument("Unknown CaptureType: " + s +
-                                ". Valid types are: header, binary, ksym, usdt, or custom.");
+                                ". Valid types are: header, binary, ksym, usdt, custom, "
+                                "or tracepoint.");
   }
   DC_LOG_TRACE("Exiting convert for CaptureType");
 }
