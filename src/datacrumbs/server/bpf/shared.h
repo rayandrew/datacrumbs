@@ -15,6 +15,7 @@ enum datacrumbs_runtime_probe_kind_t {
   DATACRUMBS_RUNTIME_PROBE_KIND_UPROBE = 2,
   DATACRUMBS_RUNTIME_PROBE_KIND_SYSCALL = 3,
   DATACRUMBS_RUNTIME_PROBE_KIND_USDT = 4,
+  DATACRUMBS_RUNTIME_PROBE_KIND_TRACEPOINT = 5,
 };
 
 struct generic_event_t {
@@ -63,10 +64,12 @@ struct fn_value_t {
 struct runtime_event_config_t {
   unsigned long long event_id;
   unsigned int probe_kind;
+  unsigned int system_wide;  // tracepoints: 1 => skip the pid gate (capture on all pids)
   unsigned int arg_count;
   unsigned int arg_index[DATACRUMBS_MAX_CAPTURE_ARGS];
   unsigned int arg_num_bytes[DATACRUMBS_MAX_CAPTURE_ARGS];
   unsigned int arg_is_pointer[DATACRUMBS_MAX_CAPTURE_ARGS];
+  unsigned int arg_offset[DATACRUMBS_MAX_CAPTURE_ARGS];  // byte offset of the field/struct member
 };
 
 struct fn_t {

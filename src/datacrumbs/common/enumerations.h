@@ -42,6 +42,7 @@ enum class ProbeType : uint8_t {
   UPROBE = 2,
   USDT = 3,
   CUSTOM = 4,
+  TRACEPOINT = 5,
 };
 
 // Converts string to ProbeType enum. Throws if invalid.
@@ -62,10 +63,14 @@ inline void convert(const std::string& s, ProbeType& type) {
   } else if (s == "custom") {
     type = ProbeType::CUSTOM;
     DC_LOG_DEBUG("Converted string '%s' to ProbeType::CUSTOM", s.c_str());
+  } else if (s == "tracepoint") {
+    type = ProbeType::TRACEPOINT;
+    DC_LOG_DEBUG("Converted string '%s' to ProbeType::TRACEPOINT", s.c_str());
   } else {
     DC_LOG_INFO("Unknown ProbeType string: '%s'", s.c_str());
     throw std::invalid_argument("Unknown ProbeType: " + s +
-                                ". Valid types are: syscalls, kprobe, uprobe, or usdt.");
+                                ". Valid types are: syscalls, kprobe, uprobe, usdt, custom, "
+                                "or tracepoint.");
   }
   DC_LOG_TRACE("Exiting convert for ProbeType");
 }

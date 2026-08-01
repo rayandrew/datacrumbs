@@ -10,6 +10,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <regex>
 #include <sstream>
 #include <string>
 
@@ -84,6 +85,8 @@ static unsigned int runtime_probe_kind(datacrumbs::ProbeType probe_type) {
       return DATACRUMBS_RUNTIME_PROBE_KIND_SYSCALL;
     case datacrumbs::ProbeType::USDT:
       return DATACRUMBS_RUNTIME_PROBE_KIND_USDT;
+    case datacrumbs::ProbeType::TRACEPOINT:
+      return DATACRUMBS_RUNTIME_PROBE_KIND_TRACEPOINT;
     default:
       return 0;
   }
@@ -91,19 +94,24 @@ static unsigned int runtime_probe_kind(datacrumbs::ProbeType probe_type) {
 
 static int populate_event_arg_config(
     int map_fd, uint64_t cookie, uint64_t event_id, datacrumbs::ProbeType probe_type,
-    const std::vector<datacrumbs::ProbeArgCaptureSpec>* arg_specs) {
+    const std::vector<datacrumbs::ProbeArgCaptureSpec>* arg_specs, bool system_wide = false) {
   runtime_event_config_t config = {};
   config.event_id = event_id;
   config.probe_kind = runtime_probe_kind(probe_type);
+  config.system_wide = system_wide ? 1u : 0u;
   if (arg_specs != nullptr) {
     config.arg_count = std::min<unsigned int>(arg_specs->size(), DATACRUMBS_MAX_CAPTURE_ARGS);
     for (unsigned int index = 0; index < config.arg_count; ++index) {
       const auto& spec = (*arg_specs)[index];
-      config.arg_index[index] = (*arg_specs)[index].index;
+      config.arg_index[index] = spec.index;
+      config.arg_offset[index] = spec.offset;
       if (spec.is_pointer) {
         if (is_char_pointer_type(spec.c_type)) {
           config.arg_num_bytes[index] =
               std::min<unsigned int>(spec.num_bytes, DATACRUMBS_MAX_CAPTURE_BYTES);
+          config.arg_is_pointer[index] = 1;
+        } else if (spec.num_bytes > 0) {  // scalar struct field read at ptr+offset (<=8 bytes)
+          config.arg_num_bytes[index] = std::min<unsigned int>(spec.num_bytes, 8U);
           config.arg_is_pointer[index] = 1;
         } else {
           config.arg_num_bytes[index] = 0;
@@ -123,6 +131,57 @@ static int populate_event_arg_config(
   return 0;
 }
 
+// Parse a tracepoint's tracefs `format` into arg-capture specs (field label, byte offset, size).
+// Scalars (<=8B) -> args; fixed char arrays and __data_loc dynamic strings -> byte capture. Skips the
+// common_* header fields. Empty result (unreadable format) leaves the tracepoint with no decoded args.
+static std::vector<datacrumbs::ProbeArgCaptureSpec> parse_tracepoint_fields(
+    const std::string& category, const std::string& name) {
+  std::vector<datacrumbs::ProbeArgCaptureSpec> specs;
+  std::ifstream f;
+  for (const char* root : {"/sys/kernel/debug/tracing/events", "/sys/kernel/tracing/events"}) {
+    f.open(std::string(root) + "/" + category + "/" + name + "/format");
+    if (f.is_open()) break;
+  }
+  if (!f.is_open()) {
+    DC_LOG_WARN("tracepoint %s:%s: format unreadable -> fields not decoded", category.c_str(),
+                name.c_str());
+    return specs;
+  }
+  static const std::regex re(
+      R"(field:([^;]+?)\s+([A-Za-z_]\w*)(\[\d+\])?;\s*offset:(\d+);\s*size:(\d+);\s*signed:(\d+);)");
+  std::string line;
+  while (std::getline(f, line)) {
+    std::smatch m;
+    if (!std::regex_search(line, m, re)) continue;
+    const std::string type = m[1].str();
+    const std::string fname = m[2].str();
+    const bool is_array = m[3].matched;
+    if (fname.rfind("common_", 0) == 0) continue;
+    datacrumbs::ProbeArgCaptureSpec s;
+    s.label = fname;
+    s.offset = static_cast<unsigned int>(std::stoul(m[4].str()));
+    s.num_bytes = static_cast<unsigned int>(std::stoul(m[5].str()));
+    const bool is_signed = m[6].str() != "0";
+    if (type.find("__data_loc") != std::string::npos) {  // dynamic string: field holds a u32 loc
+      s.is_pointer = true;
+      s.c_type = "char *";
+      s.index = 1;  // marks the two-step __data_loc read in generic_point
+      s.num_bytes = DATACRUMBS_MAX_CAPTURE_BYTES;
+    } else if (type.find("char") != std::string::npos && is_array) {  // fixed char array -> bytes
+      s.is_pointer = true;
+      s.c_type = "char *";
+    } else if (s.num_bytes <= 8) {  // scalar
+      s.is_pointer = false;
+      s.c_type = is_signed ? "long long" : "unsigned long long";
+    } else {
+      continue;  // non-char array / oversized -> skip
+    }
+    specs.push_back(std::move(s));
+    if (specs.size() >= DATACRUMBS_MAX_CAPTURE_ARGS) break;
+  }
+  return specs;
+}
+
 static int attach_runtime_probes(datacrumbs::EventProcessor* event_processor,
                                  struct datacrumbs_bpf* skel) {
   auto config_manager = event_processor->configManager_;
@@ -136,6 +195,8 @@ static int attach_runtime_probes(datacrumbs::EventProcessor* event_processor,
   auto* uprobe_exit = bpf_object__find_program_by_name(skel->obj, "trace_generic_uprobe_exit");
   auto* usdt_entry = bpf_object__find_program_by_name(skel->obj, "trace_generic_usdt_entry");
   auto* usdt_exit = bpf_object__find_program_by_name(skel->obj, "trace_generic_usdt_exit");
+  auto* tracepoint_prog =
+      bpf_object__find_program_by_name(skel->obj, "trace_generic_tracepoint");
   const int event_arg_config_fd = bpf_map__fd(skel->maps.event_arg_config_map);
 
   if (event_arg_config_fd < 0) {
@@ -325,6 +386,42 @@ static int attach_runtime_probes(datacrumbs::EventProcessor* event_processor,
         config_manager->record_successful_runtime_probe(probe, function_name);
         runtime_probe_state_updated = true;
         total_attached += 2;
+      } else if (probe->type == datacrumbs::ProbeType::TRACEPOINT) {
+        total_requested += 1;  // point event -> one attach, not entry+exit
+        // function_name is "category:name" (e.g. "sched:sched_switch"); libbpf attaches by (cat,name).
+        const auto colon = function_name.find(':');
+        const std::string tp_category =
+            colon == std::string::npos ? std::string() : function_name.substr(0, colon);
+        const std::string tp_name =
+            colon == std::string::npos ? function_name : function_name.substr(colon + 1);
+        // Decode the tracepoint's fields (offset/size from tracefs format) so generic_point can read
+        // them, and register their labels so the writer names them.
+        std::vector<datacrumbs::ProbeArgCaptureSpec> tp_fields =
+            parse_tracepoint_fields(tp_category, tp_name);
+        const std::vector<datacrumbs::ProbeArgCaptureSpec>* tp_specs =
+            tp_fields.empty() ? probe->getArgSpecs(function_name) : &tp_fields;
+        if (populate_event_arg_config(event_arg_config_fd, current_cookie, *event_id, probe->type,
+                                      tp_specs, probe->system_wide) != 0) {
+          total_failed += 1;
+          continue;
+        }
+        if (!tp_fields.empty()) config_manager->set_runtime_event_arg_specs(*event_id, tp_fields);
+        struct bpf_tracepoint_opts tp_opts = {};
+        tp_opts.sz = sizeof(tp_opts);
+        tp_opts.bpf_cookie = current_cookie;
+        auto* tp_link = bpf_program__attach_tracepoint_opts(tracepoint_prog, tp_category.c_str(),
+                                                            tp_name.c_str(), &tp_opts);
+        if (libbpf_get_error(tp_link)) {
+          DC_LOG_WARN("tracepoint attach FAILED %s:%s err=%ld", tp_category.c_str(), tp_name.c_str(),
+                      libbpf_get_error(tp_link));
+          config_manager->record_invalid_runtime_probe(probe, function_name);
+          runtime_probe_state_updated = true;
+          total_failed += 1;
+          continue;
+        }
+        config_manager->record_successful_runtime_probe(probe, function_name);
+        runtime_probe_state_updated = true;
+        total_attached += 1;
       } else {
         DC_LOG_WARN("Skipping unsupported runtime probe type %d for %s",
                     static_cast<int>(probe->type), probe->name.c_str());

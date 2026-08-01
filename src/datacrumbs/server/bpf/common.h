@@ -660,6 +660,76 @@ static inline __attribute__((always_inline)) int usdt_exit(struct pt_regs* ctx, 
 }
 #endif
 
+#if defined(DATACRUMBS_ENABLE) && (DATACRUMBS_ENABLE == 1) && defined(DATACRUMBS_MODE) && \
+    (DATACRUMBS_MODE == 1)
+// Tracepoint handler: ctx is the raw tracepoint record. A tracepoint is a point event, so this emits
+// directly (no entry/exit pairing). Fields are read from ctx at offsets parsed from the tracepoint's
+// tracefs format at attach.
+static inline __attribute__((always_inline)) int generic_point(void* ctx, u64 attach_cookie) {
+  const u64 now = bpf_ktime_get_ns();
+  const struct runtime_event_config_t* config = resolve_event_config(attach_cookie);
+  if (config == NULL) return 0;
+  const u64 event_id = config->event_id;
+  struct fn_key_t key = {};
+  if (config->system_wide) {
+    key.id = bpf_get_current_pid_tgid();  // capture on all pids
+  } else {
+    u64 start_ts = 0;
+    if (!need_tracing(&key, &start_ts)) return 0;  // default: pid-gated like kprobes
+  }
+  if (hot_probe_drop(event_id, now)) return 0;  // rate-limit a runaway (esp. system-wide) tracepoint
+  struct generic_event_t* event;
+  DATACRUMBS_RB_RESERVE(output, struct generic_event_t, event);
+  event->type = config->probe_kind;
+  event->id = key.id;
+  event->event_id = event_id;
+  event->ts = now;
+  event->dur = 1;  // nominal: a tracepoint is instantaneous; writer emits 1us so the ph:"X" renders
+  event->arg_count = config->arg_count;
+#pragma unroll
+  for (int i = 0; i < DATACRUMBS_MAX_CAPTURE_ARGS; ++i) {
+    if ((unsigned int)i >= config->arg_count) break;
+    event->args[i] = 0;
+    event->arg_data_len[i] = 0;
+    event->arg_data_status[i] = 0;
+    unsigned int nb = config->arg_num_bytes[i];
+    if (nb == 0) continue;
+    const void* src = (const char*)ctx + config->arg_offset[i];
+    if (config->arg_is_pointer[i]) {
+      if (config->arg_index[i] == 1) {  // __data_loc dynamic string: field holds [len:16|rel_off:16]
+        unsigned int loc = 0;
+        bpf_probe_read_kernel(&loc, 4, src);
+        unsigned int dl_len = (loc >> 16) & 0xffff;
+        unsigned int dl_off = loc & 0xffff;
+        if (dl_len > DATACRUMBS_MAX_CAPTURE_BYTES) dl_len = DATACRUMBS_MAX_CAPTURE_BYTES;
+        if (dl_len > 0 &&
+            bpf_probe_read_kernel(event->arg_data[i], dl_len, (const char*)ctx + dl_off) == 0) {
+          event->arg_data_len[i] = dl_len;
+          event->arg_data_status[i] = 2;
+        }
+      } else {  // fixed char array (e.g. comm[16]) -> raw bytes
+        if (nb > DATACRUMBS_MAX_CAPTURE_BYTES) nb = DATACRUMBS_MAX_CAPTURE_BYTES;
+        if (bpf_probe_read_kernel(event->arg_data[i], nb, src) == 0) {
+          event->arg_data_len[i] = nb;
+          event->arg_data_status[i] = 2;
+        }
+      }
+    } else {  // scalar field
+      unsigned long long v = 0;
+      if (nb > 8) nb = 8;
+      bpf_probe_read_kernel(&v, nb, src);
+      event->args[i] = v;
+    }
+  }
+  DATACRUMBS_EVENT_SUBMIT(event, key.id, event_id);
+  return 0;
+}
+#else
+static inline __attribute__((always_inline)) int generic_point(void* ctx, u64 attach_cookie) {
+  return 0;
+}
+#endif
+
 #if defined(DATACRUMBS_ENABLE) && (DATACRUMBS_ENABLE == 1)
 static inline __attribute__((always_inline)) int generic_fork_exit(struct pt_regs* ctx,
                                                                    u64 event_id) {

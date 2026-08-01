@@ -141,6 +141,8 @@ std::shared_ptr<Probe> probe_from_json(json_object* probe_obj) {
       return std::make_shared<USDTProbe>(USDTProbe::fromJson(probe_obj));
     case ProbeType::CUSTOM:
       return std::make_shared<CustomProbe>(CustomProbe::fromJson(probe_obj));
+    case ProbeType::TRACEPOINT:
+      return std::make_shared<TracepointProbe>(TracepointProbe::fromJson(probe_obj));
     default:
       return nullptr;
   }
@@ -156,6 +158,7 @@ bool is_supported_runtime_probe_type(ProbeType type) {
     case ProbeType::UPROBE:
     case ProbeType::SYSCALLS:
     case ProbeType::USDT:
+    case ProbeType::TRACEPOINT:
       return true;
     default:
       return false;
@@ -804,6 +807,14 @@ const RuntimeEventMetadata* RuntimeConfigurationManager::get_runtime_event_metad
     return nullptr;
   }
   return &it->second;
+}
+
+void RuntimeConfigurationManager::set_runtime_event_arg_specs(
+    uint64_t event_id, const std::vector<ProbeArgCaptureSpec>& specs) {
+  const auto it = runtime_event_metadata.find(event_id);
+  if (it != runtime_event_metadata.end()) {
+    it->second.arg_specs = specs;
+  }
 }
 
 void RuntimeConfigurationManager::validate_configurations() const {

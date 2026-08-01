@@ -28,6 +28,7 @@ class RuntimeConfigurationManager {
   std::optional<uint64_t> get_runtime_event_id(const std::string& probe_name,
                                                const std::string& function_name) const;
   const RuntimeEventMetadata* get_runtime_event_metadata(uint64_t event_id) const;
+  void set_runtime_event_arg_specs(uint64_t event_id, const std::vector<ProbeArgCaptureSpec>& specs);
 
   std::filesystem::path data_dir;
   std::filesystem::path trace_log_dir;

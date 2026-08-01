@@ -204,7 +204,7 @@ bool validate_function_arguments(json_object* function_arguments, const std::str
         continue;
       }
       if (!validate_exact_keys(arg_spec, {"index", "num_bytes", "is_pointer", "label", "c_type"},
-                               {}, arg_context, errors)) {
+                               {"offset"}, arg_context, errors)) {
         ok = false;
       }
       json_object* value = nullptr;
@@ -679,7 +679,7 @@ bool ProbeManagerService::validate_signing_payload(const std::string& signing_pa
 
       const int probe_type_value = json_object_get_int(type_obj);
       if (probe_type_value < static_cast<int>(datacrumbs::ProbeType::SYSCALLS) ||
-          probe_type_value > static_cast<int>(datacrumbs::ProbeType::CUSTOM)) {
+          probe_type_value > static_cast<int>(datacrumbs::ProbeType::TRACEPOINT)) {
         errors->push_back(context + ".type contains invalid probe type value");
         ok = false;
         continue;
@@ -687,7 +687,8 @@ bool ProbeManagerService::validate_signing_payload(const std::string& signing_pa
       const auto probe_type = static_cast<datacrumbs::ProbeType>(probe_type_value);
 
       std::unordered_set<std::string> required_keys = {"type", "name", "functions"};
-      std::unordered_set<std::string> optional_keys = {"function_arguments"};
+      std::unordered_set<std::string> optional_keys = {"function_arguments", "trace_event_type",
+                                                       "system_wide"};
       if (probe_type == datacrumbs::ProbeType::UPROBE) {
         required_keys.insert("binary_path");
         required_keys.insert("include_offsets");

@@ -1,5 +1,12 @@
 #include <datacrumbs/server/bpf/common.h>
 
+SEC("tracepoint")
+int trace_generic_tracepoint(void* ctx) {
+  const unsigned long long cookie = bpf_get_attach_cookie(ctx);
+  DBG_PRINTK("tracepoint cookie=%llu", cookie);
+  return generic_point(ctx, cookie);  // ctx = the raw tracepoint record (for field decode)
+}
+
 SEC("kprobe")
 int BPF_KPROBE(trace_generic_kprobe_entry) {
   const unsigned long long cookie = bpf_get_attach_cookie(ctx);
