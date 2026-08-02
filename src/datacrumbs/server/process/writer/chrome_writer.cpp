@@ -14,6 +14,7 @@
 #include <unistd.h>
 #include <zlib.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -200,7 +201,6 @@ long env_num(const char* name, long dflt) {
   return dflt;
 }
 
-
 }  // namespace
 
 // Specialization of the Singleton instance for KSymCapture.
@@ -215,10 +215,14 @@ bool datacrumbs::Singleton<datacrumbs::ChromeWriter>::stop_creating_instances = 
 
 namespace datacrumbs {
 ChromeWriter::ChromeWriter() : flush_bytes_(1 << 20) {
-  // Env-overridable for testing: MAX_QUEUE_EVENTS bounds the backpressure queue (0 = unbounded);
-  // ZLIB_LEVEL sets the deflate level (gzip framing is kept for Perfetto).
+  // Env-overridable: MAX_QUEUE_EVENTS bounds the backpressure queue (0 = unbounded); ZLIB_LEVEL
+  // sets the deflate level (gzip framing kept for Perfetto); WRITER_THREADS scales the
+  // serialize+gzip pool (default 1 to keep the server off the traced cores; raise it when the
+  // writer is a firehose bottleneck and backpressure would otherwise stall the ring drain).
   max_queue_events_ = static_cast<size_t>(env_num("DATACRUMBS_MAX_QUEUE_EVENTS", 500000));
   zlib_level_ = static_cast<int>(env_num("DATACRUMBS_ZLIB_LEVEL", Z_DEFAULT_COMPRESSION));
+  long nthreads = env_num("DATACRUMBS_WRITER_THREADS", 1);
+  if (nthreads < 1) nthreads = 1;
 
   auto configManager_ =
       datacrumbs::Singleton<datacrumbs::RuntimeConfigurationManager>::get_instance();
@@ -240,10 +244,12 @@ ChromeWriter::ChromeWriter() : flush_bytes_(1 << 20) {
                ",\"args\":{\"hhash\":\"" + hhash_ + "\",\"name\":\"" + json_escape(hostname_) +
                "\",\"value\":\"" + hhash_ + "\"}}\n");
 
-  worker_ = std::thread([this]() { this->worker_loop(); });
+  for (long i = 0; i < nthreads; ++i) workers_.emplace_back([this]() { this->worker_loop(); });
 }
 
-ChromeWriter::~ChromeWriter() { finalize(); }
+ChromeWriter::~ChromeWriter() {
+  finalize();
+}
 
 void ChromeWriter::finalize() {
   {
@@ -254,7 +260,8 @@ void ChromeWriter::finalize() {
   }
   queue_cv_.notify_all();
   not_full_cv_.notify_all();  // release any producer blocked on backpressure
-  if (worker_.joinable()) worker_.join();
+  for (auto& w : workers_)
+    if (w.joinable()) w.join();
   if (file_) {
     std::fclose(file_);
     file_ = nullptr;
@@ -266,8 +273,8 @@ void ChromeWriter::push_event(EventWithId* event) {
   {
     std::unique_lock<std::mutex> lock(queue_mutex_);
     if (max_queue_events_ > 0) {
-      not_full_cv_.wait(
-          lock, [this] { return event_queue_.size() < max_queue_events_ || finalized_; });
+      not_full_cv_.wait(lock,
+                        [this] { return event_queue_.size() < max_queue_events_ || finalized_; });
     }
     if (finalized_) {  // worker gone; free rather than enqueue into a dead queue
       delete event->args;
@@ -280,8 +287,10 @@ void ChromeWriter::push_event(EventWithId* event) {
 }
 
 void ChromeWriter::write_member(const std::string& data) {
-  if (data.empty() || !file_) return;
+  if (data.empty()) return;
   std::vector<uint8_t> member = datacrumbs::pfw::gzip_block(data, zlib_level_);
+  std::lock_guard<std::mutex> lock(file_mutex_);  // append is serial; members are self-contained
+  if (!file_) return;
   if (std::fwrite(member.data(), 1, member.size(), file_) != member.size()) {
     perror("Failed to write gzip member to trace file");
   }
@@ -298,7 +307,7 @@ std::string ChromeWriter::serialize_event(EventWithId* event_with_id) {
   unsigned int tid = event_with_id->tgid_pid >> 32;
   auto it = configManager_->category_map.find(event_with_id->event_id);
   if (it != configManager_->category_map.end()) {
-    index_++;
+    const unsigned long event_index = ++index_;
     std::string probe_name = it->second.first;
     std::string function_name = it->second.second;
     if (args != nullptr && event_with_id->event_type == TracePhase::COUNTER &&
@@ -313,12 +322,14 @@ std::string ChromeWriter::serialize_event(EventWithId* event_with_id) {
     }
     char buffer[1024];
     // ns -> us by integer math: exact and overflow-free (a global-epoch ts exceeds double's 2^53
-    // exact range, and floor(ts/1e3) would lose ~256ns there). dur rounds up so sub-us stays nonzero.
+    // exact range, and floor(ts/1e3) would lose ~256ns there). dur rounds up so sub-us stays
+    // nonzero.
     const unsigned long long ts_us = event_with_id->ts / 1000;
     const unsigned long long dur_us =
         event_with_id->dur / 1000 + (event_with_id->dur % 1000 != 0 ? 1 : 0);
     // "id" and "dur" are complete-event only; "type" is the probe's config domain string ("unknown"
-    // if unset -- a free-form string so a plugin can contribute its own domain without a core change).
+    // if unset -- a free-form string so a plugin can contribute its own domain without a core
+    // change).
     const auto* rmeta = configManager_->get_runtime_event_metadata(event_with_id->event_id);
     const char* type =
         (rmeta && !rmeta->trace_event_type.empty()) ? rmeta->trace_event_type.c_str() : "unknown";
@@ -340,7 +351,8 @@ std::string ChromeWriter::serialize_event(EventWithId* event_with_id) {
       len = std::snprintf(
           buffer, sizeof(buffer),
           R"({"id":%lu,"name":"%s","cat":"%s","type":"%s","pid":%d,"tid":%d,"ts":%llu,"dur":%llu,"ph":%u)",
-          index_, function_name.c_str(), probe_name.c_str(), type, pid, tid, ts_us, dur_us, ph);
+          event_index, function_name.c_str(), probe_name.c_str(), type, pid, tid, ts_us, dur_us,
+          ph);
     }
 
     if (len > 0) {
@@ -365,17 +377,24 @@ std::string ChromeWriter::serialize_event(EventWithId* event_with_id) {
 
 void ChromeWriter::worker_loop() {
   DC_LOG_DEBUG("ChromeWriter worker loop started");
+  static constexpr size_t kDrainSlice = 8192;  // bounded grab so a pool shares the queue fairly
   std::string member;
   member.reserve(flush_bytes_ + 4096);
-  std::deque<EventWithId*> batch;
+  std::vector<EventWithId*> batch;
+  batch.reserve(kDrainSlice);
   while (true) {
     {
       std::unique_lock<std::mutex> lock(queue_mutex_);
       queue_cv_.wait(lock, [this] { return !event_queue_.empty() || stop_flag_; });
       if (event_queue_.empty() && stop_flag_) break;
-      batch.swap(event_queue_);
+      const size_t n = std::min(event_queue_.size(), kDrainSlice);
+      for (size_t i = 0; i < n; ++i) {
+        batch.push_back(event_queue_.front());
+        event_queue_.pop_front();
+      }
+      if (!event_queue_.empty()) queue_cv_.notify_one();  // more left -> wake a peer worker
     }
-    not_full_cv_.notify_all();  // queue drained -> release backpressured producers
+    not_full_cv_.notify_all();  // queue drained below bound -> release backpressured producers
     for (EventWithId* event : batch) {
       run_event_enrichers(event);
       member += serialize_event(event);

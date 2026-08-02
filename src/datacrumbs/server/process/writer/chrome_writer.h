@@ -5,20 +5,23 @@
 #include <datacrumbs/common/data_structures.h>
 #include <datacrumbs/common/enumerations.h>
 // std headers
+#include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdio>
-#include <condition_variable>
 #include <deque>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace datacrumbs {
 
 // Writes events as a multi-member gzip .pfw: each drained batch is coalesced into ~1MB chunks and
 // each chunk is a self-contained gzip member. Concatenated members are a valid gzip stream, so a
 // killed server still leaves every completed member readable (truncation-tolerant). Events cross a
-// bounded queue to a single worker; a producer outrunning the writer is blocked, never dropped.
+// bounded queue to a worker pool (DATACRUMBS_WRITER_THREADS, default 1); a producer outrunning the
+// writer is blocked, never dropped. Members compress in parallel; only the file append is serial.
 class ChromeWriter {
  public:
   ChromeWriter();
@@ -37,6 +40,7 @@ class ChromeWriter {
   void write_member(const std::string& data);       // gzip `data` as one member, append to file
 
   FILE* file_ = nullptr;
+  std::mutex file_mutex_;  // serializes fwrite of members; compression stays outside it
 
   std::string hostname_;  // this node's hostname, resolved once at construction
   std::string hhash_;     // md5(hostname) as dftracer's 16-hex host key; first key of every args
@@ -47,11 +51,11 @@ class ChromeWriter {
   std::condition_variable not_full_cv_;  // producer wakes when the queue drains below the bound
   size_t max_queue_events_;              // backpressure bound (0 = unbounded)
 
-  std::thread worker_;
+  std::vector<std::thread> workers_;
   bool stop_flag_ = false;
   bool finalized_ = false;
-  unsigned long index_ = 0;  // unique event id; only the worker touches it
-  size_t flush_bytes_;       // coalesce serialized JSON to ~this many bytes per gzip member
+  std::atomic<unsigned long> index_{0};  // unique complete-event id, shared across pool workers
+  size_t flush_bytes_;                   // coalesce serialized JSON to ~this many bytes per member
   int zlib_level_;
 };
 
