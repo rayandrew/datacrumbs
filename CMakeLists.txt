@@ -467,11 +467,23 @@ set(DATACRUMBS_PROCESS_EVENTS_OBJ_SRC
 set(DATACRUMBS_SERVER_SRC
     ${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/server/process/server.cpp
 )
+# bpftime hot uprobe fast path: routes hot: uprobes to the bpftime userspace runtime (opt-in).
+if(DATACRUMBS_BPFTIME_COMPATIBLE)
+  list(APPEND DATACRUMBS_PROCESS_EVENTS_OBJ_SRC
+      ${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/server/process/bpftime_hot.cpp)
+  find_library(BPFTIME_LIB NAMES bpftime REQUIRED)
+endif()
 
 include_directories(${CMAKE_INCLUDE_OUTPUT_DIRECTORY})
 
 add_library(datacrumbs_obj SHARED ${DATACRUMBS_PROCESS_EVENTS_OBJ_SRC})
 target_link_libraries(datacrumbs_obj ${DEPENDENCY_LIB})
+if(DATACRUMBS_BPFTIME_COMPATIBLE)
+  # libbpftime.a bundles its own libbpf; datacrumbs' libbpf.a is linked first (its symbols win), so
+  # let the linker drop the duplicates instead of erroring.
+  target_link_libraries(datacrumbs_obj ${BPFTIME_LIB})
+  target_link_options(datacrumbs_obj PRIVATE "-Wl,--allow-multiple-definition")
+endif()
 install(TARGETS datacrumbs_obj
     LIBRARY DESTINATION ${DATACRUMBS_INSTALL_LIB_DIR}
 )

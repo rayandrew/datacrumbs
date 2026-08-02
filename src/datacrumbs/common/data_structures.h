@@ -128,6 +128,7 @@ class Probe {
         trace_event_type(other.trace_event_type),
         system_wide(other.system_wide),
         aggregate(other.aggregate),
+        hot(other.hot),
         name(other.name),
         functions(other.functions),
         function_arguments(other.function_arguments) {
@@ -140,6 +141,7 @@ class Probe {
         trace_event_type(std::move(other.trace_event_type)),
         system_wide(other.system_wide),
         aggregate(other.aggregate),
+        hot(other.hot),
         name(std::move(other.name)),
         functions(std::move(other.functions)),
         function_arguments(std::move(other.function_arguments)) {
@@ -152,6 +154,7 @@ class Probe {
   std::string trace_event_type;   // .pfw "type" domain string, from config (empty = unset)
   bool system_wide = false;       // tracepoints: capture on all pids (skip the pid gate)
   bool aggregate = false;         // accumulate count/duration instead of emitting per-event records
+  bool hot = false;               // uprobes: route to bpftime userspace (no kernel trap, args dropped)
   std::string name;                    // Name of the probe
   std::vector<std::string> functions;  // List of functions or arguments for the probe
   std::unordered_map<std::string, std::vector<ProbeArgCaptureSpec>>
@@ -180,6 +183,7 @@ class Probe {
                            json_object_new_string(trace_event_type.c_str()));
     if (system_wide) json_object_object_add(j, "system_wide", json_object_new_boolean(true));
     if (aggregate) json_object_object_add(j, "aggregate", json_object_new_boolean(true));
+    if (hot) json_object_object_add(j, "hot", json_object_new_boolean(true));
     json_object_object_add(j, "name", json_object_new_string(name.c_str()));
 
     json_object* funcs = json_object_new_array();
@@ -220,6 +224,9 @@ class Probe {
     }
     if (json_object* ag = json_object_object_get(j, "aggregate")) {
       p.aggregate = json_object_get_boolean(ag);
+    }
+    if (json_object* h = json_object_object_get(j, "hot")) {
+      p.hot = json_object_get_boolean(h);
     }
     json_object* name_obj = json_object_object_get(j, "name");
     if (name_obj) p.name = json_object_get_string(name_obj);
@@ -374,6 +381,7 @@ struct UProbe : public Probe {
     p.functions = base.functions;
     p.function_arguments = base.function_arguments;
     p.aggregate = base.aggregate;
+    p.hot = base.hot;
     json_object* bin_obj = json_object_object_get(j, "binary_path");
     if (bin_obj) p.binary_path = json_object_get_string(bin_obj);
 
@@ -561,6 +569,7 @@ class CaptureProbe {
   std::string trace_event_type;  // .pfw "type" domain, propagated to the emitted Probe
   bool system_wide = false;      // tracepoints: capture on all pids, propagated to the emitted Probe
   bool aggregate = false;        // accumulate count/duration, propagated to the emitted Probe
+  bool hot = false;              // uprobes: route to bpftime userspace, propagated to the emitted Probe
   std::unordered_map<std::string, std::vector<ProbeArgCaptureSpec>>
       function_arguments;  // Optional per-function arg capture specification from YAML
 

@@ -2,6 +2,8 @@
 #include <datacrumbs/common/enumerations.h>
 #include <datacrumbs/common/runtime_configuration_manager.h>
 #include <datacrumbs/common/singleton.h>
+#include <datacrumbs/server/process/bpf_map_util.h>
+#include <datacrumbs/server/process/bpftime_hot.h>
 #include <datacrumbs/server/process/event_processor.h>
 #include <datacrumbs/server/process/plugin_loader.h>
 
@@ -233,20 +235,11 @@ static void poll_auto_detach(int probe_guard_fd, datacrumbs::EventProcessor* eve
 static void drain_agg_map(int agg_fd, datacrumbs::EventProcessor* event_processor) {
   if (agg_fd < 0 || !event_processor->writer_) return;
   auto config_manager = event_processor->configManager_;
-  std::vector<struct agg_key_t> keys;
-  struct agg_key_t key = {};
-  struct agg_key_t next = {};
-  int err = bpf_map_get_next_key(agg_fd, nullptr, &next);
-  while (err == 0) {
-    keys.push_back(next);
-    key = next;
-    err = bpf_map_get_next_key(agg_fd, &key, &next);
-  }
-  for (const auto& k : keys) {
+  datacrumbs::for_each_map_entry<struct agg_key_t>(agg_fd, [&](const struct agg_key_t& k) {
     struct agg_value_t v = {};
-    if (bpf_map_lookup_elem(agg_fd, &k, &v) != 0) continue;
+    if (bpf_map_lookup_elem(agg_fd, &k, &v) != 0) return;
     bpf_map_delete_elem(agg_fd, &k);
-    if (config_manager->category_map.find(k.event_id) == config_manager->category_map.end()) continue;
+    if (config_manager->category_map.find(k.event_id) == config_manager->category_map.end()) return;
     auto* args = new DataCrumbsArgs();
     (*args)["count"] = static_cast<unsigned long long>(v.count);
     (*args)["dur"] = static_cast<unsigned long long>(v.duration_ns / 1000);  // summed us (dftracer key)
@@ -254,7 +247,19 @@ static void drain_agg_map(int agg_fd, datacrumbs::EventProcessor* event_processo
         new datacrumbs::EventWithId(datacrumbs::TracePhase::AGGREGATED, 0, 0, v.pid_tgid, k.event_id,
                                     k.time_interval * DATACRUMBS_TIME_INTERVAL_NS, 0, args);
     event_processor->writer_->push_event(aggregated);
-  }
+  });
+}
+#endif
+
+#if defined(DATACRUMBS_BPFTIME_COMPATIBLE_FLAG) && (DATACRUMBS_BPFTIME_COMPATIBLE_FLAG == 1)
+// Route a hot uprobe to the bpftime userspace runtime (opt-in via DC_BPFTIME_HOT). Returns nonzero
+// on any failure so the caller falls back to the kernel uprobe - capture is never silently lost.
+static int attach_hot_via_bpftime(struct bpf_object* obj, int kernel_cfg_fd,
+                                  const std::string& binary, unsigned long offset,
+                                  unsigned long long cookie) {
+  if (!getenv("DC_BPFTIME_HOT")) return -1;
+  if (datacrumbs::bpftime_hot_init(obj) != 0) return -1;
+  return datacrumbs::bpftime_hot_attach_uprobe(binary, offset, cookie, kernel_cfg_fd);
 }
 #endif
 
@@ -425,6 +430,16 @@ static int attach_runtime_probes(datacrumbs::EventProcessor* event_processor,
           entry_opts.func_name = function_name.c_str();
           exit_opts.func_name = function_name.c_str();
         }
+#if defined(DATACRUMBS_BPFTIME_COMPATIBLE_FLAG) && (DATACRUMBS_BPFTIME_COMPATIBLE_FLAG == 1)
+        if (uprobe->hot && has_offset &&
+            attach_hot_via_bpftime(skel->obj, event_arg_config_fd, uprobe->binary_path, offset,
+                                   current_cookie) == 0) {
+          config_manager->record_successful_runtime_probe(probe, function_name);
+          runtime_probe_state_updated = true;
+          total_attached += 2;
+          continue;  // routed to bpftime; skip the kernel uprobe
+        }
+#endif
         auto* entry_link = bpf_program__attach_uprobe_opts(
             uprobe_entry, -1, uprobe->binary_path.c_str(), offset, &entry_opts);
         auto* exit_link = bpf_program__attach_uprobe_opts(
@@ -581,15 +596,8 @@ static int main_process(datacrumbs::EventProcessor* event_processor) {
     datacrumbs_bpf__destroy(skel);
     return 1;
   }
-  struct string_t* cur_key = nullptr;
-  struct string_t next_key = {};
-  struct string_t value = {};
-  for (;;) {
-    err = bpf_map_get_next_key(inclusion_trie, cur_key, &next_key);
-    if (err) break;
-    bpf_map_delete_elem(inclusion_trie, &next_key);
-    cur_key = &next_key;
-  }
+  datacrumbs::for_each_map_entry<struct string_t>(
+      inclusion_trie, [&](const struct string_t& k) { bpf_map_delete_elem(inclusion_trie, &k); });
 
   std::unordered_map<unsigned int, string_t> inclusion_list;
   const std::string inclusion_paths = event_processor->configManager_->inclusion_paths;
@@ -616,15 +624,11 @@ static int main_process(datacrumbs::EventProcessor* event_processor) {
       return 1;
     }
   }
-  cur_key = nullptr;
-  next_key = {};
-  for (;;) {
-    err = bpf_map_get_next_key(inclusion_trie, cur_key, &next_key);
-    if (err) break;
-    bpf_map_lookup_elem(inclusion_trie, &next_key, &value);
-    DC_LOG_INFO("Trie key: %s, len: %u, value_len: %u", next_key.str, next_key.len, value.len);
-    cur_key = &next_key;
-  }
+  datacrumbs::for_each_map_entry<struct string_t>(inclusion_trie, [&](const struct string_t& k) {
+    struct string_t value = {};
+    bpf_map_lookup_elem(inclusion_trie, &k, &value);
+    DC_LOG_INFO("Trie key: %s, len: %u, value_len: %u", k.str, k.len, value.len);
+  });
 #endif
 
 #if defined(DATACRUMBS_MODE) && (DATACRUMBS_MODE == 1)
@@ -741,10 +745,22 @@ static int main_process(datacrumbs::EventProcessor* event_processor) {
 #if defined(DATACRUMBS_MODE) && (DATACRUMBS_MODE == 1)
   const int agg_fd = bpf_map__fd(skel->maps.agg_map);
 #endif
+#if defined(DATACRUMBS_BPFTIME_COMPATIBLE_FLAG) && (DATACRUMBS_BPFTIME_COMPATIBLE_FLAG == 1)
+  time_t last_bpftime_sync = time(nullptr);
+#endif
 
   unsigned long long last_processed_timestamp = 0;
   while (!stop) {
     err = 0;
+#if defined(DATACRUMBS_BPFTIME_COMPATIBLE_FLAG) && (DATACRUMBS_BPFTIME_COMPATIBLE_FLAG == 1)
+    // Drain the bpftime output ring into the same single-threaded event_processor as the kernel ring
+    // (no extra thread -> no race on the writer). Mirror traced pids on the autodetach cadence.
+    datacrumbs::bpftime_hot_poll(handle_event, event_processor);
+    if (time(nullptr) - last_bpftime_sync >= 1) {
+      last_bpftime_sync = time(nullptr);
+      datacrumbs::bpftime_hot_sync_pids(bpf_map__fd(skel->maps.pid_map));
+    }
+#endif
 #if defined(DATACRUMBS_BPFTIME_COMPATIBLE_FLAG) && (DATACRUMBS_BPFTIME_COMPATIBLE_FLAG == 0)
     err = lookup_and_delete(file_hash_fd, event_processor, keys, values, batch_size, in_batch);
     if (err == -EINTR) {
