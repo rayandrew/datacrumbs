@@ -10,6 +10,7 @@
 
 // std headers
 #include <memory>
+#include <mutex>
 #include <utility>
 
 namespace datacrumbs {
@@ -19,19 +20,13 @@ class Singleton {
  public:
   template <typename... Args>
   static std::shared_ptr<T> get_instance(Args... args) {
-    DC_LOG_TRACE("Entering Singleton::get_instance");
     if (stop_creating_instances) {
       DC_LOG_WARN("Attempted to get instance after finalization");
-      DC_LOG_TRACE("Exiting Singleton::get_instance");
       return nullptr;
     }
-    if (instance == nullptr) {
-      DC_LOG_DEBUG("Creating new instance of Singleton<%s>", typeid(T).name());
-      instance = std::make_shared<T>(std::forward<Args>(args)...);
-    } else {
-      DC_LOG_DEBUG("Returning existing instance of Singleton<%s>", typeid(T).name());
-    }
-    DC_LOG_TRACE("Exiting Singleton::get_instance");
+    // Concurrent callers must not race on construction (the configurator builds probes in parallel).
+    std::call_once(init_flag_,
+                   [&]() { instance = std::make_shared<T>(std::forward<Args>(args)...); });
     return instance;
   }
 
@@ -46,6 +41,9 @@ class Singleton {
  protected:
   static bool stop_creating_instances;
   static std::shared_ptr<T> instance;
+  // Per-T (not a function-local: get_instance is variadic, so a local flag would be per-arg-list and
+  // a no-arg get_instance() would re-construct instead of reusing get_instance(path, ...)'s instance.
+  static inline std::once_flag init_flag_;
 
   Singleton() {}
 };
