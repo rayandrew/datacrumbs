@@ -127,11 +127,16 @@ std::unordered_set<std::string> load_kernel_symbols() {
   if (!file.is_open()) {
     return symbols;
   }
-  std::string addr;
-  std::string type;
-  std::string name;
-  while (file >> addr >> type >> name) {
-    if (type == "T" || type == "t") {
+  // Parse per line: module symbols carry a 4th "[module]" field, and stream-extracting a fixed
+  // three tokens would consume it as the next line's address and desync the whole scan (dropping
+  // every module symbol, e.g. all of mlx5_core). Take the first three fields, ignore the rest.
+  std::string line;
+  while (std::getline(file, line)) {
+    std::istringstream iss(line);
+    std::string addr;
+    std::string type;
+    std::string name;
+    if ((iss >> addr >> type >> name) && (type == "T" || type == "t")) {
       symbols.insert(name);
     }
   }
