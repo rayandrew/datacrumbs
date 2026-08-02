@@ -232,14 +232,16 @@ static inline __attribute__((always_inline)) void pmu_delta_exit(const struct fn
 
 #if defined(DATACRUMBS_MODE) && (DATACRUMBS_MODE == 1)
 // Accumulate a hit into agg_map instead of emitting an event (config->aggregate probes). The server
-// drains this into periodic COUNTER records. Concurrent updates race benignly (last-writer init).
+// drains this into periodic COUNTER records. Plain (non-atomic) adds: BPF atomics (opcode 0xdb) are
+// rejected by the bpftime userspace VM (ubpf) that hosts hot uprobes, so a rare lost increment under
+// cross-CPU contention is accepted - the aggregate is a statistical summary, not an exact metric.
 static inline __attribute__((always_inline)) void aggregate_hit(u64 event_id, u64 pid_tgid, u64 ts,
                                                                 u64 te) {
   struct agg_key_t k = {.event_id = event_id, .time_interval = te / DATACRUMBS_TIME_INTERVAL_NS};
   struct agg_value_t* v = bpf_map_lookup_elem(&agg_map, &k);
   if (v != NULL) {
-    __sync_fetch_and_add(&v->count, 1);
-    __sync_fetch_and_add(&v->duration_ns, te - ts);
+    v->count += 1;
+    v->duration_ns += te - ts;
     return;
   }
   struct agg_value_t nv = {.count = 1, .duration_ns = te - ts, .pid_tgid = pid_tgid};
