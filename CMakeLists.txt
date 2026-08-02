@@ -462,6 +462,8 @@ set(DATACRUMBS_PROCESS_EVENTS_OBJ_SRC
     ${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/common/runtime_configuration_manager.h
     ${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/server/process/writer/chrome_writer.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/server/process/event_processor.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/server/process/telemetry/telemetry_sampler.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/server/process/telemetry/perf_telemetry_sampler.cpp
     ${DATACRUMBS_COMMON_SRC}
 )
 set(DATACRUMBS_SERVER_SRC

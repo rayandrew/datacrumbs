@@ -545,6 +545,98 @@ void RuntimeConfigurationManager::derive_configurations() {
   runtime_probe_state_db_path =
       data_dir / ("probes-runtime-status-" + lookup_file_suffix + ".sqlite");
   server_ready_file = server_run_dir / ("datacrumbs-" + run_id + ".ready");
+  derive_telemetry_sources();
+}
+
+// System-wide interval telemetry, all env-driven (no probe file). DATACRUMBS_TELEMETRY_INTERVAL_MS
+// sets the period; DATACRUMBS_UNCORE_EVENTS is a comma list of libpfm4 uncore event names (one
+// perf-backed track); DATACRUMBS_NIC_DEVICES is a comma list of "<ibdev>[:port]" (port default 1),
+// each becoming an IB sysfs byte/packet track plus an RDMA hw_counters "why is it slow" track.
+void RuntimeConfigurationManager::derive_telemetry_sources() {
+  telemetry_sources.clear();
+  uncore_events.clear();
+  if (const char* ms = std::getenv("DATACRUMBS_TELEMETRY_INTERVAL_MS")) {
+    const long v = std::strtol(ms, nullptr, 10);
+    if (v > 0) telemetry_interval_ms = static_cast<unsigned int>(v);
+  }
+
+#if defined(DATACRUMBS_ENABLE_HW_COUNTERS) && (DATACRUMBS_ENABLE_HW_COUNTERS == 1)
+  if (const char* ue = std::getenv("DATACRUMBS_UNCORE_EVENTS")) {
+    std::stringstream us(ue);
+    std::string ev;
+    while (std::getline(us, ev, ',')) {
+      const auto b = ev.find_first_not_of(" \t");
+      if (b == std::string::npos) continue;
+      const auto e = ev.find_last_not_of(" \t");
+      uncore_events.push_back(ev.substr(b, e - b + 1));
+    }
+  }
+  if (!uncore_events.empty()) {
+    TelemetrySource src;
+    src.cat = "uncore";
+    src.name = "uncore";
+    for (const auto& ev : uncore_events) {
+      TelemetryCounter c;
+      c.label = ev;
+      c.perf_event = ev;
+      src.counters.push_back(std::move(c));
+    }
+    telemetry_sources.push_back(std::move(src));
+  }
+#endif
+
+  const char* devs = std::getenv("DATACRUMBS_NIC_DEVICES");
+  if (devs == nullptr || *devs == '\0') return;
+  std::stringstream ss(devs);
+  std::string token;
+  while (std::getline(ss, token, ',')) {
+    const auto begin = token.find_first_not_of(" \t");
+    if (begin == std::string::npos) continue;
+    const auto end = token.find_last_not_of(" \t");
+    token = token.substr(begin, end - begin + 1);
+    std::string dev = token;
+    std::string port = "1";
+    if (const auto colon = token.find(':'); colon != std::string::npos) {
+      dev = token.substr(0, colon);
+      port = token.substr(colon + 1);
+    }
+    const std::string base = "/sys/class/infiniband/" + dev + "/ports/" + port;
+    TelemetrySource src;
+    src.cat = "nic";
+    src.name = dev;
+    // IB data counters are in 4-octet units -> *4 for bytes.
+    src.counters.push_back({"rx_bytes", base + "/counters/port_rcv_data", 4.0});
+    src.counters.push_back({"tx_bytes", base + "/counters/port_xmit_data", 4.0});
+    src.counters.push_back({"rx_packets", base + "/counters/port_rcv_packets", 1.0});
+    src.counters.push_back({"tx_packets", base + "/counters/port_xmit_packets", 1.0});
+    src.counters.push_back({"out_of_buffer", base + "/hw_counters/out_of_buffer", 1.0});
+    telemetry_sources.push_back(std::move(src));
+
+    // Firmware RDMA-engine request rates + retransmit/out-of-sequence/timeout/error health signals:
+    // the off-CPU "why is it slow" view perf and uprobes cannot see. A counter missing on this HCA
+    // is a missing sysfs file, skipped per-tick, so the list stays portable across HCAs.
+    TelemetrySource rdma;
+    rdma.cat = "nic_rdma";
+    rdma.name = dev;
+    const std::string hw = base + "/hw_counters/";
+    for (const char* c :
+         {"rx_write_requests", "rx_read_requests", "rx_atomic_requests", "packet_seq_err",
+          "out_of_sequence", "duplicate_request", "rnr_nak_retry_err", "req_rnr_retries_exceeded",
+          "req_transport_retries_exceeded", "local_ack_timeout_err", "implied_nak_seq_err",
+          "req_cqe_error", "resp_cqe_error", "req_remote_access_errors",
+          "resp_remote_access_errors"})
+      rdma.counters.push_back({c, hw + c, 1.0});
+    telemetry_sources.push_back(std::move(rdma));
+  }
+}
+
+// Telemetry sources get event ids in a high, distinct range so they never collide with probe ids
+// (kRuntimeProbeEventIdBase). Called after load_runtime_probe_file populates category_map.
+void RuntimeConfigurationManager::register_telemetry_categories(uint64_t event_id_base) {
+  for (auto& src : telemetry_sources) {
+    src.event_id = event_id_base++;
+    category_map[src.event_id] = std::make_pair(src.cat, src.name);
+  }
 }
 
 void RuntimeConfigurationManager::load_runtime_system_configuration() {
@@ -676,6 +768,8 @@ void RuntimeConfigurationManager::load_runtime_probe_file() {
                              " functions per run. Regenerate the probes file with fewer "
                              "selected functions.");
   }
+
+  register_telemetry_categories(0xE000000000000000ULL);
 }
 
 void RuntimeConfigurationManager::load_runtime_probe_state() {

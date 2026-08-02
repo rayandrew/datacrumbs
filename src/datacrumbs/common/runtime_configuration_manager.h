@@ -2,6 +2,7 @@
 #define DATACRUMBS_COMMON_RUNTIME_CONFIGURATION_MANAGER_H__
 
 #include <datacrumbs/common/data_structures.h>
+#include <datacrumbs/common/telemetry_types.h>
 #include <datacrumbs/datacrumbs_config.h>
 
 #include <filesystem>
@@ -28,7 +29,8 @@ class RuntimeConfigurationManager {
   std::optional<uint64_t> get_runtime_event_id(const std::string& probe_name,
                                                const std::string& function_name) const;
   const RuntimeEventMetadata* get_runtime_event_metadata(uint64_t event_id) const;
-  void set_runtime_event_arg_specs(uint64_t event_id, const std::vector<ProbeArgCaptureSpec>& specs);
+  void set_runtime_event_arg_specs(uint64_t event_id,
+                                   const std::vector<ProbeArgCaptureSpec>& specs);
 
   std::filesystem::path data_dir;
   std::filesystem::path trace_log_dir;
@@ -54,6 +56,11 @@ class RuntimeConfigurationManager {
   std::unordered_map<std::string, RuntimeProbeScopes> invalid_runtime_probes;
   std::unordered_map<std::string, RuntimeProbeScopes> successful_runtime_probes;
 
+  // System-wide interval telemetry (NIC sysfs + uncore perf) sampled as Chrome COUNTER tracks.
+  std::vector<TelemetrySource> telemetry_sources;
+  std::vector<std::string> uncore_events;
+  unsigned int telemetry_interval_ms = 100;
+
   bool is_known_invalid_runtime_probe(const std::shared_ptr<Probe>& probe,
                                       const std::string& function_name) const;
   void record_invalid_runtime_probe(const std::shared_ptr<Probe>& probe,
@@ -64,6 +71,8 @@ class RuntimeConfigurationManager {
 
  private:
   void derive_configurations();
+  void derive_telemetry_sources();
+  void register_telemetry_categories(uint64_t event_id_base);
   void load_runtime_system_configuration();
   void load_runtime_probe_file();
   void load_runtime_probe_state();

@@ -6,6 +6,8 @@
 #include <datacrumbs/server/process/bpftime_hot.h>
 #include <datacrumbs/server/process/event_processor.h>
 #include <datacrumbs/server/process/plugin_loader.h>
+#include <datacrumbs/server/process/telemetry/perf_telemetry_sampler.h>
+#include <datacrumbs/server/process/telemetry/telemetry_sampler.h>
 
 // std headers
 #include <algorithm>
@@ -749,6 +751,35 @@ static int main_process(datacrumbs::EventProcessor* event_processor) {
   time_t last_bpftime_sync = time(nullptr);
 #endif
 
+  // System-wide interval telemetry as Chrome COUNTER tracks on their own thread. Perf-backed
+  // sources (uncore) only exist when hw counters are compiled in; everything else reads sysfs.
+  std::vector<datacrumbs::TelemetrySource> sysfs_sources;
+#if defined(DATACRUMBS_ENABLE_HW_COUNTERS) && (DATACRUMBS_ENABLE_HW_COUNTERS == 1)
+  std::vector<datacrumbs::TelemetrySource> perf_sources;
+#endif
+  for (const auto& src : event_processor->configManager_->telemetry_sources) {
+    const bool is_perf = !src.counters.empty() && !src.counters[0].perf_event.empty();
+#if defined(DATACRUMBS_ENABLE_HW_COUNTERS) && (DATACRUMBS_ENABLE_HW_COUNTERS == 1)
+    if (is_perf) {
+      perf_sources.push_back(src);
+      continue;
+    }
+#else
+    (void)is_perf;
+#endif
+    sysfs_sources.push_back(src);
+  }
+  const unsigned int telemetry_interval = event_processor->configManager_->telemetry_interval_ms;
+  datacrumbs::SysfsTelemetrySampler sysfs_sampler(event_processor->writer_,
+                                                  std::move(sysfs_sources), telemetry_interval,
+                                                  &event_processor->event_index);
+  sysfs_sampler.start();
+#if defined(DATACRUMBS_ENABLE_HW_COUNTERS) && (DATACRUMBS_ENABLE_HW_COUNTERS == 1)
+  datacrumbs::PerfTelemetrySampler perf_sampler(event_processor->writer_, std::move(perf_sources),
+                                                telemetry_interval, &event_processor->event_index);
+  perf_sampler.start();
+#endif
+
   unsigned long long last_processed_timestamp = 0;
   while (!stop) {
     err = 0;
@@ -829,6 +860,11 @@ static int main_process(datacrumbs::EventProcessor* event_processor) {
     }
 #endif
   }
+
+  sysfs_sampler.stop();
+#if defined(DATACRUMBS_ENABLE_HW_COUNTERS) && (DATACRUMBS_ENABLE_HW_COUNTERS == 1)
+  perf_sampler.stop();
+#endif
 
   batch_size = 1024 * 1024;
   DC_LOG_INFO("");
