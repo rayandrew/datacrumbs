@@ -10,11 +10,13 @@ ExecStartPre=/usr/bin/rm -f @DATACRUMBS_SERVER_RUN_DIR@/datacrumbs-%i.ready
 ExecStartPre=/bin/sh -c 'mkdir -p "${DATACRUMBS_LOG_DIR}"'
 ExecStartPre=/bin/sh -c 'log_file="${DATACRUMBS_LOG_DIR}/datacrumbs_${DATACRUMBS_USER}_${DATACRUMBS_SERVICE_RUN_ID}_$$(hostname).log"; touch "$${log_file}" && chown "${DATACRUMBS_USER}":"${DATACRUMBS_USER}" "$${log_file}" && chmod 0660 "$${log_file}"'
 ExecStart=/bin/sh -c 'exec @DATACRUMBS_INSTALL_SBINARYDIR@/datacrumbs "${DATACRUMBS_PROBE_FILE}" "%i" "${DATACRUMBS_USER}" >> "${DATACRUMBS_LOG_DIR}/datacrumbs_${DATACRUMBS_USER}_${DATACRUMBS_SERVICE_RUN_ID}_$$(hostname).log" 2>&1'
-ExecStartPost=/bin/sh -c 'for i in $(seq 1 300); do [ -f "@DATACRUMBS_SERVER_RUN_DIR@/datacrumbs-%i.ready" ] && exit 0; sleep 1; done; exit 1'
+ExecStartPost=/bin/sh -c 'for i in $(seq 1 "${DATACRUMBS_READY_TIMEOUT:-300}"); do [ -f "@DATACRUMBS_SERVER_RUN_DIR@/datacrumbs-%i.ready" ] && exit 0; sleep 1; done; exit 1'
 ExecStop=/bin/kill -INT $MAINPID
 KillSignal=SIGINT
 KillMode=control-group
-TimeoutStartSec=10min
+# The ExecStartPost gate (DATACRUMBS_READY_TIMEOUT) bounds startup; a fixed cap here would kill a
+# slow catch-all attach mid-flight, so leave the systemd start timeout off.
+TimeoutStartSec=0
 TimeoutStopSec=10min
 
 [Install]
