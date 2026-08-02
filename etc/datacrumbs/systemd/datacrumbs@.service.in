@@ -15,9 +15,11 @@ ExecStop=/bin/kill -INT $MAINPID
 KillSignal=SIGINT
 KillMode=control-group
 # The ExecStartPost gate (DATACRUMBS_READY_TIMEOUT) bounds startup; a fixed cap here would kill a
-# slow catch-all attach mid-flight, so leave the systemd start timeout off.
+# slow catch-all attach mid-flight, so leave the systemd start timeout off. Stop is uncapped too: a
+# catch-all detaches thousands of probes and flushes the trace on SIGINT, and a fixed cap SIGKILLs
+# that mid-flush and truncates the trace.
 TimeoutStartSec=0
-TimeoutStopSec=10min
+TimeoutStopSec=0
 
 [Install]
 WantedBy=multi-user.target
