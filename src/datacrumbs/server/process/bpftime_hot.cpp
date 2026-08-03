@@ -5,10 +5,13 @@
 #include <bpf/libbpf.h>
 #include <datacrumbs/common/logging.h>
 #include <datacrumbs/server/process/bpf_map_util.h>
+#include <sys/stat.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
-#include <map>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 // Minimal bpftime raw-API decls, kept in sync with runtime/include/bpftime_shm.hpp, so the server
@@ -25,7 +28,12 @@ struct bpf_map_attr {
   uint32_t kernel_bpf_map_id = 0;
   uint64_t gpu_thread_count = 1024;
 };
-enum class shm_open_type { SHM_REMOVE_AND_CREATE, SHM_OPEN_ONLY, SHM_NO_CREATE, SHM_CREATE_OR_OPEN };
+enum class shm_open_type {
+  SHM_REMOVE_AND_CREATE,
+  SHM_OPEN_ONLY,
+  SHM_NO_CREATE,
+  SHM_CREATE_OR_OPEN
+};
 }  // namespace bpftime
 struct ebpf_inst;
 // bpftime exports these with C linkage (unmangled names, C++ param types).
@@ -44,8 +52,9 @@ int bpftime_poll_from_ringbuf(int rb_fd, void* ctx, int (*cb)(void*, void*, size
 namespace datacrumbs {
 namespace {
 bool g_inited = false;
-int g_entry_prog_id = -1, g_exit_prog_id = -1, g_cfg_map_id = -1, g_output_id = -1, g_pid_map_id = -1;
-std::map<int, int> g_fd2id;  // kernel map fd -> bpftime map id
+int g_entry_prog_id = -1, g_exit_prog_id = -1, g_cfg_map_id = -1, g_output_id = -1,
+    g_pid_map_id = -1;
+std::unordered_map<int, int> g_fd2id;  // kernel map fd -> bpftime map id
 
 int mirror_prog(struct bpf_program* pr) {
   const struct bpf_insn* ins = bpf_program__insns(pr);
@@ -65,7 +74,15 @@ int mirror_prog(struct bpf_program* pr) {
 
 int bpftime_hot_init(struct bpf_object* obj) {
   if (g_inited) return 0;
+  // The unprivileged workload agent must write the maps shm to register its uprobes, but a root
+  // server creates it 0644 -> EACCES; widen it (umask for creation, chmod if it pre-existed).
+  const mode_t old_umask = umask(0);
   bpftime_initialize_global_shm(bpftime::shm_open_type::SHM_CREATE_OR_OPEN);
+  umask(old_umask);
+  const char* shm_name = std::getenv("BPFTIME_SHM_NAME");
+  const std::string shm_path =
+      std::string("/dev/shm/") + (shm_name ? shm_name : "bpftime_maps_shm");
+  chmod(shm_path.c_str(), 0666);
   struct bpf_map* m;
   bpf_object__for_each_map(m, obj) {
     bpftime::bpf_map_attr attr;
@@ -122,11 +139,14 @@ int bpftime_hot_attach_uprobe(const std::string& binary, unsigned long offset,
   // The agent only attaches ENABLED perf events; create leaves them disabled, so enable both.
   bpftime_perf_event_enable(pe);
   bpftime_perf_event_enable(px);
-  DC_LOG_INFO("bpftime: registered hot uprobe %s+0x%lx cookie=%llu", binary.c_str(), offset, cookie);
+  DC_LOG_INFO("bpftime: registered hot uprobe %s+0x%lx cookie=%llu", binary.c_str(), offset,
+              cookie);
   return 0;
 }
 
-bool bpftime_hot_active() { return g_inited; }
+bool bpftime_hot_active() {
+  return g_inited;
+}
 
 void bpftime_hot_poll(int (*cb)(void*, void*, size_t), void* ctx) {
   if (g_inited && g_output_id >= 0) bpftime_poll_from_ringbuf(g_output_id, ctx, cb);
