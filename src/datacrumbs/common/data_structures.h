@@ -75,8 +75,9 @@ struct EventWithId {
   unsigned long long ts;
   unsigned long long dur;
   DataCrumbsArgs* args;
-  unsigned int pmu_count = 0;                     // hardware counters captured (0 = none)
-  unsigned long long pmu[DATACRUMBS_MAX_PMU] = {};  // per-counter entry->exit delta; named by a plugin
+  unsigned int pmu_count = 0;  // hardware counters captured (0 = none)
+  unsigned long long pmu[DATACRUMBS_MAX_PMU] =
+      {};  // per-counter entry->exit delta; named by a plugin
   EventWithId(TracePhase _event_type, unsigned long long _index, unsigned int _type,
               unsigned long long _tgid_pid, unsigned long long _event_id, unsigned long long _ts,
               unsigned long long _dur, DataCrumbsArgs* _args)
@@ -150,12 +151,12 @@ class Probe {
   // Constructor initializing the probe type
   Probe(ProbeType _type) : type(_type) { DC_LOG_TRACE("Probe constructor called"); }
 
-  ProbeType type;                 // The type of probe (e.g., SYSCALLS, KPROBE, etc.)
-  std::string trace_event_type;   // .pfw "type" domain string, from config (empty = unset)
-  bool system_wide = false;       // tracepoints: capture on all pids (skip the pid gate)
-  bool aggregate = false;         // accumulate count/duration instead of emitting per-event records
-  bool hot = false;               // uprobes: route to bpftime userspace (no kernel trap, args dropped)
-  std::string name;                    // Name of the probe
+  ProbeType type;                // The type of probe (e.g., SYSCALLS, KPROBE, etc.)
+  std::string trace_event_type;  // .pfw "type" domain string, from config (empty = unset)
+  bool system_wide = false;      // tracepoints: capture on all pids (skip the pid gate)
+  bool aggregate = false;        // accumulate count/duration instead of emitting per-event records
+  bool hot = false;  // uprobes: route to bpftime userspace (no kernel trap, args dropped)
+  std::string name;  // Name of the probe
   std::vector<std::string> functions;  // List of functions or arguments for the probe
   std::unordered_map<std::string, std::vector<ProbeArgCaptureSpec>>
       function_arguments;  // Optional per-function runtime arg capture specification
@@ -179,8 +180,7 @@ class Probe {
     DC_LOG_TRACE("Probe::toJson called");
     json_object* j = json_object_new_object();
     json_object_object_add(j, "type", json_object_new_int(static_cast<int>(type)));
-    json_object_object_add(j, "trace_event_type",
-                           json_object_new_string(trace_event_type.c_str()));
+    json_object_object_add(j, "trace_event_type", json_object_new_string(trace_event_type.c_str()));
     if (system_wide) json_object_object_add(j, "system_wide", json_object_new_boolean(true));
     if (aggregate) json_object_object_add(j, "aggregate", json_object_new_boolean(true));
     if (hot) json_object_object_add(j, "hot", json_object_new_boolean(true));
@@ -561,15 +561,17 @@ class CaptureProbe {
   // Constructor initializing the capture type
   CaptureProbe(CaptureType _type) : type(_type) { DC_LOG_TRACE("CaptureProbe constructor called"); }
 
-  CaptureType type;      // The type of capture (e.g., KSYM, HEADER, BINARY, USDT)
-  std::string regex;     // Regex pattern for matching
-  std::string name;      // Name of the capture probe
-  ProbeType probe_type;  // Type of probe associated with the capture
-  bool enable_explorer;  // Flag to enable explorer for this capture probe
+  CaptureType type;              // The type of capture (e.g., KSYM, HEADER, BINARY, USDT)
+  std::string regex;             // Regex pattern for matching
+  std::string name;              // Name of the capture probe
+  ProbeType probe_type;          // Type of probe associated with the capture
+  bool enable_explorer;          // Flag to enable explorer for this capture probe
   std::string trace_event_type;  // .pfw "type" domain, propagated to the emitted Probe
-  bool system_wide = false;      // tracepoints: capture on all pids, propagated to the emitted Probe
-  bool aggregate = false;        // accumulate count/duration, propagated to the emitted Probe
-  bool hot = false;              // uprobes: route to bpftime userspace, propagated to the emitted Probe
+  bool system_wide = false;  // tracepoints: capture on all pids, propagated to the emitted Probe
+  bool aggregate = false;    // accumulate count/duration, propagated to the emitted Probe
+  bool hot = false;          // uprobes: route to bpftime userspace, propagated to the emitted Probe
+  std::string hot_exclude;   // hot uprobe layers: functions matching this regex are split off to a
+                             // kernel uprobe (frida-unsafe fns, e.g. ones that corrupt a DOCA send)
   std::unordered_map<std::string, std::vector<ProbeArgCaptureSpec>>
       function_arguments;  // Optional per-function arg capture specification from YAML
 
