@@ -572,6 +572,9 @@ class CaptureProbe {
   bool hot = false;          // uprobes: route to bpftime userspace, propagated to the emitted Probe
   std::string hot_exclude;   // hot uprobe layers: functions matching this regex are split off to a
                              // kernel uprobe (frida-unsafe fns, e.g. ones that corrupt a DOCA send)
+  std::vector<std::string>
+      hot_sensitive;  // hot uprobe layers: functions that CALL a symbol
+                      // matching any of these are auto-demoted like hot_exclude
   std::unordered_map<std::string, std::vector<ProbeArgCaptureSpec>>
       function_arguments;  // Optional per-function arg capture specification from YAML
 
