@@ -130,6 +130,7 @@ class Probe {
         system_wide(other.system_wide),
         aggregate(other.aggregate),
         hot(other.hot),
+        capture_stack(other.capture_stack),
         name(other.name),
         functions(other.functions),
         function_arguments(other.function_arguments) {
@@ -143,6 +144,7 @@ class Probe {
         system_wide(other.system_wide),
         aggregate(other.aggregate),
         hot(other.hot),
+        capture_stack(other.capture_stack),
         name(std::move(other.name)),
         functions(std::move(other.functions)),
         function_arguments(std::move(other.function_arguments)) {
@@ -185,6 +187,8 @@ class Probe {
     if (system_wide) json_object_object_add(j, "system_wide", json_object_new_boolean(true));
     if (aggregate) json_object_object_add(j, "aggregate", json_object_new_boolean(true));
     if (hot) json_object_object_add(j, "hot", json_object_new_boolean(true));
+    if (capture_stack)
+      json_object_object_add(j, "capture_stack", json_object_new_boolean(true));
     json_object_object_add(j, "name", json_object_new_string(name.c_str()));
 
     json_object* funcs = json_object_new_array();
@@ -225,6 +229,9 @@ class Probe {
     }
     if (json_object* ag = json_object_object_get(j, "aggregate")) {
       p.aggregate = json_object_get_boolean(ag);
+    }
+    if (json_object* cs = json_object_object_get(j, "capture_stack")) {
+      p.capture_stack = json_object_get_boolean(cs);
     }
     if (json_object* h = json_object_object_get(j, "hot")) {
       p.hot = json_object_get_boolean(h);
@@ -467,6 +474,7 @@ struct TracepointProbe : public Probe {
     p.type = base.type;
     p.trace_event_type = base.trace_event_type;
     p.system_wide = base.system_wide;
+    p.capture_stack = base.capture_stack;
     p.name = base.name;
     p.functions = base.functions;
     p.function_arguments = base.function_arguments;

@@ -779,8 +779,13 @@ static inline __attribute__((always_inline)) int generic_point(void* ctx, u64 at
   event->event_id = event_id;
   event->ts = now;
   event->dur = 1;  // nominal: a tracepoint is instantaneous; writer emits 1us so the ph:"X" renders
-  // at sched_switch current is the blocking task (waker at sched_wakeup), so its stack is the edge
-  event->stack_id = config->capture_stack ? bpf_get_stackid(ctx, &stack_map, BPF_F_USER_STACK) : -1;
+  // at sched_switch current is the blocking task (waker at sched_wakeup), so its stack is the edge.
+  // Prefer the user stack (needs frame pointers); fall back to the kernel stack if the walk fails.
+  event->stack_id = -1;
+  if (config->capture_stack) {
+    event->stack_id = bpf_get_stackid(ctx, &stack_map, BPF_F_USER_STACK);
+    if (event->stack_id < 0) event->stack_id = bpf_get_stackid(ctx, &stack_map, 0);
+  }
   event->arg_count = config->arg_count;
 #pragma unroll
   for (int i = 0; i < DATACRUMBS_MAX_CAPTURE_ARGS; ++i) {
