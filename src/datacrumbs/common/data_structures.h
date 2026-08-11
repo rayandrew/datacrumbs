@@ -156,6 +156,7 @@ class Probe {
   bool system_wide = false;      // tracepoints: capture on all pids (skip the pid gate)
   bool aggregate = false;        // accumulate count/duration instead of emitting per-event records
   bool hot = false;  // uprobes: route to bpftime userspace (no kernel trap, args dropped)
+  bool capture_stack = false;  // tracepoints: grab the user call stack at the event
   std::string name;  // Name of the probe
   std::vector<std::string> functions;  // List of functions or arguments for the probe
   std::unordered_map<std::string, std::vector<ProbeArgCaptureSpec>>
@@ -570,6 +571,7 @@ class CaptureProbe {
   bool system_wide = false;  // tracepoints: capture on all pids, propagated to the emitted Probe
   bool aggregate = false;    // accumulate count/duration, propagated to the emitted Probe
   bool hot = false;          // uprobes: route to bpftime userspace, propagated to the emitted Probe
+  bool capture_stack = false;  // tracepoints: grab the user call stack, propagated to the Probe
   std::string hot_exclude;   // hot uprobe layers: functions matching this regex are split off to a
                              // kernel uprobe (frida-unsafe fns, e.g. ones that corrupt a DOCA send)
   std::vector<std::string>

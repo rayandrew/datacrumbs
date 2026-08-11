@@ -61,6 +61,7 @@ class EventProcessor {
   std::shared_ptr<RuntimeConfigurationManager> configManager_;
   std::shared_ptr<datacrumbs::ChromeWriter> writer_;
   int failed_events;  // Count of failed events
+  int stack_map_fd_ = -1;  // BPF_MAP_TYPE_STACK_TRACE fd for capture_stack probes (-1 = off)
   std::atomic<uint64_t> event_index{0};
 
  private:                                              // Atomic index for event processing

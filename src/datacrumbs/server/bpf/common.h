@@ -40,6 +40,12 @@ extern struct {
   __type(key, u32);
   __type(value, u32);
 } pmu_ctl SEC(".maps");
+extern struct {
+  __uint(type, BPF_MAP_TYPE_STACK_TRACE);
+  __uint(max_entries, 16384);
+  __uint(key_size, sizeof(u32));
+  __uint(value_size, DATACRUMBS_STACK_DEPTH * sizeof(u64));
+} stack_map SEC(".maps");
 
 #if defined(DATACRUMBS_MODE) && (DATACRUMBS_MODE == 1)
 DATACRUMBS_MAP_EXTERN(failed_request, u32, u32, 128);
@@ -524,6 +530,7 @@ static inline __attribute__((always_inline)) int generic_exit(struct pt_regs* ct
   event->type = config->probe_kind;
   event->id = key.id;
   event->event_id = event_id;
+  event->stack_id = -1;  // stacks are captured on tracepoints (generic_point), not entry/exit pairs
   DATACRUMBS_COLLECT_TIME(event);
   copy_captured_args_to_event(fn, event);
   pmu_delta_exit(fn, event);
@@ -677,6 +684,7 @@ static inline __attribute__((always_inline)) int usdt_exit(struct pt_regs* ctx, 
   event->type = config->probe_kind;
   event->id = key.id;
   event->event_id = event_id;
+  event->stack_id = -1;  // stacks are captured on tracepoints (generic_point), not entry/exit pairs
   DATACRUMBS_COLLECT_TIME(event);
   copy_captured_args_to_event(fn, event);
   pmu_delta_exit(fn, event);
@@ -771,6 +779,8 @@ static inline __attribute__((always_inline)) int generic_point(void* ctx, u64 at
   event->event_id = event_id;
   event->ts = now;
   event->dur = 1;  // nominal: a tracepoint is instantaneous; writer emits 1us so the ph:"X" renders
+  // at sched_switch current is the blocking task (waker at sched_wakeup), so its stack is the edge
+  event->stack_id = config->capture_stack ? bpf_get_stackid(ctx, &stack_map, BPF_F_USER_STACK) : -1;
   event->arg_count = config->arg_count;
 #pragma unroll
   for (int i = 0; i < DATACRUMBS_MAX_CAPTURE_ARGS; ++i) {

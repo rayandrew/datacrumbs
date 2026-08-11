@@ -78,6 +78,23 @@ std::unique_ptr<DataCrumbsArgs> build_runtime_args(
   return args;
 }
 
+// Offline symbolization: emit the raw user IPs as a ';'-joined hex "ustack" arg; the analysis side
+// resolves them against the binary + /proc/PID/maps.
+void append_ustack(std::unique_ptr<DataCrumbsArgs>& args, int stack_fd, int stack_id) {
+  if (stack_fd < 0 || stack_id < 0) return;
+  unsigned long long ips[DATACRUMBS_STACK_DEPTH] = {};
+  if (bpf_map_lookup_elem(stack_fd, &stack_id, ips) != 0) return;
+  std::string s;
+  for (int i = 0; i < DATACRUMBS_STACK_DEPTH && ips[i]; ++i) {
+    char buf[24];
+    snprintf(buf, sizeof(buf), "%s0x%llx", s.empty() ? "" : ";", ips[i]);
+    s += buf;
+  }
+  if (s.empty()) return;
+  if (!args) args = std::make_unique<DataCrumbsArgs>();
+  args->emplace("ustack", s);
+}
+
 }  // namespace
 
 EventProcessor::EventProcessor(const std::filesystem::path& probe_file) {
@@ -119,6 +136,7 @@ int EventProcessor::handle_event(void* data, size_t data_sz) {
 #if defined(DATACRUMBS_MODE) && (DATACRUMBS_MODE == 1)
     auto metadata = configManager_->get_runtime_event_metadata(event->event_id);
     auto runtime_args = build_runtime_args(event, metadata);
+    append_ustack(runtime_args, stack_map_fd_, event->stack_id);
     auto write_event =
         new datacrumbs::EventWithId(datacrumbs::TracePhase::COMPLETE, event_index.fetch_add(1), event->type, event->id,
                                     event->event_id, event->ts, event->dur, runtime_args.release());

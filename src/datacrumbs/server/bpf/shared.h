@@ -10,6 +10,7 @@ static int DATACRUMBS_FAILED_EVENTS_KEY = 2;
 
 #define DATACRUMBS_MAX_CAPTURE_ARGS 5
 #define DATACRUMBS_MAX_CAPTURE_BYTES 64
+#define DATACRUMBS_STACK_DEPTH 32  // frames per captured user stack (bpf_get_stackid slot size)
 
 enum datacrumbs_runtime_probe_kind_t {
   DATACRUMBS_RUNTIME_PROBE_KIND_KPROBE = 1,
@@ -32,6 +33,7 @@ struct generic_event_t {
   unsigned char arg_data[DATACRUMBS_MAX_CAPTURE_ARGS][DATACRUMBS_MAX_CAPTURE_BYTES];
   unsigned int pmu_count;                     // hardware counters read (0 = PMU off)
   unsigned long long pmu[DATACRUMBS_MAX_PMU];  // per-counter entry->exit delta
+  int stack_id;  // BPF_MAP_TYPE_STACK_TRACE id of the user stack at capture; -1 = none
 };
 typedef struct generic_event_t general_event_t;
 struct usdt_event_t {
@@ -80,8 +82,9 @@ struct agg_value_t {
 struct runtime_event_config_t {
   unsigned long long event_id;
   unsigned int probe_kind;
-  unsigned int system_wide;  // tracepoints: 1 => skip the pid gate (capture on all pids)
-  unsigned int aggregate;    // 1 => accumulate count/duration instead of emitting per-event
+  unsigned int system_wide;    // tracepoints: 1 => skip the pid gate (capture on all pids)
+  unsigned int aggregate;      // 1 => accumulate count/duration instead of emitting per-event
+  unsigned int capture_stack;  // 1 => grab the user call stack (bpf_get_stackid, BPF_F_USER_STACK)
   unsigned int arg_count;
   unsigned int arg_index[DATACRUMBS_MAX_CAPTURE_ARGS];
   unsigned int arg_num_bytes[DATACRUMBS_MAX_CAPTURE_ARGS];

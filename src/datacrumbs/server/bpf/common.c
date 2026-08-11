@@ -40,6 +40,14 @@ struct {
   __type(value, u32);
 } pmu_ctl SEC(".maps");
 
+// User call stacks for capture_stack probes; the event holds the slot id, the writer reads + symbolizes.
+struct {
+  __uint(type, BPF_MAP_TYPE_STACK_TRACE);
+  __uint(max_entries, 16384);
+  __uint(key_size, sizeof(u32));
+  __uint(value_size, DATACRUMBS_STACK_DEPTH * sizeof(u64));
+} stack_map SEC(".maps");
+
 #if defined(DATACRUMBS_MODE) && (DATACRUMBS_MODE == 1)
 DATACRUMBS_MAP(failed_request, u32, u32, 128);
 DATACRUMBS_MAP(agg_map, struct agg_key_t, struct agg_value_t, 4096);

@@ -106,12 +106,13 @@ static unsigned int runtime_probe_kind(datacrumbs::ProbeType probe_type) {
 static int populate_event_arg_config(
     int map_fd, uint64_t cookie, uint64_t event_id, datacrumbs::ProbeType probe_type,
     const std::vector<datacrumbs::ProbeArgCaptureSpec>* arg_specs, bool system_wide = false,
-    bool aggregate = false) {
+    bool aggregate = false, bool capture_stack = false) {
   runtime_event_config_t config = {};
   config.event_id = event_id;
   config.probe_kind = runtime_probe_kind(probe_type);
   config.system_wide = system_wide ? 1u : 0u;
   config.aggregate = aggregate ? 1u : 0u;
+  config.capture_stack = capture_stack ? 1u : 0u;
   if (arg_specs != nullptr) {
     config.arg_count = std::min<unsigned int>(arg_specs->size(), DATACRUMBS_MAX_CAPTURE_ARGS);
     for (unsigned int index = 0; index < config.arg_count; ++index) {
@@ -506,7 +507,8 @@ static int attach_runtime_probes(datacrumbs::EventProcessor* event_processor,
         const std::vector<datacrumbs::ProbeArgCaptureSpec>* tp_specs =
             tp_fields.empty() ? probe->getArgSpecs(function_name) : &tp_fields;
         if (populate_event_arg_config(event_arg_config_fd, current_cookie, *event_id, probe->type,
-                                      tp_specs, probe->system_wide) != 0) {
+                                      tp_specs, probe->system_wide, false,
+                                      probe->capture_stack) != 0) {
           total_failed += 1;
           continue;
         }
@@ -640,6 +642,7 @@ static int main_process(datacrumbs::EventProcessor* event_processor) {
     datacrumbs_bpf__destroy(skel);
     return 1;
   }
+  event_processor->stack_map_fd_ = bpf_map__fd(skel->maps.stack_map);
   rb = ring_buffer__new(bpf_map__fd(skel->maps.output), handle_event, event_processor, nullptr);
   if (!rb) {
     DC_LOG_ERROR("Failed to create ring buffer");
