@@ -110,6 +110,20 @@ EventProcessor::EventProcessor(const std::filesystem::path& probe_file) {
 int EventProcessor::handle_event(void* data, size_t data_sz) {
   DC_LOG_TRACE("handle_event: start");
 
+  // stack samples ride the same ringbuf tagged with a sentinel type; sink the raw record for the
+  // offline DWARF unwinder (they are not chrome events).
+  if (data != nullptr && *static_cast<const unsigned int*>(data) == DATACRUMBS_STACK_SAMPLE_TYPE) {
+    if (!stack_sink_.is_open()) {
+      const char* ld = getenv("DATACRUMBS_LOG_DIR");
+      const char* rid = getenv("DATACRUMBS_SERVICE_RUN_ID");
+      std::string p =
+          std::string(ld ? ld : "/tmp") + "/" + (rid ? rid : "x") + "/stack_samples.bin";
+      stack_sink_.open(p, std::ios::binary | std::ios::app);
+    }
+    if (stack_sink_.is_open()) stack_sink_.write(static_cast<const char*>(data), data_sz);
+    return 0;
+  }
+
 #if defined(DATACRUMBS_MODE) && (DATACRUMBS_MODE == 1)
   struct generic_event_t* event = (generic_event_t*)data;
 #else

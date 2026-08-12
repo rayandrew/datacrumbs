@@ -11,6 +11,21 @@ static int DATACRUMBS_FAILED_EVENTS_KEY = 2;
 #define DATACRUMBS_MAX_CAPTURE_ARGS 5
 #define DATACRUMBS_MAX_CAPTURE_BYTES 64
 #define DATACRUMBS_STACK_DEPTH 32  // frames per captured user stack (bpf_get_stackid slot size)
+#define DATACRUMBS_STACKDUMP_BYTES 4000  // user stack bytes per sample (offline DWARF/.eh_frame unwind)
+#define DATACRUMBS_STACK_SAMPLE_TYPE 200u  // generic_event_t.type sentinel for a stack-sample record
+
+// A raw user stack snapshot (regs + N bytes from sp) for capture_stack probes whose FP walk is too
+// shallow (crosses a frame-pointer-less vendor lib). Emitted sampled on its own ringbuf record; the
+// offline analysis replays each module's .eh_frame CFI over regs+stackdump. uregs = pc, sp, fp, lr.
+struct stack_sample_t {
+  unsigned int type;  // = DATACRUMBS_STACK_SAMPLE_TYPE
+  unsigned long long id;
+  unsigned long long event_id;
+  unsigned long long ts;
+  unsigned long long uregs[4];
+  unsigned int stackdump_len;
+  unsigned char stackdump[DATACRUMBS_STACKDUMP_BYTES];
+};
 
 enum datacrumbs_runtime_probe_kind_t {
   DATACRUMBS_RUNTIME_PROBE_KIND_KPROBE = 1,

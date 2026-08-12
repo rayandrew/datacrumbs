@@ -46,6 +46,12 @@ extern struct {
   __uint(key_size, sizeof(u32));
   __uint(value_size, DATACRUMBS_STACK_DEPTH * sizeof(u64));
 } stack_map SEC(".maps");
+extern struct {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, u32);
+  __type(value, struct stack_sample_t);
+} stack_scratch SEC(".maps");
 
 #if defined(DATACRUMBS_MODE) && (DATACRUMBS_MODE == 1)
 DATACRUMBS_MAP_EXTERN(failed_request, u32, u32, 128);
@@ -756,6 +762,27 @@ static inline __attribute__((always_inline)) int usdt_exit(struct pt_regs* ctx, 
 
 #if defined(DATACRUMBS_ENABLE) && (DATACRUMBS_ENABLE == 1) && defined(DATACRUMBS_MODE) && \
     (DATACRUMBS_MODE == 1)
+// Sampled raw stack snapshot (regs + stack bytes from sp) for offline DWARF unwinding across
+// frame-pointer-less libs. ~1/64 to bound volume; own ringbuf record tagged with a sentinel type.
+static inline __attribute__((always_inline)) void capture_stack_sample(u64 id, u64 event_id, u64 ts) {
+  if ((bpf_get_prandom_u32() & 63) != 0) return;
+  u32 zero = 0;
+  struct stack_sample_t* ss = bpf_map_lookup_elem(&stack_scratch, &zero);
+  if (!ss) return;
+  struct pt_regs* r = (struct pt_regs*)bpf_task_pt_regs((struct task_struct*)bpf_get_current_task_btf());
+  ss->type = DATACRUMBS_STACK_SAMPLE_TYPE;
+  ss->id = id;
+  ss->event_id = event_id;
+  ss->ts = ts;
+  ss->uregs[0] = BPF_CORE_READ(r, pc);
+  ss->uregs[1] = BPF_CORE_READ(r, sp);
+  ss->uregs[2] = BPF_CORE_READ(r, regs[29]);
+  ss->uregs[3] = BPF_CORE_READ(r, regs[30]);
+  long ok = bpf_probe_read_user(ss->stackdump, DATACRUMBS_STACKDUMP_BYTES, (void*)ss->uregs[1]);
+  ss->stackdump_len = ok == 0 ? DATACRUMBS_STACKDUMP_BYTES : 0;
+  bpf_ringbuf_output(&output, ss, sizeof(*ss), 0);
+}
+
 // Tracepoint handler: ctx is the raw tracepoint record. A tracepoint is a point event, so this emits
 // directly (no entry/exit pairing). Fields are read from ctx at offsets parsed from the tracepoint's
 // tracefs format at attach.
@@ -785,6 +812,7 @@ static inline __attribute__((always_inline)) int generic_point(void* ctx, u64 at
   if (config->capture_stack) {
     event->stack_id = bpf_get_stackid(ctx, &stack_map, BPF_F_USER_STACK);
     if (event->stack_id < 0) event->stack_id = bpf_get_stackid(ctx, &stack_map, 0);
+    capture_stack_sample(key.id, event_id, now);
   }
   event->arg_count = config->arg_count;
 #pragma unroll

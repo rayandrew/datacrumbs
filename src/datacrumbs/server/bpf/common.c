@@ -48,6 +48,14 @@ struct {
   __uint(value_size, DATACRUMBS_STACK_DEPTH * sizeof(u64));
 } stack_map SEC(".maps");
 
+// Per-cpu scratch for a stack sample (too big for the 512B BPF stack); filled then ringbuf-output.
+struct {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, u32);
+  __type(value, struct stack_sample_t);
+} stack_scratch SEC(".maps");
+
 #if defined(DATACRUMBS_MODE) && (DATACRUMBS_MODE == 1)
 DATACRUMBS_MAP(failed_request, u32, u32, 128);
 DATACRUMBS_MAP(agg_map, struct agg_key_t, struct agg_value_t, 4096);
