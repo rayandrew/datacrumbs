@@ -143,6 +143,8 @@ std::shared_ptr<Probe> probe_from_json(json_object* probe_obj) {
       return std::make_shared<CustomProbe>(CustomProbe::fromJson(probe_obj));
     case ProbeType::TRACEPOINT:
       return std::make_shared<TracepointProbe>(TracepointProbe::fromJson(probe_obj));
+    case ProbeType::PERF_EVENT:
+      return std::make_shared<PerfEventProbe>(PerfEventProbe::fromJson(probe_obj));
     default:
       return nullptr;
   }
@@ -159,6 +161,7 @@ bool is_supported_runtime_probe_type(ProbeType type) {
     case ProbeType::SYSCALLS:
     case ProbeType::USDT:
     case ProbeType::TRACEPOINT:
+    case ProbeType::PERF_EVENT:
       return true;
     default:
       return false;

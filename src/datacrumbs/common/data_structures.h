@@ -131,6 +131,8 @@ class Probe {
         aggregate(other.aggregate),
         hot(other.hot),
         capture_stack(other.capture_stack),
+        sample_freq(other.sample_freq),
+        stack_dump_ratio(other.stack_dump_ratio),
         name(other.name),
         functions(other.functions),
         function_arguments(other.function_arguments) {
@@ -145,6 +147,8 @@ class Probe {
         aggregate(other.aggregate),
         hot(other.hot),
         capture_stack(other.capture_stack),
+        sample_freq(other.sample_freq),
+        stack_dump_ratio(other.stack_dump_ratio),
         name(std::move(other.name)),
         functions(std::move(other.functions)),
         function_arguments(std::move(other.function_arguments)) {
@@ -159,6 +163,9 @@ class Probe {
   bool aggregate = false;        // accumulate count/duration instead of emitting per-event records
   bool hot = false;  // uprobes: route to bpftime userspace (no kernel trap, args dropped)
   bool capture_stack = false;  // tracepoints: grab the user call stack at the event
+  unsigned int sample_freq = 0;       // perf_event: samples/sec (0 = the attach-side default)
+  unsigned int stack_dump_ratio = 0;  // 1-in-N raw regs+stack dumps (0 = the per-type default);
+                                      // must be a power of two, it becomes a prandom mask
   std::string name;  // Name of the probe
   std::vector<std::string> functions;  // List of functions or arguments for the probe
   std::unordered_map<std::string, std::vector<ProbeArgCaptureSpec>>
@@ -189,6 +196,9 @@ class Probe {
     if (hot) json_object_object_add(j, "hot", json_object_new_boolean(true));
     if (capture_stack)
       json_object_object_add(j, "capture_stack", json_object_new_boolean(true));
+    if (sample_freq) json_object_object_add(j, "sample_freq", json_object_new_int(sample_freq));
+    if (stack_dump_ratio)
+      json_object_object_add(j, "stack_dump_ratio", json_object_new_int(stack_dump_ratio));
     json_object_object_add(j, "name", json_object_new_string(name.c_str()));
 
     json_object* funcs = json_object_new_array();
@@ -235,6 +245,12 @@ class Probe {
     }
     if (json_object* h = json_object_object_get(j, "hot")) {
       p.hot = json_object_get_boolean(h);
+    }
+    if (json_object* sf = json_object_object_get(j, "sample_freq")) {
+      p.sample_freq = json_object_get_int(sf);
+    }
+    if (json_object* sd = json_object_object_get(j, "stack_dump_ratio")) {
+      p.stack_dump_ratio = json_object_get_int(sd);
     }
     json_object* name_obj = json_object_object_get(j, "name");
     if (name_obj) p.name = json_object_get_string(name_obj);
@@ -475,10 +491,35 @@ struct TracepointProbe : public Probe {
     p.trace_event_type = base.trace_event_type;
     p.system_wide = base.system_wide;
     p.capture_stack = base.capture_stack;
+    p.stack_dump_ratio = base.stack_dump_ratio;
     p.name = base.name;
     p.functions = base.functions;
     p.function_arguments = base.function_arguments;
     p.aggregate = base.aggregate;
+    return p;
+  }
+};
+
+// Frequency-based on-CPU sampler. functions hold the perf event to sample on ("cpu-clock",
+// "task-clock", "cycles", "instructions"); each becomes one per-cpu perf_event_open at sample_freq.
+struct PerfEventProbe : public Probe {
+ public:
+  PerfEventProbe() : Probe(ProbeType::PERF_EVENT) {}
+  PerfEventProbe(const PerfEventProbe& other) : Probe(other) {}
+  bool validate() const override { return Probe::validate(); }
+  json_object* toJson(bool include_functions = true) const override {
+    return Probe::toJson(include_functions);
+  }
+  static PerfEventProbe fromJson(const json_object* j) {
+    PerfEventProbe p;
+    Probe base = Probe::fromJson(j);
+    p.type = base.type;
+    p.trace_event_type = base.trace_event_type;
+    p.system_wide = base.system_wide;
+    p.sample_freq = base.sample_freq;
+    p.stack_dump_ratio = base.stack_dump_ratio;
+    p.name = base.name;
+    p.functions = base.functions;
     return p;
   }
 };
@@ -580,6 +621,8 @@ class CaptureProbe {
   bool aggregate = false;    // accumulate count/duration, propagated to the emitted Probe
   bool hot = false;          // uprobes: route to bpftime userspace, propagated to the emitted Probe
   bool capture_stack = false;  // tracepoints: grab the user call stack, propagated to the Probe
+  unsigned int sample_freq = 0;       // perf_event: samples/sec, propagated to the emitted Probe
+  unsigned int stack_dump_ratio = 0;  // 1-in-N raw stack dumps, propagated to the emitted Probe
   std::string hot_exclude;   // hot uprobe layers: functions matching this regex are split off to a
                              // kernel uprobe (frida-unsafe fns, e.g. ones that corrupt a DOCA send)
   std::vector<std::string>

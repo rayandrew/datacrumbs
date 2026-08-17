@@ -684,7 +684,7 @@ bool ProbeManagerService::validate_signing_payload(const std::string& signing_pa
 
       const int probe_type_value = json_object_get_int(type_obj);
       if (probe_type_value < static_cast<int>(datacrumbs::ProbeType::SYSCALLS) ||
-          probe_type_value > static_cast<int>(datacrumbs::ProbeType::TRACEPOINT)) {
+          probe_type_value > static_cast<int>(datacrumbs::ProbeType::PERF_EVENT)) {
         errors->push_back(context + ".type contains invalid probe type value");
         ok = false;
         continue;
@@ -692,8 +692,9 @@ bool ProbeManagerService::validate_signing_payload(const std::string& signing_pa
       const auto probe_type = static_cast<datacrumbs::ProbeType>(probe_type_value);
 
       std::unordered_set<std::string> required_keys = {"type", "name", "functions"};
-      std::unordered_set<std::string> optional_keys = {"function_arguments", "trace_event_type",
-                                                       "system_wide", "aggregate", "hot", "capture_stack"};
+      std::unordered_set<std::string> optional_keys = {
+          "function_arguments", "trace_event_type", "system_wide",     "aggregate", "hot",
+          "capture_stack",      "sample_freq",      "stack_dump_ratio"};
       if (probe_type == datacrumbs::ProbeType::UPROBE) {
         required_keys.insert("binary_path");
         required_keys.insert("include_offsets");

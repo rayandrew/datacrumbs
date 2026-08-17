@@ -33,6 +33,7 @@ enum datacrumbs_runtime_probe_kind_t {
   DATACRUMBS_RUNTIME_PROBE_KIND_SYSCALL = 3,
   DATACRUMBS_RUNTIME_PROBE_KIND_USDT = 4,
   DATACRUMBS_RUNTIME_PROBE_KIND_TRACEPOINT = 5,
+  DATACRUMBS_RUNTIME_PROBE_KIND_PERF_EVENT = 6,
 };
 
 struct generic_event_t {
@@ -100,6 +101,7 @@ struct runtime_event_config_t {
   unsigned int system_wide;    // tracepoints: 1 => skip the pid gate (capture on all pids)
   unsigned int aggregate;      // 1 => accumulate count/duration instead of emitting per-event
   unsigned int capture_stack;  // 1 => grab the user call stack (bpf_get_stackid, BPF_F_USER_STACK)
+  unsigned int stack_dump_mask;  // raw regs+stack snapshot taken when (prandom & mask) == 0
   unsigned int arg_count;
   unsigned int arg_index[DATACRUMBS_MAX_CAPTURE_ARGS];
   unsigned int arg_num_bytes[DATACRUMBS_MAX_CAPTURE_ARGS];

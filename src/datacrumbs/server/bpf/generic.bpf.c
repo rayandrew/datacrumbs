@@ -7,6 +7,13 @@ int trace_generic_tracepoint(void* ctx) {
   return generic_point(ctx, cookie);  // ctx = the raw tracepoint record (for field decode)
 }
 
+SEC("perf_event")
+int trace_generic_perf_sample(struct bpf_perf_event_data* ctx) {
+  const unsigned long long cookie = bpf_get_attach_cookie(ctx);
+  DBG_PRINTK("perf sample cookie=%llu", cookie);
+  return generic_sample(ctx, cookie);
+}
+
 SEC("kprobe")
 int BPF_KPROBE(trace_generic_kprobe_entry) {
   const unsigned long long cookie = bpf_get_attach_cookie(ctx);

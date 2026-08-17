@@ -762,10 +762,12 @@ static inline __attribute__((always_inline)) int usdt_exit(struct pt_regs* ctx, 
 
 #if defined(DATACRUMBS_ENABLE) && (DATACRUMBS_ENABLE == 1) && defined(DATACRUMBS_MODE) && \
     (DATACRUMBS_MODE == 1)
-// Sampled raw stack snapshot (regs + stack bytes from sp) for offline DWARF unwinding across
-// frame-pointer-less libs. ~1/64 to bound volume; own ringbuf record tagged with a sentinel type.
-static inline __attribute__((always_inline)) void capture_stack_sample(u64 id, u64 event_id, u64 ts) {
-  if ((bpf_get_prandom_u32() & 63) != 0) return;
+// Raw stack snapshot (regs + stack bytes from sp) for offline DWARF unwinding across
+// frame-pointer-less libs. Own ringbuf record tagged with a sentinel type. Each costs
+// DATACRUMBS_STACKDUMP_BYTES, so dump_mask subsamples 1-in-(mask+1) to bound volume.
+static inline __attribute__((always_inline)) void capture_stack_sample(u64 id, u64 event_id, u64 ts,
+                                                                       u32 dump_mask) {
+  if (dump_mask && (bpf_get_prandom_u32() & dump_mask) != 0) return;
   u32 zero = 0;
   struct stack_sample_t* ss = bpf_map_lookup_elem(&stack_scratch, &zero);
   if (!ss) return;
@@ -809,10 +811,11 @@ static inline __attribute__((always_inline)) int generic_point(void* ctx, u64 at
   // at sched_switch current is the blocking task (waker at sched_wakeup), so its stack is the edge.
   // Prefer the user stack (needs frame pointers); fall back to the kernel stack if the walk fails.
   event->stack_id = -1;
+  event->pmu_count = 0;  // no entry snapshot on a point event; leaving it unset ships stack garbage
   if (config->capture_stack) {
     event->stack_id = bpf_get_stackid(ctx, &stack_map, BPF_F_USER_STACK);
     if (event->stack_id < 0) event->stack_id = bpf_get_stackid(ctx, &stack_map, 0);
-    capture_stack_sample(key.id, event_id, now);
+    capture_stack_sample(key.id, event_id, now, config->stack_dump_mask);
   }
   event->arg_count = config->arg_count;
 #pragma unroll
@@ -853,8 +856,43 @@ static inline __attribute__((always_inline)) int generic_point(void* ctx, u64 at
   DATACRUMBS_EVENT_SUBMIT(event, key.id, event_id);
   return 0;
 }
+
+// Frequency-based on-CPU sampler. A busy-poll spin never blocks (no sched edge) and a uprobe on a
+// hot poll fn inflates its own frame, so sampling is the only unbiased attribution for it. Emits
+// the point event plus the raw stack snapshot. Not rate-limited: dropping samples skews the
+// profile, so bound volume with sample_freq instead.
+static inline __attribute__((always_inline)) int generic_sample(void* ctx, u64 attach_cookie) {
+  const u64 now = bpf_ktime_get_ns();
+  const struct runtime_event_config_t* config = resolve_event_config(attach_cookie);
+  if (config == NULL) return 0;
+  const u64 event_id = config->event_id;
+  struct fn_key_t key = {};
+  if (config->system_wide) {
+    key.id = bpf_get_current_pid_tgid();
+  } else {
+    u64 start_ts = 0;
+    if (!need_tracing(&key, &start_ts)) return 0;  // the sampler is per-cpu; gate to traced pids
+  }
+  struct generic_event_t* event;
+  DATACRUMBS_RB_RESERVE(output, struct generic_event_t, event);
+  event->type = config->probe_kind;
+  event->id = key.id;
+  event->event_id = event_id;
+  event->ts = now;
+  event->dur = 1;  // a sample is instantaneous; its weight is 1/sample_freq, applied offline
+  event->arg_count = 0;
+  event->pmu_count = 0;
+  event->stack_id = bpf_get_stackid(ctx, &stack_map, BPF_F_USER_STACK);
+  if (event->stack_id < 0) event->stack_id = bpf_get_stackid(ctx, &stack_map, 0);
+  DATACRUMBS_EVENT_SUBMIT(event, key.id, event_id);
+  capture_stack_sample(key.id, event_id, now, config->stack_dump_mask);
+  return 0;
+}
 #else
 static inline __attribute__((always_inline)) int generic_point(void* ctx, u64 attach_cookie) {
+  return 0;
+}
+static inline __attribute__((always_inline)) int generic_sample(void* ctx, u64 attach_cookie) {
   return 0;
 }
 #endif

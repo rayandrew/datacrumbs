@@ -9,6 +9,11 @@
 #include <datacrumbs/server/process/telemetry/perf_telemetry_sampler.h>
 #include <datacrumbs/server/process/telemetry/telemetry_sampler.h>
 
+// system headers
+#include <linux/perf_event.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
 // std headers
 #include <algorithm>
 #include <cstdlib>
@@ -98,21 +103,61 @@ static unsigned int runtime_probe_kind(datacrumbs::ProbeType probe_type) {
       return DATACRUMBS_RUNTIME_PROBE_KIND_USDT;
     case datacrumbs::ProbeType::TRACEPOINT:
       return DATACRUMBS_RUNTIME_PROBE_KIND_TRACEPOINT;
+    case datacrumbs::ProbeType::PERF_EVENT:
+      return DATACRUMBS_RUNTIME_PROBE_KIND_PERF_EVENT;
     default:
       return 0;
   }
 }
 
-static int populate_event_arg_config(
-    int map_fd, uint64_t cookie, uint64_t event_id, datacrumbs::ProbeType probe_type,
-    const std::vector<datacrumbs::ProbeArgCaptureSpec>* arg_specs, bool system_wide = false,
-    bool aggregate = false, bool capture_stack = false) {
+// 1-in-N raw stack dumps -> the prandom mask the BPF side tests. N must be a power of two; anything
+// else would silently sample at the next one down, so fall back to every sample and say so.
+static unsigned int stack_dump_mask_from_ratio(unsigned int ratio, const char* context) {
+  if (ratio <= 1) return 0;
+  if ((ratio & (ratio - 1)) != 0) {
+    DC_LOG_WARN("%s: stack_dump_ratio=%u is not a power of two; dumping every sample", context,
+                ratio);
+    return 0;
+  }
+  return ratio - 1;
+}
+
+// Prime, so the sampler cannot lock step with a periodic workload and profile the same phase.
+static constexpr unsigned int kDefaultSampleFreq = 997;
+
+static bool resolve_perf_event(const std::string& name, unsigned int* type,
+                               unsigned long long* config) {
+  if (name == "cpu-clock") {
+    *type = PERF_TYPE_SOFTWARE;
+    *config = PERF_COUNT_SW_CPU_CLOCK;
+  } else if (name == "task-clock") {
+    *type = PERF_TYPE_SOFTWARE;
+    *config = PERF_COUNT_SW_TASK_CLOCK;
+  } else if (name == "cycles" || name == "cpu-cycles") {
+    *type = PERF_TYPE_HARDWARE;
+    *config = PERF_COUNT_HW_CPU_CYCLES;
+  } else if (name == "instructions") {
+    *type = PERF_TYPE_HARDWARE;
+    *config = PERF_COUNT_HW_INSTRUCTIONS;
+  } else {
+    return false;
+  }
+  return true;
+}
+
+static int populate_event_arg_config(int map_fd, uint64_t cookie, uint64_t event_id,
+                                     datacrumbs::ProbeType probe_type,
+                                     const std::vector<datacrumbs::ProbeArgCaptureSpec>* arg_specs,
+                                     bool system_wide = false, bool aggregate = false,
+                                     bool capture_stack = false,
+                                     unsigned int stack_dump_mask = 63) {
   runtime_event_config_t config = {};
   config.event_id = event_id;
   config.probe_kind = runtime_probe_kind(probe_type);
   config.system_wide = system_wide ? 1u : 0u;
   config.aggregate = aggregate ? 1u : 0u;
   config.capture_stack = capture_stack ? 1u : 0u;
+  config.stack_dump_mask = stack_dump_mask;
   if (arg_specs != nullptr) {
     config.arg_count = std::min<unsigned int>(arg_specs->size(), DATACRUMBS_MAX_CAPTURE_ARGS);
     for (unsigned int index = 0; index < config.arg_count; ++index) {
@@ -281,6 +326,7 @@ static int attach_runtime_probes(datacrumbs::EventProcessor* event_processor,
   auto* usdt_exit = bpf_object__find_program_by_name(skel->obj, "trace_generic_usdt_exit");
   auto* tracepoint_prog =
       bpf_object__find_program_by_name(skel->obj, "trace_generic_tracepoint");
+  auto* perf_sample_prog = bpf_object__find_program_by_name(skel->obj, "trace_generic_perf_sample");
   const int event_arg_config_fd = bpf_map__fd(skel->maps.event_arg_config_map);
 
   if (event_arg_config_fd < 0) {
@@ -506,9 +552,11 @@ static int attach_runtime_probes(datacrumbs::EventProcessor* event_processor,
             parse_tracepoint_fields(tp_category, tp_name);
         const std::vector<datacrumbs::ProbeArgCaptureSpec>* tp_specs =
             tp_fields.empty() ? probe->getArgSpecs(function_name) : &tp_fields;
-        if (populate_event_arg_config(event_arg_config_fd, current_cookie, *event_id, probe->type,
-                                      tp_specs, probe->system_wide, false,
-                                      probe->capture_stack) != 0) {
+        if (populate_event_arg_config(
+                event_arg_config_fd, current_cookie, *event_id, probe->type, tp_specs,
+                probe->system_wide, false, probe->capture_stack,
+                stack_dump_mask_from_ratio(probe->stack_dump_ratio ? probe->stack_dump_ratio : 64,
+                                           function_name.c_str())) != 0) {
           total_failed += 1;
           continue;
         }
@@ -527,6 +575,67 @@ static int attach_runtime_probes(datacrumbs::EventProcessor* event_processor,
           continue;
         }
         g_runtime_links[*event_id].push_back(tp_link);
+        config_manager->record_successful_runtime_probe(probe, function_name);
+        runtime_probe_state_updated = true;
+        total_attached += 1;
+      } else if (probe->type == datacrumbs::ProbeType::PERF_EVENT) {
+        total_requested += 1;  // one sampler, fanned out over the online cpus
+        unsigned int pe_type = 0;
+        unsigned long long pe_config = 0;
+        if (perf_sample_prog == nullptr ||
+            !resolve_perf_event(function_name, &pe_type, &pe_config)) {
+          DC_LOG_WARN(
+              "perf_event %s: unknown event (want cpu-clock/task-clock/cycles/instructions)",
+              function_name.c_str());
+          config_manager->record_invalid_runtime_probe(probe, function_name);
+          runtime_probe_state_updated = true;
+          total_failed += 1;
+          continue;
+        }
+        const unsigned int sample_freq =
+            probe->sample_freq ? probe->sample_freq : kDefaultSampleFreq;
+        if (populate_event_arg_config(
+                event_arg_config_fd, current_cookie, *event_id, probe->type, nullptr,
+                probe->system_wide, false, true,
+                stack_dump_mask_from_ratio(probe->stack_dump_ratio, function_name.c_str())) != 0) {
+          total_failed += 1;
+          continue;
+        }
+        struct perf_event_attr attr = {};
+        attr.size = sizeof(attr);
+        attr.type = pe_type;
+        attr.config = pe_config;
+        attr.freq = 1;
+        attr.sample_freq = sample_freq;
+        int attached_cpus = 0;
+        const int cpu_count = libbpf_num_possible_cpus();
+        for (int cpu = 0; cpu < cpu_count; ++cpu) {
+          // system-wide (pid=-1) per cpu; the BPF pid gate narrows it to traced processes, so a
+          // thread that migrates cpus stays sampled.
+          const int perf_fd =
+              syscall(__NR_perf_event_open, &attr, -1, cpu, -1, PERF_FLAG_FD_CLOEXEC);
+          if (perf_fd < 0) continue;  // offline cpu, or the hw event is unavailable here
+          struct bpf_perf_event_opts pe_opts = {};
+          pe_opts.sz = sizeof(pe_opts);
+          pe_opts.bpf_cookie = current_cookie;
+          auto* pe_link = bpf_program__attach_perf_event_opts(perf_sample_prog, perf_fd, &pe_opts);
+          if (libbpf_get_error(pe_link)) {
+            close(perf_fd);
+            continue;
+          }
+          g_runtime_links[*event_id].push_back(pe_link);
+          ++attached_cpus;
+        }
+        if (attached_cpus == 0) {
+          DC_LOG_WARN("perf_event %s: attached on 0 cpus (perf_event_paranoid? not root?)",
+                      function_name.c_str());
+          config_manager->record_invalid_runtime_probe(probe, function_name);
+          runtime_probe_state_updated = true;
+          total_failed += 1;
+          continue;
+        }
+        DC_LOG_INFO("perf_event %s: sampling at %u Hz on %d cpus", function_name.c_str(),
+                    sample_freq, attached_cpus);
         config_manager->record_successful_runtime_probe(probe, function_name);
         runtime_probe_state_updated = true;
         total_attached += 1;

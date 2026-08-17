@@ -43,6 +43,7 @@ enum class ProbeType : uint8_t {
   USDT = 3,
   CUSTOM = 4,
   TRACEPOINT = 5,
+  PERF_EVENT = 6,
 };
 
 // Converts string to ProbeType enum. Throws if invalid.
@@ -66,11 +67,14 @@ inline void convert(const std::string& s, ProbeType& type) {
   } else if (s == "tracepoint") {
     type = ProbeType::TRACEPOINT;
     DC_LOG_DEBUG("Converted string '%s' to ProbeType::TRACEPOINT", s.c_str());
+  } else if (s == "perf_event") {
+    type = ProbeType::PERF_EVENT;
+    DC_LOG_DEBUG("Converted string '%s' to ProbeType::PERF_EVENT", s.c_str());
   } else {
     DC_LOG_INFO("Unknown ProbeType string: '%s'", s.c_str());
     throw std::invalid_argument("Unknown ProbeType: " + s +
                                 ". Valid types are: syscalls, kprobe, uprobe, usdt, custom, "
-                                "or tracepoint.");
+                                "tracepoint, or perf_event.");
   }
   DC_LOG_TRACE("Exiting convert for ProbeType");
 }
@@ -83,6 +87,7 @@ enum class CaptureType : uint8_t {
   USDT = 3,
   CUSTOM = 4,  // Custom capture type for user-defined probes
   TRACEPOINT = 5,
+  PERF_EVENT = 6,
 };
 
 // Converts string to CaptureType enum. Throws if invalid.
@@ -106,11 +111,14 @@ inline void convert(const std::string& s, CaptureType& type) {
   } else if (s == "tracepoint") {
     type = CaptureType::TRACEPOINT;
     DC_LOG_DEBUG("Converted string '%s' to CaptureType::TRACEPOINT", s.c_str());
+  } else if (s == "perf_event") {
+    type = CaptureType::PERF_EVENT;
+    DC_LOG_DEBUG("Converted string '%s' to CaptureType::PERF_EVENT", s.c_str());
   } else {
     DC_LOG_INFO("Unknown CaptureType string: '%s'", s.c_str());
     throw std::invalid_argument("Unknown CaptureType: " + s +
                                 ". Valid types are: header, binary, ksym, usdt, custom, "
-                                "or tracepoint.");
+                                "tracepoint, or perf_event.");
   }
   DC_LOG_TRACE("Exiting convert for CaptureType");
 }
