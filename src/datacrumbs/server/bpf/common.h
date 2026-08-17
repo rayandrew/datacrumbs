@@ -780,6 +780,10 @@ static inline __attribute__((always_inline)) void capture_stack_sample(u64 id, u
   ss->uregs[1] = BPF_CORE_READ(r, sp);
   ss->uregs[2] = BPF_CORE_READ(r, regs[29]);
   ss->uregs[3] = BPF_CORE_READ(r, regs[30]);
+  ss->cpu = bpf_get_smp_processor_id();
+  ss->pmu_count = pmu_active_count();
+  __builtin_memset(ss->pmu, 0, sizeof(ss->pmu));
+  if (ss->pmu_count) pmu_read(ss->pmu, ss->pmu_count);
   long ok = bpf_probe_read_user(ss->stackdump, DATACRUMBS_STACKDUMP_BYTES, (void*)ss->uregs[1]);
   ss->stackdump_len = ok == 0 ? DATACRUMBS_STACKDUMP_BYTES : 0;
   bpf_ringbuf_output(&output, ss, sizeof(*ss), 0);

@@ -17,12 +17,17 @@ static int DATACRUMBS_FAILED_EVENTS_KEY = 2;
 // A raw user stack snapshot (regs + N bytes from sp) for capture_stack probes whose FP walk is too
 // shallow (crosses a frame-pointer-less vendor lib). Emitted sampled on its own ringbuf record; the
 // offline analysis replays each module's .eh_frame CFI over regs+stackdump. uregs = pc, sp, fp, lr.
+// pmu[] holds the counters' running totals, not a delta: a sample is a point, so the work between
+// two consecutive samples on the same cpu is what the deltas measure. Hence cpu is captured too.
 struct stack_sample_t {
   unsigned int type;  // = DATACRUMBS_STACK_SAMPLE_TYPE
   unsigned long long id;
   unsigned long long event_id;
   unsigned long long ts;
   unsigned long long uregs[4];
+  unsigned int cpu;
+  unsigned int pmu_count;
+  unsigned long long pmu[DATACRUMBS_MAX_PMU];
   unsigned int stackdump_len;
   unsigned char stackdump[DATACRUMBS_STACKDUMP_BYTES];
 };
