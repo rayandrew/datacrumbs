@@ -776,10 +776,13 @@ static inline __attribute__((always_inline)) void capture_stack_sample(u64 id, u
   ss->id = id;
   ss->event_id = event_id;
   ss->ts = ts;
-  ss->uregs[0] = BPF_CORE_READ(r, pc);
-  ss->uregs[1] = BPF_CORE_READ(r, sp);
-  ss->uregs[2] = BPF_CORE_READ(r, regs[29]);
-  ss->uregs[3] = BPF_CORE_READ(r, regs[30]);
+  // pc/sp/fp/ra via bpf_tracing's CO-RE accessors: the raw field names are per-arch (aarch64 pc and
+  // regs[29]/regs[30] do not exist on x86_64), and the server now builds for both the DPU and the
+  // host. uregs[3] is the link register on aarch64 and the RA slot address on x86_64.
+  ss->uregs[0] = PT_REGS_IP_CORE(r);
+  ss->uregs[1] = PT_REGS_SP_CORE(r);
+  ss->uregs[2] = PT_REGS_FP_CORE(r);
+  ss->uregs[3] = PT_REGS_RET_CORE(r);
   ss->cpu = bpf_get_smp_processor_id();
   ss->pmu_count = pmu_active_count();
   __builtin_memset(ss->pmu, 0, sizeof(ss->pmu));
