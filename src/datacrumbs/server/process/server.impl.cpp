@@ -873,11 +873,16 @@ static int main_process(datacrumbs::EventProcessor* event_processor) {
   // System-wide interval telemetry as Chrome COUNTER tracks on their own thread. Perf-backed
   // sources (uncore) only exist when hw counters are compiled in; everything else reads sysfs.
   std::vector<datacrumbs::TelemetrySource> sysfs_sources;
+  std::vector<datacrumbs::TelemetrySource> ethtool_sources;
 #if defined(DATACRUMBS_ENABLE_HW_COUNTERS) && (DATACRUMBS_ENABLE_HW_COUNTERS == 1)
   std::vector<datacrumbs::TelemetrySource> perf_sources;
 #endif
   for (const auto& src : event_processor->configManager_->telemetry_sources) {
     const bool is_perf = !src.counters.empty() && !src.counters[0].perf_event.empty();
+    if (is_perf && src.counters[0].perf_event == "ethtool") {
+      ethtool_sources.push_back(src);
+      continue;
+    }
 #if defined(DATACRUMBS_ENABLE_HW_COUNTERS) && (DATACRUMBS_ENABLE_HW_COUNTERS == 1)
     if (is_perf) {
       perf_sources.push_back(src);
@@ -893,6 +898,11 @@ static int main_process(datacrumbs::EventProcessor* event_processor) {
                                                   std::move(sysfs_sources), telemetry_interval,
                                                   &event_processor->event_index);
   sysfs_sampler.start();
+  datacrumbs::EthtoolTelemetrySampler ethtool_sampler(event_processor->writer_,
+                                                      std::move(ethtool_sources),
+                                                      telemetry_interval,
+                                                      &event_processor->event_index);
+  ethtool_sampler.start();
 #if defined(DATACRUMBS_ENABLE_HW_COUNTERS) && (DATACRUMBS_ENABLE_HW_COUNTERS == 1)
   datacrumbs::PerfTelemetrySampler perf_sampler(event_processor->writer_, std::move(perf_sources),
                                                 telemetry_interval, &event_processor->event_index);
@@ -981,6 +991,7 @@ static int main_process(datacrumbs::EventProcessor* event_processor) {
   }
 
   sysfs_sampler.stop();
+  ethtool_sampler.stop();
 #if defined(DATACRUMBS_ENABLE_HW_COUNTERS) && (DATACRUMBS_ENABLE_HW_COUNTERS == 1)
   perf_sampler.stop();
 #endif

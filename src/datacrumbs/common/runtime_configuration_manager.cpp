@@ -631,6 +631,29 @@ void RuntimeConfigurationManager::derive_telemetry_sources() {
       rdma.counters.push_back({c, hw + c, 1.0});
     telemetry_sources.push_back(std::move(rdma));
   }
+
+  // mlx5 vport counters, read via SIOCETHTOOL. Separate env because these are keyed by NETDEV, not
+  // by ibdev, and they are the only source that sees the DevX/DOCA RDMA bytes the IB port counters
+  // miss. Counter `path` holds the ethtool stat name; `perf_event` marks the sampler to use.
+  const char* netdevs = std::getenv("DATACRUMBS_NIC_NETDEVS");
+  if (netdevs == nullptr || *netdevs == '\0') return;
+  std::stringstream ns(netdevs);
+  while (std::getline(ns, token, ',')) {
+    const auto begin = token.find_first_not_of(" \t");
+    if (begin == std::string::npos) continue;
+    const auto end = token.find_last_not_of(" \t");
+    const std::string dev = token.substr(begin, end - begin + 1);
+    TelemetrySource vp;
+    vp.cat = "nic_vport";
+    vp.name = dev;
+    for (const char* c :
+         {"vport_rdma_unicast_bytes", "vport_rdma_unicast_packets", "rx_vport_rdma_unicast_bytes",
+          "rx_vport_rdma_unicast_packets", "tx_vport_rdma_unicast_bytes",
+          "tx_vport_rdma_unicast_packets", "rx_packets_phy", "tx_packets_phy", "rx_bytes_phy",
+          "tx_bytes_phy", "rx_discards_phy", "tx_discards_phy", "rx_out_of_buffer"})
+      vp.counters.push_back({c, c, 1.0, "ethtool"});
+    telemetry_sources.push_back(std::move(vp));
+  }
 }
 
 // Telemetry sources get event ids in a high, distinct range so they never collide with probe ids

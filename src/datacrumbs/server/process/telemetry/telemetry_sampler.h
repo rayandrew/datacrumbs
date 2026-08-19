@@ -62,6 +62,32 @@ class SysfsTelemetrySampler : public TelemetrySampler {
   bool read_raw(std::size_t src, std::size_t ctr, unsigned long long* out) override;
 };
 
+// Driver stats via the SIOCETHTOOL ioctl (ETHTOOL_GSTRINGS + ETHTOOL_GSTATS), i.e. what
+// `ethtool -S` prints, read in-process rather than by forking. This is the only place the mlx5
+// vport_* counters live: the sysfs IB port counters are blind to the DevX/DOCA RDMA path
+// (rx_write_requests stays ~0 while the link moves GB).
+//
+// `source.name` is the netdev; each counter's `path` holds the ethtool stat NAME, resolved to an
+// index once at start. ETHTOOL_GSTATS returns every stat in one call, so the array is fetched on
+// counter 0 of each source and reused for the rest of that tick.
+class EthtoolTelemetrySampler : public TelemetrySampler {
+ public:
+  using TelemetrySampler::TelemetrySampler;
+  ~EthtoolTelemetrySampler() override { stop(); }
+
+ protected:
+  void on_start() override;
+  void on_stop() override;
+  bool read_raw(std::size_t src, std::size_t ctr, unsigned long long* out) override;
+
+ private:
+  bool refresh(std::size_t src);
+
+  int fd_ = -1;
+  std::vector<std::vector<int>> index_;              // [source][counter] -> ethtool stat index
+  std::vector<std::vector<unsigned long long>> values_;  // [source] full stat array this tick
+};
+
 }  // namespace datacrumbs
 
 #endif  // DATACRUMBS_SERVER_PROCESS_TELEMETRY_SAMPLER_H__
