@@ -211,5 +211,79 @@ inline std::string remove_non_utf8(const std::string& input) {
   return result;
 }
 
+/**
+ * @brief Translate a shell-style glob into an anchored regex.
+ *
+ * Supports `*`, `?`, `[...]` (with a leading `!` or `^` negation) and `{a,b}` alternation; every
+ * other character is escaped, so a symbol like `std::vector<int>::push_back` matches literally.
+ * The result is anchored, which gives a glob whole-string semantics under both std::regex_match
+ * and std::regex_search - callers use both.
+ */
+inline std::string glob_to_regex(const std::string& glob) {
+  std::string re = "^";
+  int brace_depth = 0;
+  for (size_t i = 0; i < glob.size(); ++i) {
+    const char c = glob[i];
+    switch (c) {
+      case '*':
+        re += ".*";
+        break;
+      case '?':
+        re += '.';
+        break;
+      case '[': {
+        const size_t close = glob.find(']', i + 1);
+        if (close == std::string::npos) {
+          re += "\\[";  // unterminated class: literal, as the shell treats it
+          break;
+        }
+        re += '[';
+        size_t j = i + 1;
+        if (glob[j] == '!' || glob[j] == '^') {
+          re += '^';
+          ++j;
+        }
+        for (; j < close; ++j) {
+          if (glob[j] == '\\' || glob[j] == '[') re += '\\';
+          re += glob[j];
+        }
+        re += ']';
+        i = close;
+        break;
+      }
+      case '{':
+        re += '(';
+        ++brace_depth;
+        break;
+      case '}':
+        if (brace_depth > 0) {
+          re += ')';
+          --brace_depth;
+        } else {
+          re += "\\}";
+        }
+        break;
+      case ',':
+        re += brace_depth > 0 ? "|" : "\\,";
+        break;
+      case '\\':
+        if (i + 1 < glob.size()) {
+          re += '\\';
+          re += glob[++i];
+        } else {
+          re += "\\\\";
+        }
+        break;
+      default:
+        if (std::string("^$.|+()").find(c) != std::string::npos) re += '\\';
+        re += c;
+        break;
+    }
+  }
+  while (brace_depth-- > 0) re += ')';  // unterminated brace: close it rather than fail to compile
+  re += '$';
+  return re;
+}
+
 }  // namespace utils
 }  // namespace datacrumbs
