@@ -550,8 +550,14 @@ static int attach_runtime_probes(datacrumbs::EventProcessor* event_processor,
         // them, and register their labels so the writer names them.
         std::vector<datacrumbs::ProbeArgCaptureSpec> tp_fields =
             parse_tracepoint_fields(tp_category, tp_name);
+        // An explicit function_arguments wins over the tracefs auto-parse. The auto-parse takes the
+        // first DATACRUMBS_MAX_CAPTURE_ARGS fields in file order, which for sched_switch fills every
+        // slot before reaching next_pid - the field wake->run (run-queue) latency needs.
+        const auto* yaml_specs = probe->getArgSpecs(function_name);
+        const bool use_yaml = yaml_specs != nullptr && !yaml_specs->empty();
+        if (use_yaml) tp_fields.clear();
         const std::vector<datacrumbs::ProbeArgCaptureSpec>* tp_specs =
-            tp_fields.empty() ? probe->getArgSpecs(function_name) : &tp_fields;
+            use_yaml ? yaml_specs : (tp_fields.empty() ? nullptr : &tp_fields);
         if (populate_event_arg_config(
                 event_arg_config_fd, current_cookie, *event_id, probe->type, tp_specs,
                 probe->system_wide, false, probe->capture_stack,
@@ -560,7 +566,8 @@ static int attach_runtime_probes(datacrumbs::EventProcessor* event_processor,
           total_failed += 1;
           continue;
         }
-        if (!tp_fields.empty()) config_manager->set_runtime_event_arg_specs(*event_id, tp_fields);
+        if (tp_specs != nullptr && !tp_specs->empty())
+          config_manager->set_runtime_event_arg_specs(*event_id, *tp_specs);
         struct bpf_tracepoint_opts tp_opts = {};
         tp_opts.sz = sizeof(tp_opts);
         tp_opts.bpf_cookie = current_cookie;
