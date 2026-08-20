@@ -52,6 +52,12 @@ extern struct {
   __type(key, u32);
   __type(value, struct stack_sample_t);
 } stack_scratch SEC(".maps");
+extern struct {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, u32);
+  __type(value, struct pmu_sample_prev_t);
+} pmu_sample_prev SEC(".maps");
 
 #if defined(DATACRUMBS_MODE) && (DATACRUMBS_MODE == 1)
 DATACRUMBS_MAP_EXTERN(failed_request, u32, u32, 128);
@@ -864,6 +870,32 @@ static inline __attribute__((always_inline)) int generic_point(void* ctx, u64 at
   return 0;
 }
 
+// Counters advanced on this cpu since the previous sample, written into out[]. Returns the count.
+//
+// A sample fires only while the task is on-CPU, so these deltas cover genuinely-running intervals -
+// which is the only PMU form valid for a workload whose slow band is off-CPU, where an entry->exit
+// frame delta spans the blocked gap and reports nonsense.
+static inline __attribute__((always_inline)) u32 pmu_sample_delta(u64* out) {
+  const u32 n = pmu_active_count();
+  if (n == 0) return 0;
+  u64 now[DATACRUMBS_MAX_PMU] = {};
+  pmu_read(now, n);
+  u32 k = 0;
+  struct pmu_sample_prev_t* prev =
+      (struct pmu_sample_prev_t*)bpf_map_lookup_elem(&pmu_sample_prev, &k);
+  if (prev == NULL) return 0;
+  const u32 was_valid = prev->valid;
+#pragma unroll
+  for (u32 i = 0; i < DATACRUMBS_MAX_PMU; ++i) {
+    if (i < n) {
+      out[i] = was_valid && now[i] >= prev->v[i] ? now[i] - prev->v[i] : 0;
+      prev->v[i] = now[i];
+    }
+  }
+  prev->valid = 1;
+  return was_valid ? n : 0;  // first sample on this cpu has no baseline
+}
+
 // Frequency-based on-CPU sampler. A busy-poll spin never blocks (no sched edge) and a uprobe on a
 // hot poll fn inflates its own frame, so sampling is the only unbiased attribution for it. Emits
 // the point event plus the raw stack snapshot. Not rate-limited: dropping samples skews the
@@ -888,7 +920,7 @@ static inline __attribute__((always_inline)) int generic_sample(void* ctx, u64 a
   event->ts = now;
   event->dur = 1;  // a sample is instantaneous; its weight is 1/sample_freq, applied offline
   event->arg_count = 0;
-  event->pmu_count = 0;
+  event->pmu_count = pmu_sample_delta(event->pmu);
   event->stack_id = bpf_get_stackid(ctx, &stack_map, BPF_F_USER_STACK);
   if (event->stack_id < 0) event->stack_id = bpf_get_stackid(ctx, &stack_map, 0);
   DATACRUMBS_EVENT_SUBMIT(event, key.id, event_id);

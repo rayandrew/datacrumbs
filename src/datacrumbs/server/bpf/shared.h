@@ -41,6 +41,13 @@ enum datacrumbs_runtime_probe_kind_t {
   DATACRUMBS_RUNTIME_PROBE_KIND_PERF_EVENT = 6,
 };
 
+// Per-cpu carry for the sampler's PMU deltas. `valid` suppresses the first sample on each cpu,
+// whose "delta" would be the counter's whole history.
+struct pmu_sample_prev_t {
+  unsigned long long v[DATACRUMBS_MAX_PMU];
+  unsigned int valid;
+};
+
 struct generic_event_t {
   unsigned int type;
   unsigned long long id;

@@ -40,6 +40,16 @@ struct {
   __type(value, u32);
 } pmu_ctl SEC(".maps");
 
+// Previous per-counter values on this cpu, so a sample can emit the delta since the last sample
+// rather than a running total. Per-cpu because the counters are opened cpu-scope: differencing
+// across cpus would mix in whatever else ran there.
+struct {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, u32);
+  __type(value, struct pmu_sample_prev_t);
+} pmu_sample_prev SEC(".maps");
+
 // User call stacks for capture_stack probes; the event holds the slot id, the writer reads + symbolizes.
 struct {
   __uint(type, BPF_MAP_TYPE_STACK_TRACE);
