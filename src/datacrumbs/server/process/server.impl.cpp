@@ -149,8 +149,8 @@ static int populate_event_arg_config(int map_fd, uint64_t cookie, uint64_t event
                                      datacrumbs::ProbeType probe_type,
                                      const std::vector<datacrumbs::ProbeArgCaptureSpec>* arg_specs,
                                      bool system_wide = false, bool aggregate = false,
-                                     bool capture_stack = false,
-                                     unsigned int stack_dump_mask = 63) {
+                                     bool capture_stack = false, unsigned int stack_dump_mask = 63,
+                                     const std::string& gate_tid_arg = "") {
   runtime_event_config_t config = {};
   config.event_id = event_id;
   config.probe_kind = runtime_probe_kind(probe_type);
@@ -158,6 +158,17 @@ static int populate_event_arg_config(int map_fd, uint64_t cookie, uint64_t event
   config.aggregate = aggregate ? 1u : 0u;
   config.capture_stack = capture_stack ? 1u : 0u;
   config.stack_dump_mask = stack_dump_mask;
+  if (!gate_tid_arg.empty() && arg_specs != nullptr) {
+    for (unsigned int i = 0; i < arg_specs->size() && i < DATACRUMBS_MAX_CAPTURE_ARGS; ++i) {
+      if ((*arg_specs)[i].label == gate_tid_arg) {
+        config.gate_tid_arg = i + 1;  // 1-based; 0 means no gate
+        break;
+      }
+    }
+    if (config.gate_tid_arg == 0)
+      DC_LOG_WARN("gate_tid_arg '%s' is not a captured arg -> tracepoint stays ungated",
+                  gate_tid_arg.c_str());
+  }
   if (arg_specs != nullptr) {
     config.arg_count = std::min<unsigned int>(arg_specs->size(), DATACRUMBS_MAX_CAPTURE_ARGS);
     for (unsigned int index = 0; index < config.arg_count; ++index) {
@@ -562,7 +573,8 @@ static int attach_runtime_probes(datacrumbs::EventProcessor* event_processor,
                 event_arg_config_fd, current_cookie, *event_id, probe->type, tp_specs,
                 probe->system_wide, false, probe->capture_stack,
                 stack_dump_mask_from_ratio(probe->stack_dump_ratio ? probe->stack_dump_ratio : 64,
-                                           function_name.c_str())) != 0) {
+                                           function_name.c_str()),
+                probe->gate_tid_arg) != 0) {
           total_failed += 1;
           continue;
         }

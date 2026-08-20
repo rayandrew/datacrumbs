@@ -119,6 +119,10 @@ struct runtime_event_config_t {
   unsigned int arg_num_bytes[DATACRUMBS_MAX_CAPTURE_ARGS];
   unsigned int arg_is_pointer[DATACRUMBS_MAX_CAPTURE_ARGS];
   unsigned int arg_offset[DATACRUMBS_MAX_CAPTURE_ARGS];  // byte offset of the field/struct member
+  // system_wide tracepoints only: 1+index of the arg holding a tid; the event is dropped unless
+  // that tid belongs to a traced process. 0 = off. Keeps external-waker identity (the waker is
+  // `current`) while dropping the wakes of every untraced task on the box.
+  unsigned int gate_tid_arg;
 };
 
 struct fn_t {

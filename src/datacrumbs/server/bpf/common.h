@@ -58,6 +58,12 @@ extern struct {
   __type(key, u32);
   __type(value, struct pmu_sample_prev_t);
 } pmu_sample_prev SEC(".maps");
+extern struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, 16384);
+  __type(key, u32);
+  __type(value, u32);
+} traced_tid_map SEC(".maps");
 
 #if defined(DATACRUMBS_MODE) && (DATACRUMBS_MODE == 1)
 DATACRUMBS_MAP_EXTERN(failed_request, u32, u32, 128);
@@ -809,6 +815,16 @@ static inline __attribute__((always_inline)) int generic_point(void* ctx, u64 at
   struct fn_key_t key = {};
   if (config->system_wide) {
     key.id = bpf_get_current_pid_tgid();  // capture on all pids
+    // ... unless the probe names a tid argument to gate on: keep the wakes OF our threads (whoever
+    // the waker is, which is the point of system_wide) and drop every other task's.
+    if (config->gate_tid_arg) {
+      const u32 gi = config->gate_tid_arg - 1;
+      if (gi < DATACRUMBS_MAX_CAPTURE_ARGS) {
+        u32 tid = 0;
+        bpf_probe_read_kernel(&tid, sizeof(tid), (const char*)ctx + config->arg_offset[gi]);
+        if (bpf_map_lookup_elem(&traced_tid_map, &tid) == NULL) return 0;
+      }
+    }
   } else {
     u64 start_ts = 0;
     if (!need_tracing(&key, &start_ts)) return 0;  // default: pid-gated like kprobes
@@ -912,6 +928,10 @@ static inline __attribute__((always_inline)) int generic_sample(void* ctx, u64 a
     u64 start_ts = 0;
     if (!need_tracing(&key, &start_ts)) return 0;  // the sampler is per-cpu; gate to traced pids
   }
+  // Register this thread so a gated system_wide tracepoint can recognise a wake aimed at it.
+  const u32 self_tid = (u32)key.id;
+  const u32 one = 1;
+  bpf_map_update_elem(&traced_tid_map, &self_tid, &one, BPF_ANY);
   struct generic_event_t* event;
   DATACRUMBS_RB_RESERVE(output, struct generic_event_t, event);
   event->type = config->probe_kind;

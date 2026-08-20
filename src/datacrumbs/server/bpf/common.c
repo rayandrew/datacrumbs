@@ -40,6 +40,15 @@ struct {
   __type(value, u32);
 } pmu_ctl SEC(".maps");
 
+// Threads of traced processes, registered as they are seen on-CPU. Lets a system_wide tracepoint
+// gate on a tid it reads from an argument (the wakee), which the tgid-keyed pid_map cannot answer.
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, 16384);
+  __type(key, u32);
+  __type(value, u32);
+} traced_tid_map SEC(".maps");
+
 // Previous per-counter values on this cpu, so a sample can emit the delta since the last sample
 // rather than a running total. Per-cpu because the counters are opened cpu-scope: differencing
 // across cpus would mix in whatever else ran there.

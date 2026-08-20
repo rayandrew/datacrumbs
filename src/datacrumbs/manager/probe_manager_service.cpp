@@ -693,8 +693,8 @@ bool ProbeManagerService::validate_signing_payload(const std::string& signing_pa
 
       std::unordered_set<std::string> required_keys = {"type", "name", "functions"};
       std::unordered_set<std::string> optional_keys = {
-          "function_arguments", "trace_event_type", "system_wide",     "aggregate", "hot",
-          "capture_stack",      "sample_freq",      "stack_dump_ratio"};
+          "function_arguments", "trace_event_type", "system_wide",      "aggregate", "hot",
+          "capture_stack",      "sample_freq",      "stack_dump_ratio", "gate_tid_arg"};
       if (probe_type == datacrumbs::ProbeType::UPROBE) {
         required_keys.insert("binary_path");
         required_keys.insert("include_offsets");
