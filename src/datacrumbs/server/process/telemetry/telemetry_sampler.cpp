@@ -2,7 +2,9 @@
 #include <datacrumbs/common/logging.h>
 #include <datacrumbs/common/typedefs.h>
 #include <datacrumbs/server/process/telemetry/telemetry_sampler.h>
+#include <bpf/bpf.h>
 #include <linux/ethtool.h>
+#include <linux/perf_event.h>
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
 #include <rdma/rdma_netlink.h>
@@ -10,9 +12,11 @@
 #include <net/if.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -358,6 +362,95 @@ bool RdmaQpTelemetrySampler::read_raw(std::size_t src, std::size_t ctr, unsigned
   const auto it = values_[src].find(sources_[src].counters[ctr].path);
   if (it == values_[src].end()) return false;
   *out = it->second;
+  return true;
+}
+
+namespace {
+struct PmuKind {
+  const char* name;
+  uint32_t type;
+  uint64_t config;
+};
+const PmuKind kTaskKinds[] = {
+    {"cycles", PERF_TYPE_HARDWARE, PERF_COUNT_HW_CPU_CYCLES},
+    {"instructions", PERF_TYPE_HARDWARE, PERF_COUNT_HW_INSTRUCTIONS},
+    {"cache-misses", PERF_TYPE_HARDWARE, PERF_COUNT_HW_CACHE_MISSES},
+    {"cache-references", PERF_TYPE_HARDWARE, PERF_COUNT_HW_CACHE_REFERENCES},
+    {"page-faults", PERF_TYPE_SOFTWARE, PERF_COUNT_SW_PAGE_FAULTS},
+    {"major-faults", PERF_TYPE_SOFTWARE, PERF_COUNT_SW_PAGE_FAULTS_MAJ},
+    {"minor-faults", PERF_TYPE_SOFTWARE, PERF_COUNT_SW_PAGE_FAULTS_MIN},
+    {"context-switches", PERF_TYPE_SOFTWARE, PERF_COUNT_SW_CONTEXT_SWITCHES},
+    {"task-clock", PERF_TYPE_SOFTWARE, PERF_COUNT_SW_TASK_CLOCK},
+};
+
+int task_perf_open(const std::string& name, unsigned int tgid) {
+  const PmuKind* kind = nullptr;
+  for (const auto& k : kTaskKinds)
+    if (name == k.name) kind = &k;
+  if (kind == nullptr) return -1;
+  struct perf_event_attr attr = {};
+  attr.size = sizeof(attr);
+  attr.type = kind->type;
+  attr.config = kind->config;
+  attr.disabled = 0;
+  attr.inherit = 1;  // follow threads this process spawns later
+  attr.exclude_kernel = 0;
+  attr.exclude_hv = 1;
+  return static_cast<int>(
+      syscall(__NR_perf_event_open, &attr, static_cast<int>(tgid), -1, -1, PERF_FLAG_FD_CLOEXEC));
+}
+}  // namespace
+
+void TaskPmuTelemetrySampler::on_start() {
+  if (pid_map_fd_ < 0)
+    DC_LOG_WARN("[Telemetry] task PMU: no pid_map -> per-process counters disabled");
+}
+
+void TaskPmuTelemetrySampler::on_stop() {
+  for (auto& [tgid, fds] : fds_)
+    for (int fd : fds)
+      if (fd >= 0) close(fd);
+  fds_.clear();
+}
+
+// Traced tgids from the BPF pid_map; a process that appears mid-run gets counters from then on.
+void TaskPmuTelemetrySampler::refresh_pids(std::size_t src) {
+  if (pid_map_fd_ < 0) return;
+  unsigned int key = 0, next = 0;
+  std::vector<unsigned int> live;
+  while (bpf_map_get_next_key(pid_map_fd_, fds_.empty() && key == 0 ? nullptr : &key, &next) == 0) {
+    live.push_back(next);
+    key = next;
+    if (live.size() > 4096) break;
+  }
+  for (unsigned int tgid : live) {
+    if (fds_.count(tgid)) continue;
+    std::vector<int> opened;
+    for (const auto& c : sources_[src].counters) opened.push_back(task_perf_open(c.label, tgid));
+    if (std::any_of(opened.begin(), opened.end(), [](int f) { return f >= 0; })) {
+      fds_[tgid] = std::move(opened);
+      DC_LOG_INFO("[Telemetry] task PMU: attached to tgid %u", tgid);
+    } else {
+      for (int f : opened)
+        if (f >= 0) close(f);
+    }
+  }
+}
+
+bool TaskPmuTelemetrySampler::read_raw(std::size_t src, std::size_t ctr, unsigned long long* out) {
+  if (ctr == 0) refresh_pids(src);
+  unsigned long long total = 0;
+  bool any = false;
+  for (auto& [tgid, fds] : fds_) {
+    if (ctr >= fds.size() || fds[ctr] < 0) continue;
+    unsigned long long v = 0;
+    if (read(fds[ctr], &v, sizeof(v)) == static_cast<ssize_t>(sizeof(v))) {
+      total += v;
+      any = true;
+    }
+  }
+  if (!any) return false;
+  *out = total;
   return true;
 }
 

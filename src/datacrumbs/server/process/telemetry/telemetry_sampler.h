@@ -120,6 +120,37 @@ class RdmaQpTelemetrySampler : public TelemetrySampler {
   std::vector<std::map<std::string, unsigned long long>> values_;
 };
 
+// Hardware counters for the TRACED PROCESSES, read on the sampler's own fixed interval.
+//
+// This is the only counter scope that is sound for a workload whose threads block. The cpu-scope
+// counters (perf_event_open with pid=-1) sweep up every other task on the core, and counters read
+// from probe/sample events inherit that event's timing - during an off-CPU stretch the samples go
+// sparse and a "delta since last sample" silently spans an arbitrary wall interval. Both together
+// produced a 25,000x page-fault "signal" that was other processes running while ours was blocked.
+//
+// Opened per-task (pid=tgid, cpu=-1, inherit=1) so a counter follows the thread across cpus and
+// covers threads spawned later. Traced tgids come from the BPF pid_map, refreshed each tick.
+class TaskPmuTelemetrySampler : public TelemetrySampler {
+ public:
+  TaskPmuTelemetrySampler(std::shared_ptr<ChromeWriter> writer, std::vector<TelemetrySource> sources,
+                          unsigned int interval_ms, std::atomic<uint64_t>* event_index,
+                          int pid_map_fd)
+      : TelemetrySampler(std::move(writer), std::move(sources), interval_ms, event_index),
+        pid_map_fd_(pid_map_fd) {}
+  ~TaskPmuTelemetrySampler() override { stop(); }
+
+ protected:
+  void on_start() override;
+  void on_stop() override;
+  bool read_raw(std::size_t src, std::size_t ctr, unsigned long long* out) override;
+
+ private:
+  void refresh_pids(std::size_t src);
+
+  int pid_map_fd_ = -1;
+  std::map<unsigned int, std::vector<int>> fds_;  // tgid -> one fd per counter
+};
+
 }  // namespace datacrumbs
 
 #endif  // DATACRUMBS_SERVER_PROCESS_TELEMETRY_SAMPLER_H__

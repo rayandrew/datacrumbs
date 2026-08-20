@@ -650,6 +650,23 @@ void RuntimeConfigurationManager::derive_telemetry_sources() {
   // mlx5 vport counters, read via SIOCETHTOOL. Separate env because these are keyed by NETDEV, not
   // by ibdev, and they are the only source that sees the DevX/DOCA RDMA bytes the IB port counters
   // miss. Counter `path` holds the ethtool stat name; `perf_event` marks the sampler to use.
+  // Per-process hardware counters on a fixed interval. Separate from DATACRUMBS_HW_COUNTERS, which
+  // feeds the BPF cpu-scope arrays: those are attributable to a core, not to the traced program.
+  if (const char* task = std::getenv("DATACRUMBS_TASK_COUNTERS"); task != nullptr && *task != '\0') {
+    TelemetrySource tp;
+    tp.cat = "task_pmu";
+    tp.name = "traced";
+    std::stringstream ts_(task);
+    std::string c;
+    while (std::getline(ts_, c, ',')) {
+      const auto b = c.find_first_not_of(" \t");
+      if (b == std::string::npos) continue;
+      const auto e2 = c.find_last_not_of(" \t");
+      tp.counters.push_back({c.substr(b, e2 - b + 1), "", 1.0, "task_pmu"});
+    }
+    if (!tp.counters.empty()) telemetry_sources.push_back(std::move(tp));
+  }
+
   const char* netdevs = std::getenv("DATACRUMBS_NIC_NETDEVS");
   if (netdevs == nullptr || *netdevs == '\0') return;
   std::stringstream ns(netdevs);
