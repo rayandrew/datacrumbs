@@ -222,6 +222,43 @@ void put_attr(char* buf, std::size_t& off, unsigned short type, const void* data
   std::memcpy(buf + off + NLA_HDRLEN, data, len);
   off += NLA_ALIGN(a->nla_len);
 }
+
+// ibdev name -> nldev index, via a RDMA_NLDEV_CMD_GET dump. /sys/class/infiniband/<dev>/index does
+// not exist on every kernel (absent on the BlueField DOCA kernels), so netlink is the portable way.
+int resolve_dev_index(int fd, unsigned int seq, const std::string& want) {
+  char req[128] = {};
+  auto* nh = reinterpret_cast<struct nlmsghdr*>(req);
+  nh->nlmsg_type =
+      static_cast<unsigned short>(RDMA_NL_GET_TYPE(RDMA_NL_NLDEV, RDMA_NLDEV_CMD_GET));
+  nh->nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+  nh->nlmsg_seq = seq;
+  nh->nlmsg_len = NLMSG_HDRLEN;
+  if (send(fd, req, nh->nlmsg_len, 0) < 0) return -1;
+
+  std::vector<char> buf(32768);
+  int found = -1;
+  for (;;) {
+    const ssize_t got = recv(fd, buf.data(), buf.size(), 0);
+    if (got <= 0) return found;
+    unsigned int n = static_cast<unsigned int>(got);
+    const auto* h = reinterpret_cast<const struct nlmsghdr*>(buf.data());
+    for (; NLMSG_OK(h, n); h = NLMSG_NEXT(h, n)) {
+      if (h->nlmsg_type == NLMSG_DONE || h->nlmsg_type == NLMSG_ERROR) return found;
+      int idx = -1;
+      std::string name;
+      for_each_attr(NLMSG_DATA(h), NLMSG_PAYLOAD(h, 0), [&](const NlAttrView& a) {
+        if (attr_type(a) == RDMA_NLDEV_ATTR_DEV_INDEX) {
+          uint32_t v = 0;
+          std::memcpy(&v, a.payload(), sizeof(v));
+          idx = static_cast<int>(v);
+        } else if (attr_type(a) == RDMA_NLDEV_ATTR_DEV_NAME) {
+          name.assign(static_cast<const char*>(a.payload()));
+        }
+      });
+      if (!name.empty() && name == want) found = idx;
+    }
+  }
+}
 }  // namespace
 
 void RdmaQpTelemetrySampler::on_start() {
@@ -246,13 +283,7 @@ void RdmaQpTelemetrySampler::on_start() {
       port_[s] = static_cast<unsigned int>(std::strtoul(dev.c_str() + slash + 1, nullptr, 10));
       dev = dev.substr(0, slash);
     }
-    // ibdev index comes from sysfs; a dump of RDMA_NLDEV_CMD_GET would need a second parser.
-    const std::string path = "/sys/class/infiniband/" + dev + "/index";
-    if (FILE* f = std::fopen(path.c_str(), "r")) {
-      unsigned int idx = 0;
-      if (std::fscanf(f, "%u", &idx) == 1) dev_index_[s] = static_cast<int>(idx);
-      std::fclose(f);
-    }
+    dev_index_[s] = resolve_dev_index(fd_, ++seq_, dev);
     if (dev_index_[s] < 0)
       DC_LOG_WARN("[Telemetry] rdma %s: no device index -> per-QP counters skipped", dev.c_str());
   }
