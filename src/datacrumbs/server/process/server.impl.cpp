@@ -874,6 +874,7 @@ static int main_process(datacrumbs::EventProcessor* event_processor) {
   // sources (uncore) only exist when hw counters are compiled in; everything else reads sysfs.
   std::vector<datacrumbs::TelemetrySource> sysfs_sources;
   std::vector<datacrumbs::TelemetrySource> ethtool_sources;
+  std::vector<datacrumbs::TelemetrySource> rdma_qp_sources;
 #if defined(DATACRUMBS_ENABLE_HW_COUNTERS) && (DATACRUMBS_ENABLE_HW_COUNTERS == 1)
   std::vector<datacrumbs::TelemetrySource> perf_sources;
 #endif
@@ -881,6 +882,10 @@ static int main_process(datacrumbs::EventProcessor* event_processor) {
     const bool is_perf = !src.counters.empty() && !src.counters[0].perf_event.empty();
     if (is_perf && src.counters[0].perf_event == "ethtool") {
       ethtool_sources.push_back(src);
+      continue;
+    }
+    if (is_perf && src.counters[0].perf_event == "rdma_qp") {
+      rdma_qp_sources.push_back(src);
       continue;
     }
 #if defined(DATACRUMBS_ENABLE_HW_COUNTERS) && (DATACRUMBS_ENABLE_HW_COUNTERS == 1)
@@ -903,6 +908,10 @@ static int main_process(datacrumbs::EventProcessor* event_processor) {
                                                       telemetry_interval,
                                                       &event_processor->event_index);
   ethtool_sampler.start();
+  datacrumbs::RdmaQpTelemetrySampler rdma_qp_sampler(event_processor->writer_,
+                                                     std::move(rdma_qp_sources), telemetry_interval,
+                                                     &event_processor->event_index);
+  rdma_qp_sampler.start();
 #if defined(DATACRUMBS_ENABLE_HW_COUNTERS) && (DATACRUMBS_ENABLE_HW_COUNTERS == 1)
   datacrumbs::PerfTelemetrySampler perf_sampler(event_processor->writer_, std::move(perf_sources),
                                                 telemetry_interval, &event_processor->event_index);
@@ -992,6 +1001,7 @@ static int main_process(datacrumbs::EventProcessor* event_processor) {
 
   sysfs_sampler.stop();
   ethtool_sampler.stop();
+  rdma_qp_sampler.stop();
 #if defined(DATACRUMBS_ENABLE_HW_COUNTERS) && (DATACRUMBS_ENABLE_HW_COUNTERS == 1)
   perf_sampler.stop();
 #endif

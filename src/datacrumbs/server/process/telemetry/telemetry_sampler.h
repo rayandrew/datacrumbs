@@ -6,6 +6,8 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <map>
+#include <string>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -86,6 +88,36 @@ class EthtoolTelemetrySampler : public TelemetrySampler {
   int fd_ = -1;
   std::vector<std::vector<int>> index_;              // [source][counter] -> ethtool stat index
   std::vector<std::vector<unsigned long long>> values_;  // [source] full stat array this tick
+};
+
+// Per-QP-scope RDMA counters over RDMA netlink (RDMA_NLDEV_CMD_STAT_GET), i.e. what
+// `rdma statistic qp show` prints, read in-process. Unlike the port-wide sysfs counters these are
+// scoped to the QPs bound to a counter, so other traffic on the device does not pollute them.
+//
+// Requires per-port auto mode ("rdma statistic qp set link <dev>/<port> auto type on"), which binds
+// QPs to a counter by type - so the scope is per QP TYPE, not per individual QP; the hardware has a
+// limited number of counter sets.
+//
+// `source.name` is "<ibdev>/<port>"; each counter's `path` is the hw counter name.
+class RdmaQpTelemetrySampler : public TelemetrySampler {
+ public:
+  using TelemetrySampler::TelemetrySampler;
+  ~RdmaQpTelemetrySampler() override { stop(); }
+
+ protected:
+  void on_start() override;
+  void on_stop() override;
+  bool read_raw(std::size_t src, std::size_t ctr, unsigned long long* out) override;
+
+ private:
+  bool refresh(std::size_t src);
+
+  int fd_ = -1;
+  unsigned int seq_ = 0;
+  std::vector<int> dev_index_;
+  std::vector<unsigned int> port_;
+  // [source] hw counter name -> value summed over this port's bound counter sets
+  std::vector<std::map<std::string, unsigned long long>> values_;
 };
 
 }  // namespace datacrumbs

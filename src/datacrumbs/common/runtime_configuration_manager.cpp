@@ -630,6 +630,21 @@ void RuntimeConfigurationManager::derive_telemetry_sources() {
           "resp_remote_access_errors"})
       rdma.counters.push_back({c, hw + c, 1.0});
     telemetry_sources.push_back(std::move(rdma));
+
+    // Same hw counter names as the port-wide set above, but scoped to the bound QPs rather than the
+    // whole device, so MPI/UCX traffic on the same NIC does not pollute them. Needs per-port auto
+    // mode; without it the dump returns nothing and the source is simply silent.
+    TelemetrySource qp;
+    qp.cat = "nic_qp";
+    qp.name = dev + "/" + port;
+    for (const char* c :
+         {"rx_write_requests", "rx_read_requests", "rx_atomic_requests", "out_of_buffer",
+          "packet_seq_err", "out_of_sequence", "duplicate_request", "rnr_nak_retry_err",
+          "req_rnr_retries_exceeded", "req_transport_retries_exceeded", "local_ack_timeout_err",
+          "implied_nak_seq_err", "req_cqe_error", "resp_cqe_error", "req_cqe_flush_error",
+          "resp_cqe_flush_error"})
+      qp.counters.push_back({c, c, 1.0, "rdma_qp"});
+    telemetry_sources.push_back(std::move(qp));
   }
 
   // mlx5 vport counters, read via SIOCETHTOOL. Separate env because these are keyed by NETDEV, not

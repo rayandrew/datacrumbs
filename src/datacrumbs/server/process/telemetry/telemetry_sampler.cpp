@@ -3,6 +3,9 @@
 #include <datacrumbs/common/typedefs.h>
 #include <datacrumbs/server/process/telemetry/telemetry_sampler.h>
 #include <linux/ethtool.h>
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
+#include <rdma/rdma_netlink.h>
 #include <linux/sockios.h>
 #include <net/if.h>
 #include <sys/ioctl.h>
@@ -183,6 +186,147 @@ bool EthtoolTelemetrySampler::read_raw(std::size_t src, std::size_t ctr, unsigne
   const int i = index_[src][ctr];
   if (i < 0 || static_cast<std::size_t>(i) >= values_[src].size()) return false;
   *out = values_[src][static_cast<std::size_t>(i)];
+  return true;
+}
+
+namespace {
+// Minimal netlink attribute walk. RDMA nldev replies are nested tables of (type, len, payload).
+struct NlAttrView {
+  const struct nlattr* a;
+  const void* payload() const { return reinterpret_cast<const char*>(a) + NLA_HDRLEN; }
+  unsigned int plen() const { return a->nla_len - NLA_HDRLEN; }
+};
+
+template <typename F>
+void for_each_attr(const void* buf, unsigned int len, F&& fn) {
+  const char* p = static_cast<const char*>(buf);
+  while (len >= NLA_HDRLEN) {
+    const auto* a = reinterpret_cast<const struct nlattr*>(p);
+    if (a->nla_len < NLA_HDRLEN || a->nla_len > len) return;
+    fn(NlAttrView{a});
+    const unsigned int step = NLA_ALIGN(a->nla_len);
+    if (step > len) return;
+    p += step;
+    len -= step;
+  }
+}
+
+unsigned int attr_type(const NlAttrView& v) { return v.a->nla_type & NLA_TYPE_MASK; }
+
+// Append one attribute to a netlink request buffer.
+void put_attr(char* buf, std::size_t& off, unsigned short type, const void* data,
+              unsigned short len) {
+  auto* a = reinterpret_cast<struct nlattr*>(buf + off);
+  a->nla_type = type;
+  a->nla_len = static_cast<unsigned short>(NLA_HDRLEN + len);
+  std::memcpy(buf + off + NLA_HDRLEN, data, len);
+  off += NLA_ALIGN(a->nla_len);
+}
+}  // namespace
+
+void RdmaQpTelemetrySampler::on_start() {
+  fd_ = socket(AF_NETLINK, SOCK_RAW, NETLINK_RDMA);
+  if (fd_ < 0) {
+    DC_LOG_WARN("[Telemetry] rdma netlink unavailable -> per-QP counters disabled");
+    return;
+  }
+  struct sockaddr_nl sa = {};
+  sa.nl_family = AF_NETLINK;
+  if (bind(fd_, reinterpret_cast<struct sockaddr*>(&sa), sizeof(sa)) != 0) {
+    close(fd_);
+    fd_ = -1;
+    return;
+  }
+  dev_index_.assign(sources_.size(), -1);
+  port_.assign(sources_.size(), 1);
+  values_.assign(sources_.size(), {});
+  for (std::size_t s = 0; s < sources_.size(); ++s) {
+    std::string dev = sources_[s].name;
+    if (const auto slash = dev.find('/'); slash != std::string::npos) {
+      port_[s] = static_cast<unsigned int>(std::strtoul(dev.c_str() + slash + 1, nullptr, 10));
+      dev = dev.substr(0, slash);
+    }
+    // ibdev index comes from sysfs; a dump of RDMA_NLDEV_CMD_GET would need a second parser.
+    const std::string path = "/sys/class/infiniband/" + dev + "/index";
+    if (FILE* f = std::fopen(path.c_str(), "r")) {
+      unsigned int idx = 0;
+      if (std::fscanf(f, "%u", &idx) == 1) dev_index_[s] = static_cast<int>(idx);
+      std::fclose(f);
+    }
+    if (dev_index_[s] < 0)
+      DC_LOG_WARN("[Telemetry] rdma %s: no device index -> per-QP counters skipped", dev.c_str());
+  }
+}
+
+void RdmaQpTelemetrySampler::on_stop() {
+  if (fd_ >= 0) close(fd_);
+  fd_ = -1;
+}
+
+// One STAT_GET dump for this port; sum each hw counter across the bound counter sets.
+bool RdmaQpTelemetrySampler::refresh(std::size_t src) {
+  if (fd_ < 0 || dev_index_[src] < 0) return false;
+  char req[256] = {};
+  auto* nh = reinterpret_cast<struct nlmsghdr*>(req);
+  nh->nlmsg_type = static_cast<unsigned short>(RDMA_NL_GET_TYPE(RDMA_NL_NLDEV,
+                                                                RDMA_NLDEV_CMD_STAT_GET));
+  nh->nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+  nh->nlmsg_seq = ++seq_;
+  std::size_t off = NLMSG_HDRLEN;
+  const uint32_t dev = static_cast<uint32_t>(dev_index_[src]);
+  const uint32_t port = port_[src];
+  const uint32_t res = RDMA_NLDEV_ATTR_RES_QP;
+  put_attr(req, off, RDMA_NLDEV_ATTR_DEV_INDEX, &dev, sizeof(dev));
+  put_attr(req, off, RDMA_NLDEV_ATTR_PORT_INDEX, &port, sizeof(port));
+  put_attr(req, off, RDMA_NLDEV_ATTR_STAT_RES, &res, sizeof(res));
+  nh->nlmsg_len = static_cast<unsigned int>(off);
+  if (send(fd_, req, off, 0) < 0) return false;
+
+  values_[src].clear();
+  std::vector<char> buf(65536);
+  bool done = false;
+  while (!done) {
+    const ssize_t got = recv(fd_, buf.data(), buf.size(), 0);
+    if (got <= 0) return !values_[src].empty();
+    unsigned int n = static_cast<unsigned int>(got);  // NLMSG_NEXT mutates this
+    const auto* h = reinterpret_cast<const struct nlmsghdr*>(buf.data());
+    for (; NLMSG_OK(h, n); h = NLMSG_NEXT(h, n)) {
+      if (h->nlmsg_type == NLMSG_DONE || h->nlmsg_type == NLMSG_ERROR) {
+        done = true;
+        break;
+      }
+      for_each_attr(NLMSG_DATA(h), NLMSG_PAYLOAD(h, 0), [&](const NlAttrView& top) {
+        if (attr_type(top) != RDMA_NLDEV_ATTR_STAT_COUNTER) return;
+        for_each_attr(top.payload(), top.plen(), [&](const NlAttrView& entry) {
+          if (attr_type(entry) != RDMA_NLDEV_ATTR_STAT_COUNTER_ENTRY) return;
+          for_each_attr(entry.payload(), entry.plen(), [&](const NlAttrView& f) {
+            if (attr_type(f) != RDMA_NLDEV_ATTR_STAT_HWCOUNTERS) return;
+            for_each_attr(f.payload(), f.plen(), [&](const NlAttrView& hw) {
+              if (attr_type(hw) != RDMA_NLDEV_ATTR_STAT_HWCOUNTER_ENTRY) return;
+              std::string name;
+              unsigned long long val = 0;
+              for_each_attr(hw.payload(), hw.plen(), [&](const NlAttrView& kv) {
+                if (attr_type(kv) == RDMA_NLDEV_ATTR_STAT_HWCOUNTER_ENTRY_NAME)
+                  name.assign(static_cast<const char*>(kv.payload()));
+                else if (attr_type(kv) == RDMA_NLDEV_ATTR_STAT_HWCOUNTER_ENTRY_VALUE)
+                  std::memcpy(&val, kv.payload(), sizeof(val));
+              });
+              if (!name.empty()) values_[src][name] += val;
+            });
+          });
+        });
+      });
+    }
+  }
+  return !values_[src].empty();
+}
+
+bool RdmaQpTelemetrySampler::read_raw(std::size_t src, std::size_t ctr, unsigned long long* out) {
+  if (fd_ < 0 || src >= values_.size()) return false;
+  if (ctr == 0 && !refresh(src)) return false;
+  const auto it = values_[src].find(sources_[src].counters[ctr].path);
+  if (it == values_[src].end()) return false;
+  *out = it->second;
   return true;
 }
 
