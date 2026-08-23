@@ -820,6 +820,7 @@ static int main_process(datacrumbs::EventProcessor* event_processor) {
 
   const double elapsed = timer.pauseTime();
   DC_LOG_PRINT("Initialization of DataCrumbs elapsed time: %f seconds", elapsed);
+  event_processor->collecting.store(true, std::memory_order_relaxed);
   {
     std::error_code ec;
     std::filesystem::create_directories(

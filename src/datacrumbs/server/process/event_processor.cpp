@@ -110,6 +110,8 @@ EventProcessor::EventProcessor(const std::filesystem::path& probe_file) {
 int EventProcessor::handle_event(void* data, size_t data_sz) {
   DC_LOG_TRACE("handle_event: start");
 
+  if (!collecting.load(std::memory_order_relaxed)) return 0;  // attach still in progress
+
   // stack samples ride the same ringbuf tagged with a sentinel type; sink the raw record for the
   // offline DWARF unwinder (they are not chrome events).
   if (data != nullptr && *static_cast<const unsigned int*>(data) == DATACRUMBS_STACK_SAMPLE_TYPE) {

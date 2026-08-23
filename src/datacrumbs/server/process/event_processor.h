@@ -64,6 +64,9 @@ class EventProcessor {
   int stack_map_fd_ = -1;  // BPF_MAP_TYPE_STACK_TRACE fd for capture_stack probes (-1 = off)
   std::ofstream stack_sink_;  // raw stack_sample_t records for offline DWARF unwinding
   std::atomic<uint64_t> event_index{0};
+  // Probes fire as they are installed, so without this a catch-all attach records the machine for
+  // the minutes before the workload starts. Set once attach is done, just before signalling ready.
+  std::atomic<bool> collecting{false};
 
  private:                                              // Atomic index for event processing
   std::unordered_set<unsigned int> processed_hashes_;  // Set to track processed PIDs
