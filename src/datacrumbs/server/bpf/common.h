@@ -537,8 +537,7 @@ static inline __attribute__((always_inline)) int generic_exit(struct pt_regs* ct
   key.event_id = event_id;
   struct fn_value_t* fn = bpf_map_lookup_elem(&fn_pid_map, &key);
   if (fn == 0) return 0;  // missed entry
-  // A hot: layer's fn_pid_map lives in bpftime's /dev/shm and can outlive a run, so an exit may
-  // pair with a dead run's entry and emit a duration of days. Drop unpaired/stale entries.
+  // Stale pairing: a hot: layer's fn_pid_map lives in bpftime's /dev/shm and outlives a crashed run.
   if (fn->ts == 0 || fn->ts > te) return 0;
   if (config->aggregate) {  // count+duration only, no per-event record
     aggregate_hit(event_id, key.id, fn->ts, te);
@@ -574,8 +573,7 @@ static inline __attribute__((always_inline)) int generic_exit(struct pt_regs* ct
   key.event_id = event_id;
   struct fn_value_t* fn = bpf_map_lookup_elem(&fn_pid_map, &key);
   if (fn == 0) return 0;  // missed entry
-  // A hot: layer's fn_pid_map lives in bpftime's /dev/shm and can outlive a run, so an exit may
-  // pair with a dead run's entry and emit a duration of days. Drop unpaired/stale entries.
+  // Stale pairing: a hot: layer's fn_pid_map lives in bpftime's /dev/shm and outlives a crashed run.
   if (fn->ts == 0 || fn->ts > te) return 0;
   struct profile_key_t profile_key = {};
   profile_key.type = 1;
@@ -697,8 +695,7 @@ static inline __attribute__((always_inline)) int usdt_exit(struct pt_regs* ctx, 
   key.event_id = event_id;
   struct fn_value_t* fn = bpf_map_lookup_elem(&fn_pid_map, &key);
   if (fn == 0) return 0;  // missed entry
-  // A hot: layer's fn_pid_map lives in bpftime's /dev/shm and can outlive a run, so an exit may
-  // pair with a dead run's entry and emit a duration of days. Drop unpaired/stale entries.
+  // Stale pairing: a hot: layer's fn_pid_map lives in bpftime's /dev/shm and outlives a crashed run.
   if (fn->ts == 0 || fn->ts > te) return 0;
   if (config->aggregate) {  // count+duration only, no per-event record
     aggregate_hit(event_id, key.id, fn->ts, te);
@@ -734,8 +731,7 @@ static inline __attribute__((always_inline)) int usdt_exit(struct pt_regs* ctx, 
   key.event_id = event_id;
   struct fn_value_t* fn = bpf_map_lookup_elem(&fn_pid_map, &key);
   if (fn == 0) return 0;  // missed entry
-  // A hot: layer's fn_pid_map lives in bpftime's /dev/shm and can outlive a run, so an exit may
-  // pair with a dead run's entry and emit a duration of days. Drop unpaired/stale entries.
+  // Stale pairing: a hot: layer's fn_pid_map lives in bpftime's /dev/shm and outlives a crashed run.
   if (fn->ts == 0 || fn->ts > te) return 0;
   DATACRUMBS_SKIP_SMALL_EVENTS(fn, te);
   struct string_t local_str = {};                                                      // 100
