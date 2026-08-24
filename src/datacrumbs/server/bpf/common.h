@@ -13,7 +13,7 @@
 #include <datacrumbs/server/bpf/shared.h>
 
 DATACRUMBS_MAP_EXTERN(pid_map, u32, u64, 1024);
-DATACRUMBS_MAP_EXTERN(fn_pid_map, struct fn_key_t, struct fn_value_t);
+DATACRUMBS_LRU_MAP_EXTERN(fn_pid_map, struct fn_key_t, struct fn_value_t, 262144);
 DATACRUMBS_MAP_EXTERN(probe_guard, u64, struct probe_guard_t, DATACRUMBS_MAX_RUNTIME_FUNCTIONS);
 DATACRUMBS_MAP_EXTERN(event_arg_config_map, u64, struct runtime_event_config_t,
                       DATACRUMBS_MAX_RUNTIME_FUNCTIONS);
@@ -538,13 +538,20 @@ static inline __attribute__((always_inline)) int generic_exit(struct pt_regs* ct
   struct fn_value_t* fn = bpf_map_lookup_elem(&fn_pid_map, &key);
   if (fn == 0) return 0;  // missed entry
   // Stale pairing: a hot: layer's fn_pid_map lives in bpftime's /dev/shm and outlives a crashed run.
-  if (fn->ts == 0 || fn->ts > te) return 0;
-  if (config->aggregate) {  // count+duration only, no per-event record
-    aggregate_hit(event_id, key.id, fn->ts, te);
+  if (fn->ts == 0 || fn->ts > te) {
+    bpf_map_delete_elem(&fn_pid_map, &key);  // garbage pairing; free the slot
     return 0;
   }
-  DATACRUMBS_SKIP_SMALL_EVENTS(fn, te);
-  if (hot_probe_drop(event_id, te)) return 0;  // rate-limit a runaway (busy-poll) probe
+  if (config->aggregate) {  // count+duration only, no per-event record
+    aggregate_hit(event_id, key.id, fn->ts, te);
+    bpf_map_delete_elem(&fn_pid_map, &key);  // pair consumed; nothing else frees it
+    return 0;
+  }
+  DATACRUMBS_SKIP_SMALL_EVENTS(fn, te, key);
+  if (hot_probe_drop(event_id, te)) {  // rate-limit a runaway (busy-poll) probe
+    bpf_map_delete_elem(&fn_pid_map, &key);  // pair consumed even though nothing is emitted
+    return 0;
+  }
   struct generic_event_t* event;
   DATACRUMBS_RB_RESERVE(output, struct generic_event_t, event);
   event->type = config->probe_kind;
@@ -555,6 +562,7 @@ static inline __attribute__((always_inline)) int generic_exit(struct pt_regs* ct
   copy_captured_args_to_event(fn, event);
   pmu_delta_exit(fn, event);
   DATACRUMBS_EVENT_SUBMIT(event, key.id, event_id);
+  bpf_map_delete_elem(&fn_pid_map, &key);  // pair consumed; nothing else frees it
   return 0;
 }
 #else
@@ -574,7 +582,10 @@ static inline __attribute__((always_inline)) int generic_exit(struct pt_regs* ct
   struct fn_value_t* fn = bpf_map_lookup_elem(&fn_pid_map, &key);
   if (fn == 0) return 0;  // missed entry
   // Stale pairing: a hot: layer's fn_pid_map lives in bpftime's /dev/shm and outlives a crashed run.
-  if (fn->ts == 0 || fn->ts > te) return 0;
+  if (fn->ts == 0 || fn->ts > te) {
+    bpf_map_delete_elem(&fn_pid_map, &key);  // garbage pairing; free the slot
+    return 0;
+  }
   struct profile_key_t profile_key = {};
   profile_key.type = 1;
   profile_key.id = key.id;
@@ -696,13 +707,20 @@ static inline __attribute__((always_inline)) int usdt_exit(struct pt_regs* ctx, 
   struct fn_value_t* fn = bpf_map_lookup_elem(&fn_pid_map, &key);
   if (fn == 0) return 0;  // missed entry
   // Stale pairing: a hot: layer's fn_pid_map lives in bpftime's /dev/shm and outlives a crashed run.
-  if (fn->ts == 0 || fn->ts > te) return 0;
-  if (config->aggregate) {  // count+duration only, no per-event record
-    aggregate_hit(event_id, key.id, fn->ts, te);
+  if (fn->ts == 0 || fn->ts > te) {
+    bpf_map_delete_elem(&fn_pid_map, &key);  // garbage pairing; free the slot
     return 0;
   }
-  DATACRUMBS_SKIP_SMALL_EVENTS(fn, te);
-  if (hot_probe_drop(event_id, te)) return 0;  // rate-limit a runaway (busy-poll) probe
+  if (config->aggregate) {  // count+duration only, no per-event record
+    aggregate_hit(event_id, key.id, fn->ts, te);
+    bpf_map_delete_elem(&fn_pid_map, &key);  // pair consumed; nothing else frees it
+    return 0;
+  }
+  DATACRUMBS_SKIP_SMALL_EVENTS(fn, te, key);
+  if (hot_probe_drop(event_id, te)) {  // rate-limit a runaway (busy-poll) probe
+    bpf_map_delete_elem(&fn_pid_map, &key);  // pair consumed even though nothing is emitted
+    return 0;
+  }
   struct generic_event_t* event;
   DATACRUMBS_RB_RESERVE(output, struct generic_event_t, event);
   event->type = config->probe_kind;
@@ -713,6 +731,7 @@ static inline __attribute__((always_inline)) int usdt_exit(struct pt_regs* ctx, 
   copy_captured_args_to_event(fn, event);
   pmu_delta_exit(fn, event);
   DATACRUMBS_EVENT_SUBMIT(event, key.id, event_id);
+  bpf_map_delete_elem(&fn_pid_map, &key);  // pair consumed; nothing else frees it
   return 0;
 }
 #else
@@ -732,8 +751,11 @@ static inline __attribute__((always_inline)) int usdt_exit(struct pt_regs* ctx, 
   struct fn_value_t* fn = bpf_map_lookup_elem(&fn_pid_map, &key);
   if (fn == 0) return 0;  // missed entry
   // Stale pairing: a hot: layer's fn_pid_map lives in bpftime's /dev/shm and outlives a crashed run.
-  if (fn->ts == 0 || fn->ts > te) return 0;
-  DATACRUMBS_SKIP_SMALL_EVENTS(fn, te);
+  if (fn->ts == 0 || fn->ts > te) {
+    bpf_map_delete_elem(&fn_pid_map, &key);  // garbage pairing; free the slot
+    return 0;
+  }
+  DATACRUMBS_SKIP_SMALL_EVENTS(fn, te, key);
   struct string_t local_str = {};                                                      // 100
   long len = bpf_probe_read_user_str(&local_str.str, MAX_STR_READ_LEN, (void*)clazz);  // 90
   local_str.len = len * 8;
@@ -891,6 +913,7 @@ static inline __attribute__((always_inline)) int generic_point(void* ctx, u64 at
     }
   }
   DATACRUMBS_EVENT_SUBMIT(event, key.id, event_id);
+  bpf_map_delete_elem(&fn_pid_map, &key);  // pair consumed; nothing else frees it
   return 0;
 }
 

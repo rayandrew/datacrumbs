@@ -44,6 +44,17 @@
     __type(value, map_value);                                 \
   } name SEC(".maps");
 
+// Self-evicting map, for state whose entries have no reliable delete point. A plain HASH refuses
+// inserts once full and fails silently, which strands every later entry/exit pair; an LRU evicts the
+// least recently used instead, so a leaked entry costs one stale slot rather than the whole map.
+#define DATACRUMBS_LRU_MAP(name, map_key, map_value, size) \
+  struct {                                                 \
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);                   \
+    __uint(max_entries, size);                             \
+    __type(key, map_key);                                  \
+    __type(value, map_value);                              \
+  } name SEC(".maps");
+
 #define GET_5TH_ARG(arg1, arg2, arg3, arg4, arg5, ...) arg5
 #define DATACRUMBS_MAP_MACRO_CHOOSER(...) \
   GET_5TH_ARG(__VA_ARGS__, DATACRUMBS_MAP_4_ARGS, DATACRUMBS_MAP_3_ARGS, )
@@ -99,6 +110,16 @@
 /**
  * Macro for defining a BPF map
  */
+
+// Must mirror DATACRUMBS_LRU_MAP exactly: bpftool's linker rejects a map whose extern declaration
+// disagrees with its definition, with only "Invalid argument (22)" to say so.
+#define DATACRUMBS_LRU_MAP_EXTERN(name, map_key, map_value, size) \
+  extern struct {                                                 \
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);                          \
+    __uint(max_entries, size);                                    \
+    __type(key, map_key);                                         \
+    __type(value, map_value);                                     \
+  } name SEC(".maps");
 
 #define DATACRUMBS_MAP_EXTERN_3_ARGS(name, map_key, map_value) \
   extern struct {                                              \
@@ -171,10 +192,13 @@
     return 0;                                                                                   \
   }
 
-#define DATACRUMBS_SKIP_SMALL_EVENTS(fn, te)                                                     \
+// Frees the pairing slot before bailing: the pair is consumed either way, and an entry left behind
+// is a slot lost until its (thread, function) runs again.
+#define DATACRUMBS_SKIP_SMALL_EVENTS(fn, te, key)                                                \
   if (te - fn->ts <                                                                              \
       DATACRUMBS_SKIP_SMALL_EVENTS_THRESHOLD_NS) { /* Skip events with duration less than 1ms */ \
     DBG_PRINTK("Skipping small event with duration %llu ns", te - fn->ts);                       \
+    bpf_map_delete_elem(&fn_pid_map, &key);                                                      \
     return 0;                                                                                    \
   }
 

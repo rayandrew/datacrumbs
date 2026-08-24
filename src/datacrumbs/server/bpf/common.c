@@ -10,7 +10,12 @@
 #include <datacrumbs/server/bpf/shared.h>
 
 DATACRUMBS_MAP(pid_map, u32, u64, 1024);
-DATACRUMBS_MAP(fn_pid_map, struct fn_key_t, struct fn_value_t);
+// Entry/exit pairing state, keyed per (thread, function). Nothing deletes an entry, so every new
+// thread-function combination consumes a slot for the life of the run: measured filling to capacity
+// after 3 reps of a 15.6k-probe set, after which entries stop being recorded, every exit finds no
+// entry, and all uprobe and kprobe events vanish while tracepoints (which never pair) keep flowing.
+// LRU so a full map evicts instead of refusing, and sized for the probe count times live threads.
+DATACRUMBS_LRU_MAP(fn_pid_map, struct fn_key_t, struct fn_value_t, 262144);
 DATACRUMBS_MAP(probe_guard, u64, struct probe_guard_t, DATACRUMBS_MAX_RUNTIME_FUNCTIONS);
 DATACRUMBS_MAP(event_arg_config_map, u64, struct runtime_event_config_t,
                DATACRUMBS_MAX_RUNTIME_FUNCTIONS);
