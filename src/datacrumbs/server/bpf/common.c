@@ -10,6 +10,8 @@
 #include <datacrumbs/server/bpf/shared.h>
 
 DATACRUMBS_MAP(pid_map, u32, u64, 1024);
+// One entry per live sink worker; the client adds its tid on thread start and drops it on exit.
+DATACRUMBS_MAP(tracer_tid_map, u32, u8, 64);
 // Entry/exit pairing state, keyed per (thread, function). Nothing deletes an entry, so every new
 // thread-function combination consumes a slot for the life of the run: measured filling to capacity
 // after 3 reps of a 15.6k-probe set, after which entries stop being recorded, every exit finds no
@@ -44,6 +46,24 @@ struct {
   __type(key, u32);
   __type(value, u32);
 } pmu_ctl SEC(".maps");
+
+// 1 when some function probe asked to be system wide. Function probes gate on the traced-pid map
+// before anything else, because a kprobe fires for every process and most hits are not ours. A
+// probe that wants every process therefore has to defeat that gate, and checking its config first
+// would put a map lookup on every hit of every probe. This flag keeps the untraced-pid bail
+// immediate whenever nothing asked for the behaviour.
+struct {
+  __uint(type, BPF_MAP_TYPE_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, u32);
+  __type(value, u32);
+} fn_gate_ctl SEC(".maps");
+
+// The tracer's own tgid. A system_wide probe fires for every process on the machine, including the
+// server writing the trace, so probing anything the writer itself does feeds the trace back into
+// itself: a run with a system_wide probe on write() grew from 2796 hits in its first round to 96017
+// in its fourth for an identical workload.
+DATACRUMBS_MAP(self_ctl, u32, u32, 1);
 
 // Threads of traced processes, registered as they are seen on-CPU. Lets a system_wide tracepoint
 // gate on a tid it reads from an argument (the wakee), which the tgid-keyed pid_map cannot answer.

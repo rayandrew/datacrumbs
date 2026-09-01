@@ -13,6 +13,11 @@
 #include <datacrumbs/server/bpf/shared.h>
 
 DATACRUMBS_MAP_EXTERN(pid_map, u32, u64, 1024);
+DATACRUMBS_MAP_EXTERN(self_ctl, u32, u32, 1);
+// Threads inside the client's own sink I/O. is_self() cannot cover these: the sink runs inside the
+// traced process, so the pid gate has already admitted it. Keyed by tid, one entry per active sink
+// worker.
+DATACRUMBS_MAP_EXTERN(tracer_tid_map, u32, u8, 64);
 DATACRUMBS_LRU_MAP_EXTERN(fn_pid_map, struct fn_key_t, struct fn_value_t, 262144);
 DATACRUMBS_MAP_EXTERN(probe_guard, u64, struct probe_guard_t, DATACRUMBS_MAX_RUNTIME_FUNCTIONS);
 DATACRUMBS_MAP_EXTERN(event_arg_config_map, u64, struct runtime_event_config_t,
@@ -24,12 +29,12 @@ extern struct {
   __type(value, struct fn_value_t);
 } scratch_fn_value_map SEC(".maps");
 
-#define DATACRUMBS_PMU_ARRAY_EXTERN(name)      \
-  extern struct {                              \
+#define DATACRUMBS_PMU_ARRAY_EXTERN(name)        \
+  extern struct {                                \
     __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY); \
-    __uint(key_size, sizeof(u32));             \
-    __uint(value_size, sizeof(u32));           \
-    __uint(max_entries, 256);                  \
+    __uint(key_size, sizeof(u32));               \
+    __uint(value_size, sizeof(u32));             \
+    __uint(max_entries, 256);                    \
   } name SEC(".maps");
 DATACRUMBS_PMU_ARRAY_EXTERN(pmu_counter0)
 DATACRUMBS_PMU_ARRAY_EXTERN(pmu_counter1)
@@ -40,6 +45,12 @@ extern struct {
   __type(key, u32);
   __type(value, u32);
 } pmu_ctl SEC(".maps");
+extern struct {
+  __uint(type, BPF_MAP_TYPE_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, u32);
+  __type(value, u32);
+} fn_gate_ctl SEC(".maps");
 extern struct {
   __uint(type, BPF_MAP_TYPE_STACK_TRACE);
   __uint(max_entries, 16384);
@@ -170,9 +181,10 @@ static inline __attribute__((always_inline)) int need_tracing(struct fn_key_t* k
 }
 #else
 static inline __attribute__((always_inline)) int need_tracing(struct fn_key_t* key, u64* start_ts) {
-  key->id = bpf_get_current_pid_tgid();  // full tgid|tid; fn_pid_map still pairs entry/exit per-thread
-  u32 tgid = key->id >> 32;              // gate by process so worker threads trace too, not just the
-                                         // thread that called datacrumbs_start
+  key->id =
+      bpf_get_current_pid_tgid();  // full tgid|tid; fn_pid_map still pairs entry/exit per-thread
+  u32 tgid = key->id >> 32;        // gate by process so worker threads trace too, not just the
+                                   // thread that called datacrumbs_start
   start_ts = (u64*)bpf_map_lookup_elem(&pid_map, &tgid);
   if (start_ts == 0 || key->id == 0) return 0;
   return 1;
@@ -213,6 +225,59 @@ resolve_event_config(u64 attach_cookie) {
                                                                    &attach_cookie);
 }
 
+// The pid gate for function probes, with a per-probe escape.
+//
+// need_tracing answers "is this process traced", which is the right question for a kprobe that
+// fires across the whole machine. It leaves a probe aimed at an unmodified workload with nothing to
+// report, and an aggregate probe watched against a process that was never marked produces zero
+// records and reads exactly like a broken feature.
+//
+// A probe marked system_wide is admitted regardless. The config lookup that needs happens only
+// after the pid check has already failed, and only when some probe actually asked for it, so a
+// configuration without one keeps the immediate bail.
+// True when the current task is the tracer itself. Only system_wide probes need this: a pid-gated
+// probe already answers no for the server, which never marks itself traced.
+static inline __attribute__((always_inline)) int is_self(void) {
+  const u32 zero = 0;
+  const u32* self = (u32*)bpf_map_lookup_elem(&self_ctl, &zero);
+  if (self != NULL && *self != 0 && (u32)(bpf_get_current_pid_tgid() >> 32) == *self) return 1;
+  // The server is not the only tracer process on the node: dc_timesync publishes the shared clock
+  // and datacrumbs_probe_manager owns the bpftime shm, and a system_wide probe captures both, so
+  // the trace ends up measuring the tracing stack. Matched on comm rather than pid because either
+  // daemon can restart mid-run and a pid captured at attach would then stop excluding it.
+  // Compared byte by byte: __builtin_memcmp is not inlined here, so it emits a call to memcmp and
+  // the BPF link then fails on the missing symbol.
+  char c[16] = {};
+  if (bpf_get_current_comm(&c, sizeof(c)) != 0) return 0;
+  if (c[0] != 'd') return 0;
+  // "datacrumbs" also matches datacrumbs_probe_manager, which comm truncates to 15 chars.
+  if (c[1] == 'a' && c[2] == 't' && c[3] == 'a' && c[4] == 'c' && c[5] == 'r' && c[6] == 'u' &&
+      c[7] == 'm' && c[8] == 'b' && c[9] == 's')
+    return 1;
+  if (c[1] == 'c' && c[2] == '_' && c[3] == 't' && c[4] == 'i' && c[5] == 'm' && c[6] == 'e' &&
+      c[7] == 's' && c[8] == 'y' && c[9] == 'n' && c[10] == 'c')
+    return 1;
+  return 0;
+}
+
+static inline __attribute__((always_inline)) int is_tracer_thread(void);
+
+static inline __attribute__((always_inline)) int fn_pid_gate(struct fn_key_t* key, u64* start_ts,
+                                                             u64 attach_cookie) {
+  // A traced pid still has to exclude the client's own sink threads: the sink writes from inside
+  // the traced process, so this gate has already said yes by the time is_self() would be consulted.
+  if (need_tracing(key, start_ts)) return is_tracer_thread() ? 0 : 1;
+  const u32 zero = 0;
+  const u32* any = (u32*)bpf_map_lookup_elem(&fn_gate_ctl, &zero);
+  if (any == NULL || *any == 0) return 0;
+  const struct runtime_event_config_t* c = resolve_event_config(attach_cookie);
+  if (c == NULL || c->system_wide == 0) return 0;
+  if (is_self()) return 0;  // tracing the writer's own work feeds the trace back into itself
+  key->id = bpf_get_current_pid_tgid();
+  if (key->id == 0) return 0;
+  return 1;
+}
+
 static inline __attribute__((always_inline)) struct fn_value_t* get_scratch_fn_value(void) {
   u32 key = 0;
   return (struct fn_value_t*)bpf_map_lookup_elem(&scratch_fn_value_map, &key);
@@ -250,25 +315,52 @@ static inline __attribute__((always_inline)) void pmu_delta_exit(const struct fn
   if (!fn->pmu_count) return;
   u64 now[DATACRUMBS_MAX_PMU] = {};
   pmu_read(now, fn->pmu_count);
+  // Clamp instead of subtracting blind: pmu_read is BPF_F_CURRENT_CPU, so a task that migrates
+  // between entry and exit reads two different CPUs' counters and the difference is meaningless,
+  // not merely negative. Unsigned it wraps to ~1.8e19 and swamps any sum a consumer takes -
+  // measured 31 of 229,320 events on one node.
 #pragma unroll
-  for (int i = 0; i < DATACRUMBS_MAX_PMU; ++i) event->pmu[i] = now[i] - fn->pmu_start[i];
+  for (int i = 0; i < DATACRUMBS_MAX_PMU; ++i)
+    event->pmu[i] = now[i] >= fn->pmu_start[i] ? now[i] - fn->pmu_start[i] : 0;
 }
 
 #if defined(DATACRUMBS_MODE) && (DATACRUMBS_MODE == 1)
 // Accumulate a hit into agg_map instead of emitting an event (config->aggregate probes). The server
 // drains this into periodic COUNTER records. Plain (non-atomic) adds: BPF atomics (opcode 0xdb) are
-// rejected by the bpftime userspace VM (ubpf) that hosts hot uprobes, so a rare lost increment under
-// cross-CPU contention is accepted - the aggregate is a statistical summary, not an exact metric.
+// rejected by the bpftime userspace VM (ubpf) that hosts hot uprobes, so a rare lost increment
+// under cross-CPU contention is accepted - the aggregate is a statistical summary, not an exact
+// metric. Largest duration whose square still fits in 64 bits, about 4.3 seconds in nanoseconds.
+#define DC_SQ_MAX_OPERAND 4294967295ULL
+
 static inline __attribute__((always_inline)) void aggregate_hit(u64 event_id, u64 pid_tgid, u64 ts,
                                                                 u64 te) {
   struct agg_key_t k = {.event_id = event_id, .time_interval = te / DATACRUMBS_TIME_INTERVAL_NS};
+  const u64 d = te - ts;
   struct agg_value_t* v = bpf_map_lookup_elem(&agg_map, &k);
   if (v != NULL) {
     v->count += 1;
-    v->duration_ns += te - ts;
+    v->duration_ns += d;
+    if (d < v->min_ns) v->min_ns = d;
+    if (d > v->max_ns) v->max_ns = d;
+    // A millisecond squared is 1e12, so a million of them still fits; a second squared is 1e18 and
+    // eighteen of those would wrap. Saturating keeps a pathological outlier from reading as a tiny
+    // variance. Compared against the square root of the range rather than checked by dividing
+    // afterwards: the BPF backend turns that division into __multi3, which it then refuses.
+    const u64 sq = d > DC_SQ_MAX_OPERAND ? ~0ULL : d * d;
+    if (v->sum_sq_ns2 > ~0ULL - sq) {
+      v->sum_sq_ns2 = ~0ULL;
+    } else {
+      v->sum_sq_ns2 += sq;
+    }
     return;
   }
-  struct agg_value_t nv = {.count = 1, .duration_ns = te - ts, .pid_tgid = pid_tgid};
+  const u64 sq0 = d > DC_SQ_MAX_OPERAND ? ~0ULL : d * d;
+  struct agg_value_t nv = {.count = 1,
+                           .duration_ns = d,
+                           .pid_tgid = pid_tgid,
+                           .min_ns = d,
+                           .max_ns = d,
+                           .sum_sq_ns2 = sq0};
   bpf_map_update_elem(&agg_map, &k, &nv, BPF_ANY);
 }
 #endif
@@ -290,6 +382,30 @@ static inline __attribute__((always_inline)) int unmark_current_pid_traced(void)
   bpf_map_delete_elem(&pid_map, &tgid);
   DBG_PRINTK("Unmarked tracing tgid=%u", tgid);
   return 0;
+}
+
+static inline __attribute__((always_inline)) int mark_current_tid_tracer(void) {
+  const u32 tid = (u32)bpf_get_current_pid_tgid();
+  const u8 one = 1;
+  if (tid == 0) return 0;
+  bpf_map_update_elem(&tracer_tid_map, &tid, &one, BPF_ANY);
+  DBG_PRINTK("Marked tracer tid=%u", tid);
+  return 0;
+}
+
+static inline __attribute__((always_inline)) int unmark_current_tid_tracer(void) {
+  const u32 tid = (u32)bpf_get_current_pid_tgid();
+  if (tid == 0) return 0;
+  bpf_map_delete_elem(&tracer_tid_map, &tid);
+  return 0;
+}
+
+// True on a thread doing the client's own sink I/O. Its writes descend through vfs, ext4 and the
+// block layer, where no fd survives to gate on, so the thread is the only handle that works at
+// every level.
+static inline __attribute__((always_inline)) int is_tracer_thread(void) {
+  const u32 tid = (u32)bpf_get_current_pid_tgid();
+  return bpf_map_lookup_elem(&tracer_tid_map, &tid) != NULL;
 }
 
 static inline __attribute__((always_inline)) void reset_captured_args(struct fn_value_t* fn) {
@@ -474,7 +590,7 @@ static inline __attribute__((always_inline)) int generic_entry(struct pt_regs* c
   // per-event config lookup to drop a map lookup on that path.
   struct fn_key_t key = {};
   u64 start_ts = 0;
-  if (!need_tracing(&key, &start_ts)) {
+  if (!fn_pid_gate(&key, &start_ts, attach_cookie)) {
     return 0;  // not tracing this pid
   }
   const struct runtime_event_config_t* config = resolve_event_config(attach_cookie);
@@ -497,7 +613,7 @@ static inline __attribute__((always_inline)) int generic_entry(struct pt_regs* c
   // pid gate first (see generic_entry above): bail before the config lookup.
   struct fn_key_t key = {};
   u64 start_ts;
-  if (!need_tracing(&key, &start_ts)) {
+  if (!fn_pid_gate(&key, &start_ts, attach_cookie)) {
     return 0;  // not tracing this pid
   }
   const struct runtime_event_config_t* config = resolve_event_config(attach_cookie);
@@ -527,7 +643,7 @@ static inline __attribute__((always_inline)) int generic_exit(struct pt_regs* ct
   // pid gate first (see generic_entry): bail before the config + state lookups.
   struct fn_key_t key = {};
   u64 start_ts = 0;
-  if (!need_tracing(&key, &start_ts)) {
+  if (!fn_pid_gate(&key, &start_ts, attach_cookie)) {
     return 0;  // not tracing this pid
   }
   u64 te = bpf_ktime_get_ns();
@@ -537,7 +653,8 @@ static inline __attribute__((always_inline)) int generic_exit(struct pt_regs* ct
   key.event_id = event_id;
   struct fn_value_t* fn = bpf_map_lookup_elem(&fn_pid_map, &key);
   if (fn == 0) return 0;  // missed entry
-  // Stale pairing: a hot: layer's fn_pid_map lives in bpftime's /dev/shm and outlives a crashed run.
+  // Stale pairing: a hot: layer's fn_pid_map lives in bpftime's /dev/shm and outlives a crashed
+  // run.
   if (fn->ts == 0 || fn->ts > te) {
     bpf_map_delete_elem(&fn_pid_map, &key);  // garbage pairing; free the slot
     return 0;
@@ -548,7 +665,7 @@ static inline __attribute__((always_inline)) int generic_exit(struct pt_regs* ct
     return 0;
   }
   DATACRUMBS_SKIP_SMALL_EVENTS(fn, te, key);
-  if (hot_probe_drop(event_id, te)) {  // rate-limit a runaway (busy-poll) probe
+  if (hot_probe_drop(event_id, te)) {        // rate-limit a runaway (busy-poll) probe
     bpf_map_delete_elem(&fn_pid_map, &key);  // pair consumed even though nothing is emitted
     return 0;
   }
@@ -571,7 +688,7 @@ static inline __attribute__((always_inline)) int generic_exit(struct pt_regs* ct
   // pid gate first (see generic_entry): bail before the config + state lookups.
   struct fn_key_t key = {};
   u64 start_ts;
-  if (!need_tracing(&key, &start_ts)) {
+  if (!fn_pid_gate(&key, &start_ts, attach_cookie)) {
     return 0;  // not tracing this pid
   }
   u64 te = bpf_ktime_get_ns();
@@ -581,7 +698,8 @@ static inline __attribute__((always_inline)) int generic_exit(struct pt_regs* ct
   key.event_id = event_id;
   struct fn_value_t* fn = bpf_map_lookup_elem(&fn_pid_map, &key);
   if (fn == 0) return 0;  // missed entry
-  // Stale pairing: a hot: layer's fn_pid_map lives in bpftime's /dev/shm and outlives a crashed run.
+  // Stale pairing: a hot: layer's fn_pid_map lives in bpftime's /dev/shm and outlives a crashed
+  // run.
   if (fn->ts == 0 || fn->ts > te) {
     bpf_map_delete_elem(&fn_pid_map, &key);  // garbage pairing; free the slot
     return 0;
@@ -626,7 +744,7 @@ static inline __attribute__((always_inline)) int generic_syscall_entry(
   // pid gate first (see generic_entry): bail before the config lookup.
   struct fn_key_t key = {};
   u64 start_ts = 0;
-  if (!need_tracing(&key, &start_ts)) {
+  if (!fn_pid_gate(&key, &start_ts, attach_cookie)) {
     return 0;
   }
   const struct runtime_event_config_t* config = resolve_event_config(attach_cookie);
@@ -664,7 +782,7 @@ static inline __attribute__((always_inline)) int usdt_entry(struct pt_regs* ctx,
   // pid gate first (see generic_entry): bail before the config lookup.
   struct fn_key_t key = {};
   u64 start_ts;
-  if (!need_tracing(&key, &start_ts)) {
+  if (!fn_pid_gate(&key, &start_ts, attach_cookie)) {
     return 0;  // not tracing this pid
   }
   const struct runtime_event_config_t* config = resolve_event_config(attach_cookie);
@@ -696,7 +814,7 @@ static inline __attribute__((always_inline)) int usdt_exit(struct pt_regs* ctx, 
   // pid gate first (see generic_entry): bail before the config + state lookups.
   struct fn_key_t key = {};
   u64 start_ts;
-  if (!need_tracing(&key, &start_ts)) {
+  if (!fn_pid_gate(&key, &start_ts, attach_cookie)) {
     return 0;  // not tracing this pid
   }
   u64 te = bpf_ktime_get_ns();
@@ -706,7 +824,8 @@ static inline __attribute__((always_inline)) int usdt_exit(struct pt_regs* ctx, 
   key.event_id = event_id;
   struct fn_value_t* fn = bpf_map_lookup_elem(&fn_pid_map, &key);
   if (fn == 0) return 0;  // missed entry
-  // Stale pairing: a hot: layer's fn_pid_map lives in bpftime's /dev/shm and outlives a crashed run.
+  // Stale pairing: a hot: layer's fn_pid_map lives in bpftime's /dev/shm and outlives a crashed
+  // run.
   if (fn->ts == 0 || fn->ts > te) {
     bpf_map_delete_elem(&fn_pid_map, &key);  // garbage pairing; free the slot
     return 0;
@@ -717,7 +836,7 @@ static inline __attribute__((always_inline)) int usdt_exit(struct pt_regs* ctx, 
     return 0;
   }
   DATACRUMBS_SKIP_SMALL_EVENTS(fn, te, key);
-  if (hot_probe_drop(event_id, te)) {  // rate-limit a runaway (busy-poll) probe
+  if (hot_probe_drop(event_id, te)) {        // rate-limit a runaway (busy-poll) probe
     bpf_map_delete_elem(&fn_pid_map, &key);  // pair consumed even though nothing is emitted
     return 0;
   }
@@ -740,7 +859,7 @@ static inline __attribute__((always_inline)) int usdt_exit(struct pt_regs* ctx, 
   // pid gate first (see generic_entry): bail before the config + state lookups.
   struct fn_key_t key = {};
   u64 start_ts;
-  if (!need_tracing(&key, &start_ts)) {
+  if (!fn_pid_gate(&key, &start_ts, attach_cookie)) {
     return 0;  // not tracing this pid
   }
   u64 te = bpf_ktime_get_ns();
@@ -750,7 +869,8 @@ static inline __attribute__((always_inline)) int usdt_exit(struct pt_regs* ctx, 
   key.event_id = event_id;
   struct fn_value_t* fn = bpf_map_lookup_elem(&fn_pid_map, &key);
   if (fn == 0) return 0;  // missed entry
-  // Stale pairing: a hot: layer's fn_pid_map lives in bpftime's /dev/shm and outlives a crashed run.
+  // Stale pairing: a hot: layer's fn_pid_map lives in bpftime's /dev/shm and outlives a crashed
+  // run.
   if (fn->ts == 0 || fn->ts > te) {
     bpf_map_delete_elem(&fn_pid_map, &key);  // garbage pairing; free the slot
     return 0;
@@ -813,7 +933,8 @@ static inline __attribute__((always_inline)) void capture_stack_sample(u64 id, u
   u32 zero = 0;
   struct stack_sample_t* ss = bpf_map_lookup_elem(&stack_scratch, &zero);
   if (!ss) return;
-  struct pt_regs* r = (struct pt_regs*)bpf_task_pt_regs((struct task_struct*)bpf_get_current_task_btf());
+  struct pt_regs* r =
+      (struct pt_regs*)bpf_task_pt_regs((struct task_struct*)bpf_get_current_task_btf());
   ss->type = DATACRUMBS_STACK_SAMPLE_TYPE;
   ss->id = id;
   ss->event_id = event_id;
@@ -834,16 +955,19 @@ static inline __attribute__((always_inline)) void capture_stack_sample(u64 id, u
   bpf_ringbuf_output(&output, ss, sizeof(*ss), 0);
 }
 
-// Tracepoint handler: ctx is the raw tracepoint record. A tracepoint is a point event, so this emits
-// directly (no entry/exit pairing). Fields are read from ctx at offsets parsed from the tracepoint's
-// tracefs format at attach.
+// Tracepoint handler: ctx is the raw tracepoint record. A tracepoint is a point event, so this
+// emits directly (no entry/exit pairing). Fields are read from ctx at offsets parsed from the
+// tracepoint's tracefs format at attach.
 static inline __attribute__((always_inline)) int generic_point(void* ctx, u64 attach_cookie) {
   const u64 now = bpf_ktime_get_ns();
   const struct runtime_event_config_t* config = resolve_event_config(attach_cookie);
   if (config == NULL) return 0;
   const u64 event_id = config->event_id;
   struct fn_key_t key = {};
+  // neither branch below reaches fn_pid_gate, which is what excludes the client's sink threads
+  if (is_tracer_thread()) return 0;
   if (config->system_wide) {
+    if (is_self()) return 0;              // as above: the tracer must not observe itself
     key.id = bpf_get_current_pid_tgid();  // capture on all pids
     // ... unless the probe names a tid argument to gate on: keep the wakes OF our threads (whoever
     // the waker is, which is the point of system_wide) and drop every other task's.
@@ -859,7 +983,8 @@ static inline __attribute__((always_inline)) int generic_point(void* ctx, u64 at
     u64 start_ts = 0;
     if (!need_tracing(&key, &start_ts)) return 0;  // default: pid-gated like kprobes
   }
-  if (hot_probe_drop(event_id, now)) return 0;  // rate-limit a runaway (esp. system-wide) tracepoint
+  if (hot_probe_drop(event_id, now))
+    return 0;  // rate-limit a runaway (esp. system-wide) tracepoint
   struct generic_event_t* event;
   DATACRUMBS_RB_RESERVE(output, struct generic_event_t, event);
   event->type = config->probe_kind;
@@ -887,7 +1012,8 @@ static inline __attribute__((always_inline)) int generic_point(void* ctx, u64 at
     if (nb == 0) continue;
     const void* src = (const char*)ctx + config->arg_offset[i];
     if (config->arg_is_pointer[i]) {
-      if (config->arg_index[i] == 1) {  // __data_loc dynamic string: field holds [len:16|rel_off:16]
+      if (config->arg_index[i] ==
+          1) {  // __data_loc dynamic string: field holds [len:16|rel_off:16]
         unsigned int loc = 0;
         bpf_probe_read_kernel(&loc, 4, src);
         unsigned int dl_len = (loc >> 16) & 0xffff;
@@ -953,6 +1079,8 @@ static inline __attribute__((always_inline)) int generic_sample(void* ctx, u64 a
   if (config == NULL) return 0;
   const u64 event_id = config->event_id;
   struct fn_key_t key = {};
+  // neither branch below reaches fn_pid_gate, which is what excludes the client's sink threads
+  if (is_tracer_thread()) return 0;
   if (config->system_wide) {
     key.id = bpf_get_current_pid_tgid();
   } else {

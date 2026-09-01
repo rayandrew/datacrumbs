@@ -5,14 +5,8 @@
 #include <datacrumbs/common/constants.h>
 #include <datacrumbs/datacrumbs_config.h>
 
-static int DATACRUMBS_TS_KEY = 1;
-static int DATACRUMBS_FAILED_EVENTS_KEY = 2;
-
-#define DATACRUMBS_MAX_CAPTURE_ARGS 5
-#define DATACRUMBS_MAX_CAPTURE_BYTES 64
-#define DATACRUMBS_STACK_DEPTH 32  // frames per captured user stack (bpf_get_stackid slot size)
-#define DATACRUMBS_STACKDUMP_BYTES 4000  // user stack bytes per sample (offline DWARF/.eh_frame unwind)
-#define DATACRUMBS_STACK_SAMPLE_TYPE 200u  // generic_event_t.type sentinel for a stack-sample record
+static int DATACRUMBS_TS_KEY __attribute__((unused)) = 1;
+static int DATACRUMBS_FAILED_EVENTS_KEY __attribute__((unused)) = 2;
 
 // A raw user stack snapshot (regs + N bytes from sp) for capture_stack probes whose FP walk is too
 // shallow (crosses a frame-pointer-less vendor lib). Emitted sampled on its own ringbuf record; the
@@ -59,7 +53,7 @@ struct generic_event_t {
   unsigned int arg_data_len[DATACRUMBS_MAX_CAPTURE_ARGS];
   unsigned int arg_data_status[DATACRUMBS_MAX_CAPTURE_ARGS];
   unsigned char arg_data[DATACRUMBS_MAX_CAPTURE_ARGS][DATACRUMBS_MAX_CAPTURE_BYTES];
-  unsigned int pmu_count;                     // hardware counters read (0 = PMU off)
+  unsigned int pmu_count;                      // hardware counters read (0 = PMU off)
   unsigned long long pmu[DATACRUMBS_MAX_PMU];  // per-counter entry->exit delta
   int stack_id;  // BPF_MAP_TYPE_STACK_TRACE id of the user stack at capture; -1 = none
 };
@@ -71,8 +65,6 @@ struct usdt_event_t {
   unsigned long long ts;
   unsigned long long dur;
 };
-
-#define MAX_STR_READ_LEN 256
 
 struct fn_key_t {
   unsigned long long id;
@@ -105,6 +97,15 @@ struct agg_value_t {
   unsigned long long count;
   unsigned long long duration_ns;  // summed entry->exit duration
   unsigned long long pid_tgid;     // a representative pid_tgid for the counter record
+  // A sum and a count give a mean, and a mean hides the tail that usually explains a stall. These
+  // are what dftracer's numeric aggregation carries, so a reader gets the same four fields.
+  unsigned long long min_ns;
+  unsigned long long max_ns;
+  // Sum of squared durations, so a standard deviation can be derived. The accumulator rather than
+  // the deviation itself: min, max, sum and count all merge across windows and a deviation does
+  // not, so a reader that re-buckets a trace would have to throw a computed one away. Saturates
+  // rather than wrapping, since a wrapped value reads as a plausible small variance.
+  unsigned long long sum_sq_ns2;
 };
 
 struct runtime_event_config_t {
