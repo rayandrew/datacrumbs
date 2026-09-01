@@ -120,6 +120,33 @@ class RdmaQpTelemetrySampler : public TelemetrySampler {
   std::vector<std::map<std::string, unsigned long long>> values_;
 };
 
+// Utilisation from procfs, the thing hardware counters cannot tell you.
+//
+// A PMU says how many cycles and instructions ran; it does not say how much of the node was busy,
+// how much memory is resident, or how often a thread was preempted. Those come from procfs, and on
+// this hardware there is no alternative: BlueField-3 exposes only armv8_pmuv3_0 and no uncore PMU
+// at all, so system-wide counters there are the same core events at a different scope rather than
+// different counters. The x86 host does have uncore (8 amd_iommu units plus power), which is where
+// device DMA and package energy become visible.
+//
+// Node scope reads /proc/stat and /proc/meminfo; process scope reads /proc/<pid>/stat and
+// /proc/<pid>/status for the traced tgids, which come from the BPF pid_map like the PMU sampler's.
+// `source.name` is "node" or the pid; each counter's `path` names the field.
+class ProcTelemetrySampler : public TelemetrySampler {
+ public:
+  ProcTelemetrySampler(std::shared_ptr<ChromeWriter> writer, std::vector<TelemetrySource> sources,
+                       unsigned int interval_ms, std::atomic<uint64_t>* event_index, int pid_map_fd)
+      : TelemetrySampler(std::move(writer), std::move(sources), interval_ms, event_index),
+        pid_map_fd_(pid_map_fd) {}
+  ~ProcTelemetrySampler() override { stop(); }
+
+ protected:
+  bool read_raw(std::size_t src, std::size_t ctr, unsigned long long* out) override;
+
+ private:
+  int pid_map_fd_;
+};
+
 // Hardware counters for the TRACED PROCESSES, read on the sampler's own fixed interval.
 //
 // This is the only counter scope that is sound for a workload whose threads block. The cpu-scope

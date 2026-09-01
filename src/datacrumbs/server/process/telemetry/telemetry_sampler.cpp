@@ -1,15 +1,15 @@
+#include <bpf/bpf.h>
 #include <datacrumbs/common/enumerations.h>
 #include <datacrumbs/common/logging.h>
 #include <datacrumbs/common/typedefs.h>
 #include <datacrumbs/server/process/telemetry/telemetry_sampler.h>
-#include <bpf/bpf.h>
 #include <linux/ethtool.h>
-#include <linux/perf_event.h>
 #include <linux/netlink.h>
+#include <linux/perf_event.h>
 #include <linux/rtnetlink.h>
-#include <rdma/rdma_netlink.h>
 #include <linux/sockios.h>
 #include <net/if.h>
+#include <rdma/rdma_netlink.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
@@ -21,6 +21,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <map>
+#include <string>
 #include <vector>
 
 namespace datacrumbs {
@@ -118,7 +121,8 @@ int ethtool_stat_count(int fd, const char* ifname) {
   q.hdr.cmd = ETHTOOL_GSSET_INFO;
   q.hdr.sset_mask = 1ULL << ETH_SS_STATS;
   if (!ethtool_call(fd, ifname, &q)) return -1;
-  return q.hdr.sset_mask ? static_cast<int>(q.hdr.data[0]) : 0;
+  // hdr.data is a kernel zero-length array (linux/ethtool.h); buf[0] is its actual storage.
+  return q.hdr.sset_mask ? static_cast<int>(q.buf[0]) : 0;
 }
 }  // namespace
 
@@ -215,7 +219,9 @@ void for_each_attr(const void* buf, unsigned int len, F&& fn) {
   }
 }
 
-unsigned int attr_type(const NlAttrView& v) { return v.a->nla_type & NLA_TYPE_MASK; }
+unsigned int attr_type(const NlAttrView& v) {
+  return v.a->nla_type & NLA_TYPE_MASK;
+}
 
 // Append one attribute to a netlink request buffer.
 void put_attr(char* buf, std::size_t& off, unsigned short type, const void* data,
@@ -232,8 +238,7 @@ void put_attr(char* buf, std::size_t& off, unsigned short type, const void* data
 int resolve_dev_index(int fd, unsigned int seq, const std::string& want) {
   char req[128] = {};
   auto* nh = reinterpret_cast<struct nlmsghdr*>(req);
-  nh->nlmsg_type =
-      static_cast<unsigned short>(RDMA_NL_GET_TYPE(RDMA_NL_NLDEV, RDMA_NLDEV_CMD_GET));
+  nh->nlmsg_type = static_cast<unsigned short>(RDMA_NL_GET_TYPE(RDMA_NL_NLDEV, RDMA_NLDEV_CMD_GET));
   nh->nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
   nh->nlmsg_seq = seq;
   nh->nlmsg_len = NLMSG_HDRLEN;
@@ -303,8 +308,8 @@ bool RdmaQpTelemetrySampler::refresh(std::size_t src) {
   if (fd_ < 0 || dev_index_[src] < 0) return false;
   char req[256] = {};
   auto* nh = reinterpret_cast<struct nlmsghdr*>(req);
-  nh->nlmsg_type = static_cast<unsigned short>(RDMA_NL_GET_TYPE(RDMA_NL_NLDEV,
-                                                                RDMA_NLDEV_CMD_STAT_GET));
+  nh->nlmsg_type =
+      static_cast<unsigned short>(RDMA_NL_GET_TYPE(RDMA_NL_NLDEV, RDMA_NLDEV_CMD_STAT_GET));
   nh->nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
   nh->nlmsg_seq = ++seq_;
   std::size_t off = NLMSG_HDRLEN;
@@ -445,6 +450,98 @@ bool TaskPmuTelemetrySampler::read_raw(std::size_t src, std::size_t ctr, unsigne
     if (ctr >= fds.size() || fds[ctr] < 0) continue;
     unsigned long long v = 0;
     if (read(fds[ctr], &v, sizeof(v)) == static_cast<ssize_t>(sizeof(v))) {
+      total += v;
+      any = true;
+    }
+  }
+  if (!any) return false;
+  *out = total;
+  return true;
+}
+
+namespace {
+
+// One whitespace-separated field from a procfs line, 1-indexed as procfs(5) numbers them.
+bool field_at(const std::string& line, int index, unsigned long long* out) {
+  const char* p = line.c_str();
+  for (int i = 1; i < index; ++i) {
+    while (*p != '\0' && *p != ' ') ++p;
+    while (*p == ' ') ++p;
+    if (*p == '\0') return false;
+  }
+  char* end = nullptr;
+  const unsigned long long v = std::strtoull(p, &end, 10);
+  if (end == p) return false;
+  *out = v;
+  return true;
+}
+
+// A "key: value" line from /proc/meminfo or /proc/<pid>/status.
+bool keyed_value(const std::string& path, const std::string& key, unsigned long long* out) {
+  std::ifstream f(path);
+  std::string line;
+  while (std::getline(f, line)) {
+    if (line.compare(0, key.size(), key) != 0 || line[key.size()] != ':') continue;
+    return field_at(line.substr(key.size() + 1), 1, out);
+  }
+  return false;
+}
+
+// One field for one pid. utime and stime are fields 14 and 15 of /proc/<pid>/stat and num_threads
+// is 20; resident size comes from status instead because stat reports it in pages while status is
+// already kB.
+bool read_proc_field(const std::string& pid, const std::string& field, unsigned long long* out) {
+  if (field.rfind("Vm", 0) == 0) return keyed_value("/proc/" + pid + "/status", field, out);
+  static const std::map<std::string, int> kStatField = {
+      {"utime", 14}, {"stime", 15}, {"num_threads", 20}, {"minflt", 10}, {"majflt", 12}};
+  const auto it = kStatField.find(field);
+  if (it == kStatField.end()) return false;
+  std::ifstream f("/proc/" + pid + "/stat");
+  std::string line;
+  if (!std::getline(f, line)) return false;
+  // comm is parenthesised and may contain spaces, so index from after the closing paren.
+  const std::size_t close = line.rfind(')');
+  if (close == std::string::npos) return false;
+  return field_at(line.substr(close + 2), it->second - 2, out);
+}
+
+}  // namespace
+
+bool ProcTelemetrySampler::read_raw(std::size_t src, std::size_t ctr, unsigned long long* out) {
+  const std::string& field = sources_[src].counters[ctr].path;
+
+  if (sources_[src].name == "node") {
+    if (field.rfind("mem.", 0) == 0) return keyed_value("/proc/meminfo", field.substr(4), out);
+    std::ifstream f("/proc/stat");
+    std::string line;
+    while (std::getline(f, line)) {
+      if (line.rfind("cpu ", 0) == 0) {
+        // The aggregate cpu line: "cpu" then user nice system idle iowait irq softirq steal.
+        static const char* kCpuFields[] = {"user",   "nice", "system",  "idle",
+                                           "iowait", "irq",  "softirq", "steal"};
+        for (int i = 0; i < 8; ++i)
+          if (field == kCpuFields[i]) return field_at(line, i + 2, out);
+        continue;
+      }
+      if (line.rfind(field + " ", 0) == 0) return field_at(line, 2, out);  // ctxt, processes
+    }
+    return false;
+  }
+
+  // Process scope, summed across the traced tgids exactly as the task PMU sampler does: one value
+  // per counter for the workload as a whole, rather than a source per pid that would churn as
+  // processes come and go.
+  if (pid_map_fd_ < 0) return false;
+  unsigned int key = 0, next = 0;
+  bool first = true, any = false;
+  unsigned long long total = 0;
+  std::size_t seen = 0;
+  while (bpf_map_get_next_key(pid_map_fd_, first ? nullptr : &key, &next) == 0) {
+    first = false;
+    key = next;
+    if (++seen > 4096) break;
+    unsigned long long v = 0;
+    if (read_proc_field(std::to_string(next), field, &v)) {
       total += v;
       any = true;
     }
