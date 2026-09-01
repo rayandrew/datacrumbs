@@ -35,18 +35,26 @@ struct ProgressSnapshot {
   double rate = 0.0;
 };
 
-inline FILE* get_log_file() {
+inline FILE*& log_stream() {
 #ifdef LOG_TO_FILE
-  static FILE* file = std::fopen(LOG_FILE_PATH, "a");
-  return file;
+  static FILE* stream = std::fopen(LOG_FILE_PATH, "a");
 #else
-  return stdout;
+  static FILE* stream = stdout;
 #endif
+  return stream;
 }
+
+inline FILE* get_log_file() { return log_stream(); }
 
 inline std::mutex& get_log_mutex() {
   static std::mutex mtx;
   return mtx;
+}
+
+inline void set_log_stream(FILE* stream) {
+  if (stream == nullptr) return;
+  std::lock_guard<std::mutex> lock(get_log_mutex());
+  log_stream() = stream;
 }
 
 inline std::mutex& get_progress_mutex() {
@@ -88,7 +96,8 @@ inline void write_log_fragment(const std::string& message) {
   std::fflush(out);
 }
 
-inline void log_message_fmt(const char* level, const char* fmt, ...) {
+__attribute__((format(printf, 2, 3))) inline void log_message_fmt(const char* level,
+                                                                  const char* fmt, ...) {
   va_list args;
   va_start(args, fmt);
   const std::string message = format_message(fmt, args);
@@ -96,22 +105,13 @@ inline void log_message_fmt(const char* level, const char* fmt, ...) {
   write_log_line(level, message);
 }
 
-inline void log_message_fmt_no_new_line(const char* /*level*/, const char* fmt, ...) {
+__attribute__((format(printf, 2, 3))) inline void log_message_fmt_no_new_line(
+    const char* /*level*/, const char* fmt, ...) {
   va_list args;
   va_start(args, fmt);
   const std::string message = format_message(fmt, args);
   va_end(args);
   write_log_fragment(message);
-}
-
-template <typename... Args>
-inline void log_message(const char* level, const char* fmt, Args&&... args) {
-  log_message_fmt(level, fmt, std::forward<Args>(args)...);
-}
-
-template <typename... Args>
-inline void log_message_no_new_line(const char* level, const char* fmt, Args&&... args) {
-  log_message_fmt_no_new_line(level, fmt, std::forward<Args>(args)...);
 }
 
 inline std::string format_compact_count(double value) {
@@ -254,36 +254,40 @@ inline void log_progress(
 
 }  // namespace datacrumbs::logging_internal
 
-#define DC_LOG_PRINT(...) datacrumbs::logging_internal::log_message("PRINT", __VA_ARGS__)
+// Diagnostics default to stdout. An LD_PRELOAD client must redirect them to stderr: its stdout
+// belongs to the program being traced, which reports its own results there.
+#define DC_LOG_SET_STREAM(stream) datacrumbs::logging_internal::set_log_stream(stream)
+
+#define DC_LOG_PRINT(...) datacrumbs::logging_internal::log_message_fmt("PRINT", __VA_ARGS__)
 #define DC_LOG_PRINT_NO_NEW_LINE(...) \
-  datacrumbs::logging_internal::log_message_no_new_line("PRINT", __VA_ARGS__)
+  datacrumbs::logging_internal::log_message_fmt_no_new_line("PRINT", __VA_ARGS__)
 
 #if DATACRUMBS_LOG_LEVEL >= LOG_LEVEL_ERROR
-#define DC_LOG_ERROR(...) datacrumbs::logging_internal::log_message("ERROR", __VA_ARGS__)
+#define DC_LOG_ERROR(...) datacrumbs::logging_internal::log_message_fmt("ERROR", __VA_ARGS__)
 #else
 #define DC_LOG_ERROR(...) (void)0
 #endif
 
 #if DATACRUMBS_LOG_LEVEL >= LOG_LEVEL_WARN
-#define DC_LOG_WARN(...) datacrumbs::logging_internal::log_message("WARN", __VA_ARGS__)
+#define DC_LOG_WARN(...) datacrumbs::logging_internal::log_message_fmt("WARN", __VA_ARGS__)
 #else
 #define DC_LOG_WARN(...) (void)0
 #endif
 
 #if DATACRUMBS_LOG_LEVEL >= LOG_LEVEL_INFO
-#define DC_LOG_INFO(...) datacrumbs::logging_internal::log_message("INFO", __VA_ARGS__)
+#define DC_LOG_INFO(...) datacrumbs::logging_internal::log_message_fmt("INFO", __VA_ARGS__)
 #else
 #define DC_LOG_INFO(...) (void)0
 #endif
 
 #if DATACRUMBS_LOG_LEVEL >= LOG_LEVEL_DEBUG
-#define DC_LOG_DEBUG(...) datacrumbs::logging_internal::log_message("DEBUG", __VA_ARGS__)
+#define DC_LOG_DEBUG(...) datacrumbs::logging_internal::log_message_fmt("DEBUG", __VA_ARGS__)
 #else
 #define DC_LOG_DEBUG(...) (void)0
 #endif
 
 #if DATACRUMBS_LOG_LEVEL >= LOG_LEVEL_TRACE
-#define DC_LOG_TRACE(...) datacrumbs::logging_internal::log_message("TRACE", __VA_ARGS__)
+#define DC_LOG_TRACE(...) datacrumbs::logging_internal::log_message_fmt("TRACE", __VA_ARGS__)
 #else
 #define DC_LOG_TRACE(...) (void)0
 #endif
