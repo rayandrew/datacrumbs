@@ -116,10 +116,8 @@ int EventProcessor::handle_event(void* data, size_t data_sz) {
   // offline DWARF unwinder (they are not chrome events).
   if (data != nullptr && *static_cast<const unsigned int*>(data) == DATACRUMBS_STACK_SAMPLE_TYPE) {
     if (!stack_sink_.is_open()) {
-      const char* ld = getenv("DATACRUMBS_LOG_DIR");
-      const char* rid = getenv("DATACRUMBS_SERVICE_RUN_ID");
-      std::string p =
-          std::string(ld ? ld : "/tmp") + "/" + (rid ? rid : "x") + "/stack_samples.bin";
+      std::string p = configManager_->stack_sample_log_dir + "/" +
+                      configManager_->stack_sample_run_id + "/stack_samples.bin";
       stack_sink_.open(p, std::ios::binary | std::ios::app);
     }
     if (stack_sink_.is_open()) stack_sink_.write(static_cast<const char*>(data), data_sz);
@@ -139,10 +137,8 @@ int EventProcessor::handle_event(void* data, size_t data_sz) {
   }
   auto it = configManager_->category_map.find(event->event_id);
   if (it != configManager_->category_map.end()) {
-    const auto& [probe_name, function_name] = it->second;
-    // Print event info to stdout for debugging
-    DC_LOG_DEBUG("%-6u  %-6llu  %s.%s", pid, event->event_id, probe_name.c_str(),
-                 function_name.c_str());
+    DC_LOG_DEBUG("%-6u  %-6llu  %s.%s", pid, event->event_id, it->second.first.c_str(),
+                 it->second.second.c_str());
     // Write event to Chrome trace file
     auto writer = datacrumbs::Singleton<datacrumbs::ChromeWriter>::get_instance();
     if (!writer) {
@@ -153,9 +149,9 @@ int EventProcessor::handle_event(void* data, size_t data_sz) {
     auto metadata = configManager_->get_runtime_event_metadata(event->event_id);
     auto runtime_args = build_runtime_args(event, metadata);
     append_ustack(runtime_args, stack_map_fd_, event->stack_id);
-    auto write_event =
-        new datacrumbs::EventWithId(datacrumbs::TracePhase::COMPLETE, event_index.fetch_add(1), event->type, event->id,
-                                    event->event_id, event->ts, event->dur, runtime_args.release());
+    auto write_event = new datacrumbs::EventWithId(
+        datacrumbs::TracePhase::COMPLETE, event_index.fetch_add(1), event->type, event->id,
+        event->event_id, event->ts, event->dur, runtime_args.release());
     write_event->pmu_count = std::min<unsigned int>(event->pmu_count, DATACRUMBS_MAX_PMU);
     for (unsigned int i = 0; i < write_event->pmu_count; ++i) write_event->pmu[i] = event->pmu[i];
     writer->push_event(write_event);
@@ -240,15 +236,34 @@ int EventProcessor::update_filename(const char* filename, unsigned int hash) {
   auto args = new DataCrumbsArgs();
   args->emplace("value", file_str);
   args->emplace("hash", hash);
-  auto event =
-      new datacrumbs::EventWithId(datacrumbs::TracePhase::METADATA, event_index.fetch_add(1), 0, 0, 0, 0, 0, args);
+  auto event = new datacrumbs::EventWithId(datacrumbs::TracePhase::METADATA,
+                                           event_index.fetch_add(1), 0, 0, 0, 0, 0, args);
   if (writer_) {
     writer_->push_event(event);  // async path; metadata is order-independent
   }
   return 0;
 }
 int EventProcessor::finalize() {
-  DC_LOG_PRINT("Collected %d events and failed %d events", event_index.load(), failed_events);
+  DC_LOG_PRINT("Collected %llu events and failed %d events",
+               static_cast<unsigned long long>(event_index.load()), failed_events);
+  // A run that blocked here collected nothing for that long, so the trace ends early and reads as a
+  // quiet workload. Stated plainly, because no other line in this summary would show it.
+  if (writer_ != nullptr && writer_->stall_count() > 0) {
+    DC_LOG_WARN(
+        "writer backpressure held producers for %.1f s across %llu stalls and dropped %llu events; "
+        "the trace is sampled over that period, not missing it",
+        static_cast<double>(writer_->stall_ns()) / 1e9,
+        static_cast<unsigned long long>(writer_->stall_count()),
+        static_cast<unsigned long long>(writer_->dropped()));
+    // Also into the trace, because whoever reads it later is not reading this log. Without it a
+    // truncated run is indistinguishable from a short one at analysis time.
+    auto* stall_args = new DataCrumbsArgs();
+    (*stall_args)["stall_ns"] = static_cast<unsigned long long>(writer_->stall_ns());
+    (*stall_args)["stall_count"] = static_cast<unsigned long long>(writer_->stall_count());
+    (*stall_args)["dropped"] = static_cast<unsigned long long>(writer_->dropped());
+    writer_->push_event(new datacrumbs::EventWithId(
+        datacrumbs::TracePhase::METADATA, event_index.fetch_add(1), 0, 0, 0, 0, 0, stall_args));
+  }
   auto writer_ = datacrumbs::Singleton<datacrumbs::ChromeWriter>::get_instance();
   if (writer_) {
     writer_->finalize();

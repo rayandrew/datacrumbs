@@ -1,4 +1,5 @@
 // Internal headers
+#include <datacrumbs/common/constants.h>
 #include <datacrumbs/common/enumerations.h>
 #include <datacrumbs/common/runtime_configuration_manager.h>
 #include <datacrumbs/common/singleton.h>
@@ -8,6 +9,8 @@
 #include <datacrumbs/server/process/plugin_loader.h>
 #include <datacrumbs/server/process/telemetry/perf_telemetry_sampler.h>
 #include <datacrumbs/server/process/telemetry/telemetry_sampler.h>
+
+#include <cmath>
 
 // system headers
 #include <linux/perf_event.h>
@@ -23,16 +26,27 @@
 #include <fstream>
 #include <regex>
 #include <sstream>
+#include <dirent.h>
+
 #include <string>
 #include <unordered_map>
 #include <vector>
 
-// event_id -> its attached links, so a runaway probe can be fully detached at runtime (auto-detach).
+// event_id -> its attached links, so a runaway probe can be fully detached at runtime
+// (auto-detach).
 static std::unordered_map<uint64_t, std::vector<struct bpf_link*>> g_runtime_links;
 
 static int libbpf_print_fn(enum libbpf_print_level level, const char* format, va_list args) {
   if (level >= LIBBPF_DEBUG) return 0;
-  return vfprintf(stderr, format, args);
+  // libbpf terminates its own lines; the log adds one.
+  std::string message = datacrumbs::logging_internal::format_message(format, args);
+  while (!message.empty() && (message.back() == '\n' || message.back() == '\r')) message.pop_back();
+  if (level == LIBBPF_WARN) {
+    DC_LOG_WARN("[libbpf] %s", message.c_str());
+  } else {
+    DC_LOG_INFO("[libbpf] %s", message.c_str());
+  }
+  return static_cast<int>(message.size());
 }
 
 static bool is_char_pointer_type(const std::string& c_type) {
@@ -79,6 +93,26 @@ static bool split_uprobe_target(const std::string& symbol_with_offset, std::stri
   *symbol_name = symbol_with_offset.substr(0, pos);
   *offset = std::stoul(symbol_with_offset.substr(pos + 1), nullptr, 0);
   return true;
+}
+
+/// Every datacrumbs shared library beside the client. The sink markers are inline in a header, so
+/// each module owning a sink has a copy at its own address and needs its own uprobe.
+static std::vector<std::string> datacrumbs_libraries() {
+  std::vector<std::string> libs{DATACRUMBS_CLIENT_LIB};
+  const std::string client = DATACRUMBS_CLIENT_LIB;
+  const std::size_t slash = client.rfind('/');
+  if (slash == std::string::npos) return libs;
+  const std::string dir = client.substr(0, slash);
+  DIR* d = opendir(dir.c_str());
+  if (d == nullptr) return libs;
+  while (const dirent* ent = readdir(d)) {
+    const std::string name = ent->d_name;
+    if (name.rfind("libdatacrumbs", 0) != 0 || name.find(".so") == std::string::npos) continue;
+    const std::string path = dir + "/" + name;
+    if (path != client) libs.push_back(path);
+  }
+  closedir(d);
+  return libs;
 }
 
 static std::string normalize_syscall_name_for_attach(const std::string& function_name) {
@@ -145,6 +179,10 @@ static bool resolve_perf_event(const std::string& name, unsigned int* type,
   return true;
 }
 
+// Set when a kprobe, uprobe, syscall or usdt probe asks to be system wide. Read once after attach
+// to prime fn_gate_ctl.
+static bool g_fn_system_wide_requested = false;
+
 static int populate_event_arg_config(int map_fd, uint64_t cookie, uint64_t event_id,
                                      datacrumbs::ProbeType probe_type,
                                      const std::vector<datacrumbs::ProbeArgCaptureSpec>* arg_specs,
@@ -155,6 +193,13 @@ static int populate_event_arg_config(int map_fd, uint64_t cookie, uint64_t event
   config.event_id = event_id;
   config.probe_kind = runtime_probe_kind(probe_type);
   config.system_wide = system_wide ? 1u : 0u;
+  // A function probe that wants every process has to defeat the traced-pid gate, and that costs a
+  // config lookup on hits the gate would otherwise reject immediately. Recorded here so the BPF
+  // side pays it only when some probe actually asked.
+  if (system_wide && config.probe_kind != DATACRUMBS_RUNTIME_PROBE_KIND_TRACEPOINT &&
+      config.probe_kind != DATACRUMBS_RUNTIME_PROBE_KIND_PERF_EVENT) {
+    g_fn_system_wide_requested = true;
+  }
   config.aggregate = aggregate ? 1u : 0u;
   config.capture_stack = capture_stack ? 1u : 0u;
   config.stack_dump_mask = stack_dump_mask;
@@ -194,16 +239,18 @@ static int populate_event_arg_config(int map_fd, uint64_t cookie, uint64_t event
     }
   }
   if (bpf_map_update_elem(map_fd, &cookie, &config, BPF_ANY) < 0) {
-    DC_LOG_ERROR("Failed to populate event_arg_config_map for cookie=%llu event_id=%llu", cookie,
-                 event_id);
+    DC_LOG_ERROR("Failed to populate event_arg_config_map for cookie=%llu event_id=%llu",
+                 static_cast<unsigned long long>(cookie),
+                 static_cast<unsigned long long>(event_id));
     return -1;
   }
   return 0;
 }
 
 // Parse a tracepoint's tracefs `format` into arg-capture specs (field label, byte offset, size).
-// Scalars (<=8B) -> args; fixed char arrays and __data_loc dynamic strings -> byte capture. Skips the
-// common_* header fields. Empty result (unreadable format) leaves the tracepoint with no decoded args.
+// Scalars (<=8B) -> args; fixed char arrays and __data_loc dynamic strings -> byte capture. Skips
+// the common_* header fields. Empty result (unreadable format) leaves the tracepoint with no
+// decoded args.
 static std::vector<datacrumbs::ProbeArgCaptureSpec> parse_tracepoint_fields(
     const std::string& category, const std::string& name) {
   std::vector<datacrumbs::ProbeArgCaptureSpec> specs;
@@ -252,12 +299,12 @@ static std::vector<datacrumbs::ProbeArgCaptureSpec> parse_tracepoint_fields(
   return specs;
 }
 
-// Destroy the links of a runaway probe: one whose dropped counter keeps climbing past the rate limit
-// for kHotChecks consecutive checks. hot_probe_drop only rate-limits it (still fires); this removes
-// it. Irreversible for the run; logged. Off with DATACRUMBS_AUTODETACH=0.
+// Destroy the links of a runaway probe: one whose dropped counter keeps climbing past the rate
+// limit for kHotChecks consecutive checks. hot_probe_drop only rate-limits it (still fires); this
+// removes it. Irreversible for the run; logged. Off with DATACRUMBS_AUTODETACH=0.
 static void poll_auto_detach(int probe_guard_fd, datacrumbs::EventProcessor* event_processor) {
   static constexpr unsigned long long kDropsPerCheck = 200000;  // >200k drops/check = runaway
-  static constexpr int kHotChecks = 3;                          // sustained over N checks, not a burst
+  static constexpr int kHotChecks = 3;  // sustained over N checks, not a burst
   static std::unordered_map<uint64_t, unsigned long long> last_dropped;
   static std::unordered_map<uint64_t, int> hot_checks;
   if (probe_guard_fd < 0) return;
@@ -300,11 +347,31 @@ static void drain_agg_map(int agg_fd, datacrumbs::EventProcessor* event_processo
     bpf_map_delete_elem(agg_fd, &k);
     if (config_manager->category_map.find(k.event_id) == config_manager->category_map.end()) return;
     auto* args = new DataCrumbsArgs();
-    (*args)["count"] = static_cast<unsigned long long>(v.count);
-    (*args)["dur"] = static_cast<unsigned long long>(v.duration_ns / 1000);  // summed us (dftracer key)
-    auto* aggregated =
-        new datacrumbs::EventWithId(datacrumbs::TracePhase::AGGREGATED, 0, 0, v.pid_tgid, k.event_id,
-                                    k.time_interval * DATACRUMBS_TIME_INTERVAL_NS, 0, args);
+    // dftracer's aggregation keys: dft_cnt for the count, <key>_sum/_min/_max for a numeric key,
+    // here the duration. Values are in the unit the trace declares in its time_metric record, so
+    // nothing carries a unit in its name.
+    (*args)["dft_cnt"] = static_cast<unsigned long long>(v.count);
+    (*args)["dur_sum"] =
+        static_cast<unsigned long long>(v.duration_ns / DATACRUMBS_TIME_DIVISOR_NS);
+    (*args)["dur_min"] = static_cast<unsigned long long>(v.min_ns / DATACRUMBS_TIME_DIVISOR_NS);
+    (*args)["dur_max"] = static_cast<unsigned long long>(v.max_ns / DATACRUMBS_TIME_DIVISOR_NS);
+    // Ours; dftracer has no equivalent. Without it a reader cannot recompute the deviation or
+    // merge two windows.
+    (*args)["dur_sum_sq"] = static_cast<unsigned long long>(
+        v.sum_sq_ns2 / (DATACRUMBS_TIME_DIVISOR_NS * DATACRUMBS_TIME_DIVISOR_NS));
+    // Derived here as well as accumulated, so the common case needs no arithmetic from the reader.
+    // Population deviation, since the bucket is the whole set of events in that window, not a
+    // sample of it. The subtraction can go slightly negative on rounding, so it is clamped.
+    if (v.count > 0) {
+      const double n = static_cast<double>(v.count);
+      const double mean = static_cast<double>(v.duration_ns) / n;
+      const double var = static_cast<double>(v.sum_sq_ns2) / n - mean * mean;
+      (*args)["dur_std"] = static_cast<unsigned long long>(
+          (var > 0.0 ? std::sqrt(var) : 0.0) / static_cast<double>(DATACRUMBS_TIME_DIVISOR_NS));
+    }
+    auto* aggregated = new datacrumbs::EventWithId(
+        datacrumbs::TracePhase::AGGREGATED, 0, 0, v.pid_tgid, k.event_id,
+        k.time_interval * DATACRUMBS_TIME_INTERVAL_NS, 0, args);
     event_processor->writer_->push_event(aggregated);
   });
 }
@@ -316,7 +383,8 @@ static void drain_agg_map(int agg_fd, datacrumbs::EventProcessor* event_processo
 static int attach_hot_via_bpftime(struct bpf_object* obj, int kernel_cfg_fd,
                                   const std::string& binary, unsigned long offset,
                                   unsigned long long cookie) {
-  if (!getenv("DC_BPFTIME_HOT")) return -1;
+  if (!datacrumbs::Singleton<datacrumbs::RuntimeConfigurationManager>::get_instance()->bpftime_hot)
+    return -1;
   if (datacrumbs::bpftime_hot_init(obj) != 0) return -1;
   return datacrumbs::bpftime_hot_attach_uprobe(binary, offset, cookie, kernel_cfg_fd);
 }
@@ -327,6 +395,8 @@ static int attach_runtime_probes(datacrumbs::EventProcessor* event_processor,
   auto config_manager = event_processor->configManager_;
   auto* client_start = bpf_object__find_program_by_name(skel->obj, "trace_client_start");
   auto* client_stop = bpf_object__find_program_by_name(skel->obj, "trace_client_stop");
+  auto* io_begin = bpf_object__find_program_by_name(skel->obj, "trace_io_thread_begin");
+  auto* io_end = bpf_object__find_program_by_name(skel->obj, "trace_io_thread_end");
   auto* kprobe_entry = bpf_object__find_program_by_name(skel->obj, "trace_generic_kprobe_entry");
   auto* kprobe_exit = bpf_object__find_program_by_name(skel->obj, "trace_generic_kprobe_exit");
   auto* syscall_entry = bpf_object__find_program_by_name(skel->obj, "trace_generic_syscall_entry");
@@ -335,8 +405,7 @@ static int attach_runtime_probes(datacrumbs::EventProcessor* event_processor,
   auto* uprobe_exit = bpf_object__find_program_by_name(skel->obj, "trace_generic_uprobe_exit");
   auto* usdt_entry = bpf_object__find_program_by_name(skel->obj, "trace_generic_usdt_entry");
   auto* usdt_exit = bpf_object__find_program_by_name(skel->obj, "trace_generic_usdt_exit");
-  auto* tracepoint_prog =
-      bpf_object__find_program_by_name(skel->obj, "trace_generic_tracepoint");
+  auto* tracepoint_prog = bpf_object__find_program_by_name(skel->obj, "trace_generic_tracepoint");
   auto* perf_sample_prog = bpf_object__find_program_by_name(skel->obj, "trace_generic_perf_sample");
   const int event_arg_config_fd = bpf_map__fd(skel->maps.event_arg_config_map);
 
@@ -381,6 +450,29 @@ static int attach_runtime_probes(datacrumbs::EventProcessor* event_processor,
       DC_LOG_ERROR("Failed to attach datacrumbs client hooks for %s", DATACRUMBS_CLIENT_LIB);
       return 1;
     }
+
+    // Probing only the client library left every other module's worker unmarked: one api_trace
+    // worker put 120k ext4 events of its own into a measured trace.
+    if (io_begin != nullptr && io_end != nullptr) {
+      int marked = 0;
+      for (const std::string& lib : datacrumbs_libraries()) {
+        struct bpf_uprobe_opts b = {};
+        b.sz = sizeof(b);
+        b.func_name = "datacrumbs_io_thread_begin";
+        struct bpf_uprobe_opts e = {};
+        e.sz = sizeof(e);
+        e.func_name = "datacrumbs_io_thread_end";
+        auto* bl = bpf_program__attach_uprobe_opts(io_begin, -1, lib.c_str(), 0, &b);
+        auto* el = bpf_program__attach_uprobe_opts(io_end, -1, lib.c_str(), 0, &e);
+        if (!libbpf_get_error(bl) && !libbpf_get_error(el)) ++marked;
+      }
+      if (marked == 0)
+        DC_LOG_WARN("No sink-thread hooks attached; datacrumbs' own writes will be traced");
+      else
+        DC_LOG_PRINT("Sink-thread exclusion attached to %d datacrumbs libraries", marked);
+    } else {
+      DC_LOG_WARN("Sink-thread BPF programs absent; datacrumbs' own writes will be traced");
+    }
   }
 
   int total_requested = 0;
@@ -403,7 +495,7 @@ static int attach_runtime_probes(datacrumbs::EventProcessor* event_processor,
       if (probe->type == datacrumbs::ProbeType::KPROBE) {
         total_requested += 2;
         if (populate_event_arg_config(event_arg_config_fd, current_cookie, *event_id, probe->type,
-                                      probe->getArgSpecs(function_name), false,
+                                      probe->getArgSpecs(function_name), probe->system_wide,
                                       probe->aggregate) != 0) {
           total_failed += 2;
           continue;
@@ -434,7 +526,7 @@ static int attach_runtime_probes(datacrumbs::EventProcessor* event_processor,
         total_requested += 2;
         const std::string syscall_name = normalize_syscall_name_for_attach(function_name);
         if (populate_event_arg_config(event_arg_config_fd, current_cookie, *event_id, probe->type,
-                                      probe->getArgSpecs(function_name), false,
+                                      probe->getArgSpecs(function_name), probe->system_wide,
                                       probe->aggregate) != 0) {
           total_failed += 2;
           continue;
@@ -474,7 +566,7 @@ static int attach_runtime_probes(datacrumbs::EventProcessor* event_processor,
           continue;
         }
         if (populate_event_arg_config(event_arg_config_fd, current_cookie, *event_id, probe->type,
-                                      probe->getArgSpecs(function_name), false,
+                                      probe->getArgSpecs(function_name), probe->system_wide,
                                       probe->aggregate) != 0) {
           total_failed += 2;
           continue;
@@ -519,7 +611,7 @@ static int attach_runtime_probes(datacrumbs::EventProcessor* event_processor,
         total_requested += 2;
         auto usdt = std::dynamic_pointer_cast<datacrumbs::USDTProbe>(probe);
         if (populate_event_arg_config(event_arg_config_fd, current_cookie, *event_id, probe->type,
-                                      probe->getArgSpecs(function_name), false,
+                                      probe->getArgSpecs(function_name), probe->system_wide,
                                       probe->aggregate) != 0) {
           total_failed += 2;
           continue;
@@ -551,19 +643,20 @@ static int attach_runtime_probes(datacrumbs::EventProcessor* event_processor,
         total_attached += 2;
       } else if (probe->type == datacrumbs::ProbeType::TRACEPOINT) {
         total_requested += 1;  // point event -> one attach, not entry+exit
-        // function_name is "category:name" (e.g. "sched:sched_switch"); libbpf attaches by (cat,name).
+        // function_name is "category:name" (e.g. "sched:sched_switch"); libbpf attaches by
+        // (cat,name).
         const auto colon = function_name.find(':');
         const std::string tp_category =
             colon == std::string::npos ? std::string() : function_name.substr(0, colon);
         const std::string tp_name =
             colon == std::string::npos ? function_name : function_name.substr(colon + 1);
-        // Decode the tracepoint's fields (offset/size from tracefs format) so generic_point can read
-        // them, and register their labels so the writer names them.
+        // Decode the tracepoint's fields (offset/size from tracefs format) so generic_point can
+        // read them, and register their labels so the writer names them.
         std::vector<datacrumbs::ProbeArgCaptureSpec> tp_fields =
             parse_tracepoint_fields(tp_category, tp_name);
         // An explicit function_arguments wins over the tracefs auto-parse. The auto-parse takes the
-        // first DATACRUMBS_MAX_CAPTURE_ARGS fields in file order, which for sched_switch fills every
-        // slot before reaching next_pid - the field wake->run (run-queue) latency needs.
+        // first DATACRUMBS_MAX_CAPTURE_ARGS fields in file order, which for sched_switch fills
+        // every slot before reaching next_pid - the field wake->run (run-queue) latency needs.
         const auto* yaml_specs = probe->getArgSpecs(function_name);
         const bool use_yaml = yaml_specs != nullptr && !yaml_specs->empty();
         if (use_yaml) tp_fields.clear();
@@ -586,8 +679,8 @@ static int attach_runtime_probes(datacrumbs::EventProcessor* event_processor,
         auto* tp_link = bpf_program__attach_tracepoint_opts(tracepoint_prog, tp_category.c_str(),
                                                             tp_name.c_str(), &tp_opts);
         if (libbpf_get_error(tp_link)) {
-          DC_LOG_WARN("tracepoint attach FAILED %s:%s err=%ld", tp_category.c_str(), tp_name.c_str(),
-                      libbpf_get_error(tp_link));
+          DC_LOG_WARN("tracepoint attach FAILED %s:%s err=%ld", tp_category.c_str(),
+                      tp_name.c_str(), libbpf_get_error(tp_link));
           config_manager->record_invalid_runtime_probe(probe, function_name);
           runtime_probe_state_updated = true;
           total_failed += 1;
@@ -691,7 +784,8 @@ static int main_process(datacrumbs::EventProcessor* event_processor) {
     return 1;
   }
 
-  // Let plugins prime BPF maps before probes fire (e.g. the pmu plugin fills the perf-event arrays).
+  // Let plugins prime BPF maps before probes fire (e.g. the pmu plugin fills the perf-event
+  // arrays).
   datacrumbs::PluginBpfContext bpf_ctx;
   bpf_ctx.get_map_fd = [skel](const char* name) -> int {
     struct bpf_map* m = bpf_object__find_map_by_name(skel->obj, name);
@@ -710,6 +804,31 @@ static int main_process(datacrumbs::EventProcessor* event_processor) {
     DC_LOG_ERROR("Failed to attach runtime probes: %d", err);
     datacrumbs_bpf__destroy(skel);
     return 1;
+  }
+  // Before the gate opens: a system_wide probe fires for every process on the machine, this one
+  // included, and anything the writer does on the way to writing a record then produces another.
+  {
+    struct bpf_map* self = bpf_object__find_map_by_name(skel->obj, "self_ctl");
+    const unsigned int zero = 0;
+    const unsigned int self_tgid = static_cast<unsigned int>(getpid());
+    if (self == nullptr ||
+        bpf_map_update_elem(bpf_map__fd(self), &zero, &self_tgid, BPF_ANY) != 0) {
+      DC_LOG_WARN("self_ctl could not be set; system_wide probes will also capture the tracer");
+    }
+  }
+
+  // After attach, because that is when every probe's config has been written and the answer is
+  // known. Left at zero otherwise, which keeps the untraced-pid bail immediate.
+  if (g_fn_system_wide_requested) {
+    struct bpf_map* gate = bpf_object__find_map_by_name(skel->obj, "fn_gate_ctl");
+    const unsigned int zero = 0, one = 1;
+    if (gate == nullptr || bpf_map_update_elem(bpf_map__fd(gate), &zero, &one, BPF_ANY) != 0) {
+      DC_LOG_ERROR(
+          "system_wide function probes configured but fn_gate_ctl could not be set; "
+          "they will only see traced processes");
+    } else {
+      DC_LOG_INFO("system_wide function probes enabled: untraced processes are captured too");
+    }
   }
 
 #if !(defined(DATACRUMBS_ENABLE) && (DATACRUMBS_ENABLE == 1))
@@ -836,7 +955,10 @@ static int main_process(datacrumbs::EventProcessor* event_processor) {
               event_processor->configManager_->trace_file_path.c_str());
 
   signal(SIGINT, sig_handler);
+#if (defined(DATACRUMBS_BPFTIME_COMPATIBLE_FLAG) && (DATACRUMBS_BPFTIME_COMPATIBLE_FLAG == 0)) || \
+    (defined(DATACRUMBS_MODE) && (DATACRUMBS_MODE == 2))
   unsigned int batch_size = 1024;
+#endif
 #if defined(DATACRUMBS_BPFTIME_COMPATIBLE_FLAG) && (DATACRUMBS_BPFTIME_COMPATIBLE_FLAG == 0)
   struct string_t* keys =
       static_cast<struct string_t*>(malloc(batch_size * sizeof(struct string_t)));
@@ -873,8 +995,7 @@ static int main_process(datacrumbs::EventProcessor* event_processor) {
 #endif
 
   const int probe_guard_fd = bpf_map__fd(skel->maps.probe_guard);
-  const char* autodetach_env = std::getenv("DATACRUMBS_AUTODETACH");
-  const bool autodetach = autodetach_env == nullptr || std::strcmp(autodetach_env, "0") != 0;
+  const bool autodetach = event_processor->configManager_->autodetach;
   time_t last_autodetach = time(nullptr);
 #if defined(DATACRUMBS_MODE) && (DATACRUMBS_MODE == 1)
   const int agg_fd = bpf_map__fd(skel->maps.agg_map);
@@ -889,6 +1010,7 @@ static int main_process(datacrumbs::EventProcessor* event_processor) {
   std::vector<datacrumbs::TelemetrySource> ethtool_sources;
   std::vector<datacrumbs::TelemetrySource> rdma_qp_sources;
   std::vector<datacrumbs::TelemetrySource> task_pmu_sources;
+  std::vector<datacrumbs::TelemetrySource> proc_sources;
 #if defined(DATACRUMBS_ENABLE_HW_COUNTERS) && (DATACRUMBS_ENABLE_HW_COUNTERS == 1)
   std::vector<datacrumbs::TelemetrySource> perf_sources;
 #endif
@@ -900,6 +1022,10 @@ static int main_process(datacrumbs::EventProcessor* event_processor) {
     }
     if (is_perf && src.counters[0].perf_event == "rdma_qp") {
       rdma_qp_sources.push_back(src);
+      continue;
+    }
+    if (src.counters[0].perf_event == "proc") {
+      proc_sources.push_back(src);
       continue;
     }
     if (is_perf && src.counters[0].perf_event == "task_pmu") {
@@ -921,10 +1047,9 @@ static int main_process(datacrumbs::EventProcessor* event_processor) {
                                                   std::move(sysfs_sources), telemetry_interval,
                                                   &event_processor->event_index);
   sysfs_sampler.start();
-  datacrumbs::EthtoolTelemetrySampler ethtool_sampler(event_processor->writer_,
-                                                      std::move(ethtool_sources),
-                                                      telemetry_interval,
-                                                      &event_processor->event_index);
+  datacrumbs::EthtoolTelemetrySampler ethtool_sampler(
+      event_processor->writer_, std::move(ethtool_sources), telemetry_interval,
+      &event_processor->event_index);
   ethtool_sampler.start();
   datacrumbs::RdmaQpTelemetrySampler rdma_qp_sampler(event_processor->writer_,
                                                      std::move(rdma_qp_sources), telemetry_interval,
@@ -934,18 +1059,56 @@ static int main_process(datacrumbs::EventProcessor* event_processor) {
       event_processor->writer_, std::move(task_pmu_sources), telemetry_interval,
       &event_processor->event_index, bpf_map__fd(skel->maps.pid_map));
   task_pmu_sampler.start();
+  datacrumbs::ProcTelemetrySampler proc_sampler(event_processor->writer_, std::move(proc_sources),
+                                                telemetry_interval, &event_processor->event_index,
+                                                bpf_map__fd(skel->maps.pid_map));
+  proc_sampler.start();
 #if defined(DATACRUMBS_ENABLE_HW_COUNTERS) && (DATACRUMBS_ENABLE_HW_COUNTERS == 1)
   datacrumbs::PerfTelemetrySampler perf_sampler(event_processor->writer_, std::move(perf_sources),
                                                 telemetry_interval, &event_processor->event_index);
   perf_sampler.start();
 #endif
 
+  // Plugin samplers: one thread each, owned here so they cannot outlive the writer they emit into.
+  // A plugin gets no writer handle at all; it hands back an event and the core stamps and pushes
+  // it.
+  std::vector<std::thread> plugin_threads;
+  std::atomic<bool> plugin_running{true};
+  for (const auto& spec : datacrumbs::plugin_samplers()) {
+    plugin_threads.emplace_back([&plugin_running, spec, event_processor] {
+      const datacrumbs::PluginEmit emit = [event_processor](uint64_t event_id, uint64_t ts_ns,
+                                                            DataCrumbsArgs* args) {
+        if (event_processor->writer_ == nullptr) {
+          delete args;
+          return;
+        }
+        event_processor->writer_->push_event(new datacrumbs::EventWithId(
+            datacrumbs::TracePhase::COUNTER, event_processor->event_index.fetch_add(1), 0, 0,
+            event_id, ts_ns, 0, args));
+      };
+      while (plugin_running.load(std::memory_order_relaxed)) {
+        spec.sampler(emit);
+        for (unsigned int slept = 0;
+             slept < spec.interval_ms && plugin_running.load(std::memory_order_relaxed);
+             slept += 50)
+          std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      }
+    });
+  }
+  if (!plugin_threads.empty()) DC_LOG_INFO("plugin samplers started: %zu", plugin_threads.size());
+
+#if !defined(DATACRUMBS_MODE) || (DATACRUMBS_MODE != 1)
   unsigned long long last_processed_timestamp = 0;
+#endif
+  // Off by default so it costs nothing; DATACRUMBS_HEARTBEAT_S=10 is enough to place a stall.
+  const long heartbeat_s = event_processor->configManager_->heartbeat_s;
+  time_t last_heartbeat = time(nullptr);
   while (!stop) {
     err = 0;
 #if defined(DATACRUMBS_BPFTIME_COMPATIBLE_FLAG) && (DATACRUMBS_BPFTIME_COMPATIBLE_FLAG == 1)
-    // Drain the bpftime output ring into the same single-threaded event_processor as the kernel ring
-    // (no extra thread -> no race on the writer). Mirror traced pids on the autodetach cadence.
+    // Drain the bpftime output ring into the same single-threaded event_processor as the kernel
+    // ring (no extra thread -> no race on the writer). Mirror traced pids on the autodetach
+    // cadence.
     datacrumbs::bpftime_hot_poll(handle_event, event_processor);
     if (time(nullptr) - last_bpftime_sync >= 1) {
       last_bpftime_sync = time(nullptr);
@@ -972,6 +1135,15 @@ static int main_process(datacrumbs::EventProcessor* event_processor) {
       last_autodetach = time(nullptr);
       if (autodetach) poll_auto_detach(probe_guard_fd, event_processor);
       drain_agg_map(agg_fd, event_processor);
+    }
+    // A run whose trace stops partway leaves no evidence of when or why: the loop is still turning,
+    // the writer is idle because nothing arrives, and the summary at exit reports success. This
+    // says what the loop saw, so a stall can be placed in time instead of inferred from the gap.
+    if (heartbeat_s > 0 && time(nullptr) - last_heartbeat >= heartbeat_s) {
+      last_heartbeat = time(nullptr);
+      DC_LOG_INFO("heartbeat: collected=%llu failed=%d",
+                  static_cast<unsigned long long>(event_processor->event_index.load()),
+                  event_processor->failed_events);
     }
     err = ring_buffer__poll(rb, 10);
     if (err == -EINTR) {
@@ -1021,6 +1193,11 @@ static int main_process(datacrumbs::EventProcessor* event_processor) {
 #endif
   }
 
+  // Before the samplers below, because these emit into the same writer and a thread still running
+  // when the writer finalizes would push into a queue nothing drains.
+  plugin_running.store(false, std::memory_order_relaxed);
+  for (auto& t : plugin_threads)
+    if (t.joinable()) t.join();
   sysfs_sampler.stop();
   ethtool_sampler.stop();
   rdma_qp_sampler.stop();
@@ -1029,8 +1206,11 @@ static int main_process(datacrumbs::EventProcessor* event_processor) {
   perf_sampler.stop();
 #endif
 
+#if (defined(DATACRUMBS_BPFTIME_COMPATIBLE_FLAG) && (DATACRUMBS_BPFTIME_COMPATIBLE_FLAG == 0)) || \
+    (defined(DATACRUMBS_MODE) && (DATACRUMBS_MODE == 2))
   batch_size = 1024 * 1024;
-  DC_LOG_INFO("");
+#endif
+  DC_LOG_INFO(" ");
 #if defined(DATACRUMBS_MODE) && (DATACRUMBS_MODE == 1)
   drain_agg_map(agg_fd, event_processor);  // flush the final interval buckets before shutdown
 #endif
@@ -1099,7 +1279,8 @@ static int main_process(datacrumbs::EventProcessor* event_processor) {
   const double finalize_elapsed = timer.pauseTime();
   DC_LOG_PRINT("Finalization and cleanup of DataCrumbs elapsed: %f seconds", finalize_elapsed);
   DC_LOG_PRINT("Failed events: %d", event_processor->failed_events);
-  DC_LOG_PRINT("Total events: %llu", event_processor->event_index.load());
+  DC_LOG_PRINT("Total events: %llu",
+               static_cast<unsigned long long>(event_processor->event_index.load()));
   DC_LOG_TRACE("main: end");
   return 0;
 }

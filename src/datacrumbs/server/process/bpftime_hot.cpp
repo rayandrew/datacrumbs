@@ -1,3 +1,4 @@
+#include <datacrumbs/common/constants.h>
 #include <datacrumbs/server/process/bpftime_hot.h>
 
 #if defined(DATACRUMBS_BPFTIME_COMPATIBLE_FLAG) && (DATACRUMBS_BPFTIME_COMPATIBLE_FLAG == 1)
@@ -74,12 +75,24 @@ int mirror_prog(struct bpf_program* pr) {
 
 int bpftime_hot_init(struct bpf_object* obj) {
   if (g_inited) return 0;
+  // Every knob a caller sets is spelled DATACRUMBS_*; forward onto the names bpftime reads, before
+  // it initialises. Not overwritten, so an explicit upstream value still wins.
+  static const struct {
+    const char* ours;
+    const char* theirs;
+  } kForward[] = {
+      {DATACRUMBS_ENV_BPFTIME_SHM_NAME, DATACRUMBS_BPFTIME_ENV_SHM_NAME},
+      {DATACRUMBS_ENV_BPFTIME_SHM_MEMORY_MB, DATACRUMBS_BPFTIME_ENV_SHM_MEMORY_MB},
+      {DATACRUMBS_ENV_BPFTIME_VM_NAME, DATACRUMBS_BPFTIME_ENV_VM_NAME},
+  };
+  for (const auto& f : kForward)
+    if (const char* v = std::getenv(f.ours)) setenv(f.theirs, v, 0);
   // The unprivileged workload agent must write the maps shm to register its uprobes, but a root
   // server creates it 0644 -> EACCES; widen it (umask for creation, chmod if it pre-existed).
   const mode_t old_umask = umask(0);
   bpftime_initialize_global_shm(bpftime::shm_open_type::SHM_CREATE_OR_OPEN);
   umask(old_umask);
-  const char* shm_name = std::getenv("BPFTIME_SHM_NAME");
+  const char* shm_name = std::getenv(DATACRUMBS_BPFTIME_ENV_SHM_NAME);
   const std::string shm_path =
       std::string("/dev/shm/") + (shm_name ? shm_name : "bpftime_maps_shm");
   chmod(shm_path.c_str(), 0666);

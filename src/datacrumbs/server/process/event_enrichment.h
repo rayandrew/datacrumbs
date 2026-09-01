@@ -34,4 +34,20 @@ inline void register_bpf_ready(PluginBpfReady hook) {
 inline void run_bpf_ready(const PluginBpfContext& ctx) {
   for (const auto& hook : bpf_ready_hooks()) hook(ctx);
 }
+
+// Samplers a plugin registers, with the interval it asked for. The server owns the threads: a
+// plugin spawning its own would outlive the writer it emits into.
+struct PluginSamplerSpec {
+  unsigned int interval_ms;
+  PluginSampler sampler;
+};
+
+inline std::vector<PluginSamplerSpec>& plugin_samplers() {
+  static std::vector<PluginSamplerSpec> registry;
+  return registry;
+}
+
+inline void register_plugin_sampler(unsigned int interval_ms, PluginSampler sampler) {
+  plugin_samplers().push_back({interval_ms, std::move(sampler)});
+}
 }  // namespace datacrumbs

@@ -47,21 +47,17 @@ class EventProcessor {
 
   int update_filename(const char* filename, unsigned int hash);
 
-  int capture_general_counter(struct profile_key_t* key, struct profile_value_t* value) {
-    return 0;
-  }
+  int capture_general_counter(struct profile_key_t*, struct profile_value_t*) { return 0; }
 
-  int capture_usdt_counter(struct usdt_profile_key_t* key, struct profile_value_t* value) {
-    return 0;
-  }
+  int capture_usdt_counter(struct usdt_profile_key_t*, struct profile_value_t*) { return 0; }
 
   int finalize();
 
  public:
   std::shared_ptr<RuntimeConfigurationManager> configManager_;
   std::shared_ptr<datacrumbs::ChromeWriter> writer_;
-  int failed_events;  // Count of failed events
-  int stack_map_fd_ = -1;  // BPF_MAP_TYPE_STACK_TRACE fd for capture_stack probes (-1 = off)
+  int failed_events;          // Count of failed events
+  int stack_map_fd_ = -1;     // BPF_MAP_TYPE_STACK_TRACE fd for capture_stack probes (-1 = off)
   std::ofstream stack_sink_;  // raw stack_sample_t records for offline DWARF unwinding
   std::atomic<uint64_t> event_index{0};
   // Probes fire as they are installed, so without this a catch-all attach records the machine for
