@@ -84,4 +84,5 @@ deps
 docs/_build/
 docs/_static/__pycache__/
 .vscode
-build*scratch/
+build*
+scratch/

@@ -1,6 +1,11 @@
 cmake_minimum_required(VERSION 3.20)
 cmake_policy(SET CMP0075 NEW)
 project(datacrumbs LANGUAGES C CXX)
+
+# Warnings on for the C/C++ build. The BPF objects already build with -Wall; the host side had
+# nothing, so a format/argument mismatch could reach a traced process uncaught.
+add_compile_options(-Wall -Wextra -Wformat=2)
+
 include(CMakePackageConfigHelpers)
 
 # ------------------------------------------------------------------------------
@@ -92,6 +97,20 @@ set(DATACRUMBS_SKIP_SMALL_EVENTS_THRESHOLD_NS "1000" CACHE STRING "Threshold in 
 
 # Profiling Options
 set(DATACRUMBS_TIME_INTERVAL_NS "1000000" CACHE STRING "Profiling time interval in nanosecond")
+
+# The unit of ts and dur in the trace, declared in every trace's time_metric record so a reader
+# never has to assume. NS by default: a wrapped call on the DPU takes a few hundred nanoseconds, so
+# microseconds floor its minimum and maximum to zero. US costs about 2% less trace and is what a
+# chrome-trace viewer expects.
+set(DATACRUMBS_TIME_UNIT "NS" CACHE STRING "Unit of ts and dur in the trace: NS or US")
+set_property(CACHE DATACRUMBS_TIME_UNIT PROPERTY STRINGS NS US)
+if(DATACRUMBS_TIME_UNIT STREQUAL "NS")
+  set(DATACRUMBS_TIME_DIVISOR_NS 1)
+elseif(DATACRUMBS_TIME_UNIT STREQUAL "US")
+  set(DATACRUMBS_TIME_DIVISOR_NS 1000)
+else()
+  message(FATAL_ERROR "DATACRUMBS_TIME_UNIT must be NS or US, got '${DATACRUMBS_TIME_UNIT}'")
+endif()
 
 # Other options
 set(DATACRUMBS_LOG_LEVEL_STR "INFO" CACHE STRING "Log Level for compiling ${UPPER_PROJECT_NAME}")
@@ -567,6 +586,14 @@ install(
 
 # Create an empty directory at install time
 install(CODE "file(MAKE_DIRECTORY \"\${DATACRUMBS_INSTALL_LIBEXEC}/sbin\")")
+
+# The escaper turns probe arguments, which are raw memory rather than text, into parseable JSON.
+# Exhaustive over every byte and every two-byte pair: the failure it was written for was a single
+# stray byte, and a hand-picked list of cases would not have reached it.
+add_executable(datacrumbs_json_escape_test
+    "${CMAKE_CURRENT_SOURCE_DIR}/test/json_escape_test.cpp")
+target_include_directories(datacrumbs_json_escape_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+add_test(NAME test_json_escape COMMAND datacrumbs_json_escape_test)
 
 add_test(NAME test_simple_dd
     COMMAND bash -c "dd if=/dev/zero of=/tmp/img_temp.bat bs=1M count=16"

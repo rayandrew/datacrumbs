@@ -39,6 +39,12 @@
 #endif
 
 #cmakedefine DATACRUMBS_TIME_INTERVAL_NS @DATACRUMBS_TIME_INTERVAL_NS@
+
+// Unit of ts and dur in the trace, and how many nanoseconds one of them is. Every timestamp is
+// captured in nanoseconds and divided by this on the way out, so changing the unit is one setting
+// rather than an edit at every emit site.
+#cmakedefine DATACRUMBS_TIME_UNIT "@DATACRUMBS_TIME_UNIT@"
+#cmakedefine DATACRUMBS_TIME_DIVISOR_NS @DATACRUMBS_TIME_DIVISOR_NS@
 #cmakedefine DATACRUMBS_SRC_GEN_PATH "@DATACRUMBS_SRC_GEN_PATH@"
 #cmakedefine DATACRUMBS_LIBC_SO "@DATACRUMBS_LIBC_SO@"
 
