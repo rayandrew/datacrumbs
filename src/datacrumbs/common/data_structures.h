@@ -10,12 +10,6 @@
 // dependency headers
 #include <json-c/json.h>
 
-#ifndef DATACRUMBS_MAX_CAPTURE_ARGS
-#define DATACRUMBS_MAX_CAPTURE_ARGS 5
-#endif
-#ifndef DATACRUMBS_MAX_CAPTURE_BYTES
-#define DATACRUMBS_MAX_CAPTURE_BYTES 64
-#endif
 // std headers
 #include <string>
 #include <unordered_map>
@@ -163,17 +157,37 @@ class Probe {
   std::string trace_event_type;  // .pfw "type" domain string, from config (empty = unset)
   bool system_wide = false;      // tracepoints: capture on all pids (skip the pid gate)
   bool aggregate = false;        // accumulate count/duration instead of emitting per-event records
-  bool hot = false;  // uprobes: route to bpftime userspace (no kernel trap, args dropped)
+  bool hot = false;            // uprobes: route to bpftime userspace (no kernel trap, args dropped)
   bool capture_stack = false;  // tracepoints: grab the user call stack at the event
   unsigned int sample_freq = 0;       // perf_event: samples/sec (0 = the attach-side default)
   unsigned int stack_dump_ratio = 0;  // 1-in-N raw regs+stack dumps (0 = the per-type default);
                                       // must be a power of two, it becomes a prandom mask
   std::string gate_tid_arg;  // system_wide tracepoints: captured arg naming a tid; drop the event
                              // unless that tid belongs to a traced process
-  std::string name;  // Name of the probe
+  std::string name;          // Name of the probe
   std::vector<std::string> functions;  // List of functions or arguments for the probe
   std::unordered_map<std::string, std::vector<ProbeArgCaptureSpec>>
       function_arguments;  // Optional per-function runtime arg capture specification
+
+  // Copy every base field onto a subclass instance. Subclass fromJson methods used to list these
+  // by hand and five of seven omitted trace_event_type, so a type declared in the probe file
+  // parsed, survived the signed config, and was dropped at construction - the writer's
+  // empty() ? "unknown" fallback then made every record look untyped. Anything added to the base
+  // must be added here, once.
+  static void copy_base(Probe& p, const Probe& base) {
+    p.type = base.type;
+    p.trace_event_type = base.trace_event_type;
+    p.system_wide = base.system_wide;
+    p.aggregate = base.aggregate;
+    p.hot = base.hot;
+    p.capture_stack = base.capture_stack;
+    p.sample_freq = base.sample_freq;
+    p.stack_dump_ratio = base.stack_dump_ratio;
+    p.gate_tid_arg = base.gate_tid_arg;
+    p.name = base.name;
+    p.functions = base.functions;
+    p.function_arguments = base.function_arguments;
+  }
 
   // Validates the probe's configuration
   virtual bool validate() const {
@@ -198,8 +212,7 @@ class Probe {
     if (system_wide) json_object_object_add(j, "system_wide", json_object_new_boolean(true));
     if (aggregate) json_object_object_add(j, "aggregate", json_object_new_boolean(true));
     if (hot) json_object_object_add(j, "hot", json_object_new_boolean(true));
-    if (capture_stack)
-      json_object_object_add(j, "capture_stack", json_object_new_boolean(true));
+    if (capture_stack) json_object_object_add(j, "capture_stack", json_object_new_boolean(true));
     if (sample_freq) json_object_object_add(j, "sample_freq", json_object_new_int(sample_freq));
     if (stack_dump_ratio)
       json_object_object_add(j, "stack_dump_ratio", json_object_new_int(stack_dump_ratio));
@@ -329,11 +342,7 @@ struct SysCallProbe : public Probe {
     DC_LOG_TRACE("SysCallProbe::fromJson called");
     SysCallProbe p;
     Probe base = Probe::fromJson(j);
-    p.type = base.type;
-    p.name = base.name;
-    p.functions = base.functions;
-    p.function_arguments = base.function_arguments;
-    p.aggregate = base.aggregate;
+    copy_base(p, base);
     return p;
   }
 };
@@ -363,11 +372,7 @@ struct KProbe : public Probe {
     DC_LOG_TRACE("KProbe::fromJson called");
     KProbe p;
     Probe base = Probe::fromJson(j);
-    p.type = base.type;
-    p.name = base.name;
-    p.functions = base.functions;
-    p.function_arguments = base.function_arguments;
-    p.aggregate = base.aggregate;
+    copy_base(p, base);
     return p;
   }
 };
@@ -409,12 +414,7 @@ struct UProbe : public Probe {
     DC_LOG_TRACE("UProbe::fromJson called");
     UProbe p;
     Probe base = Probe::fromJson(j);
-    p.type = base.type;
-    p.name = base.name;
-    p.functions = base.functions;
-    p.function_arguments = base.function_arguments;
-    p.aggregate = base.aggregate;
-    p.hot = base.hot;
+    copy_base(p, base);
     json_object* bin_obj = json_object_object_get(j, "binary_path");
     if (bin_obj) p.binary_path = json_object_get_string(bin_obj);
 
@@ -467,11 +467,7 @@ struct USDTProbe : public Probe {
     DC_LOG_TRACE("USDTProbe::fromJson called");
     USDTProbe p;
     Probe base = Probe::fromJson(j);
-    p.type = base.type;
-    p.name = base.name;
-    p.functions = base.functions;
-    p.function_arguments = base.function_arguments;
-    p.aggregate = base.aggregate;
+    copy_base(p, base);
 
     json_object* bin_obj = json_object_object_get(j, "binary_path");
     if (bin_obj) p.binary_path = json_object_get_string(bin_obj);
@@ -496,16 +492,7 @@ struct TracepointProbe : public Probe {
   static TracepointProbe fromJson(const json_object* j) {
     TracepointProbe p;
     Probe base = Probe::fromJson(j);
-    p.type = base.type;
-    p.trace_event_type = base.trace_event_type;
-    p.system_wide = base.system_wide;
-    p.capture_stack = base.capture_stack;
-    p.stack_dump_ratio = base.stack_dump_ratio;
-    p.gate_tid_arg = base.gate_tid_arg;
-    p.name = base.name;
-    p.functions = base.functions;
-    p.function_arguments = base.function_arguments;
-    p.aggregate = base.aggregate;
+    copy_base(p, base);
     return p;
   }
 };
@@ -523,14 +510,7 @@ struct PerfEventProbe : public Probe {
   static PerfEventProbe fromJson(const json_object* j) {
     PerfEventProbe p;
     Probe base = Probe::fromJson(j);
-    p.type = base.type;
-    p.trace_event_type = base.trace_event_type;
-    p.system_wide = base.system_wide;
-    p.sample_freq = base.sample_freq;
-    p.stack_dump_ratio = base.stack_dump_ratio;
-    p.gate_tid_arg = base.gate_tid_arg;
-    p.name = base.name;
-    p.functions = base.functions;
+    copy_base(p, base);
     return p;
   }
 };
@@ -595,11 +575,7 @@ struct CustomProbe : public Probe {
     DC_LOG_TRACE("CustomProbe::fromJson called");
     CustomProbe p;
     Probe base = Probe::fromJson(j);
-    p.type = base.type;
-    p.name = base.name;
-    p.functions = base.functions;
-    p.function_arguments = base.function_arguments;
-    p.aggregate = base.aggregate;
+    copy_base(p, base);
 
     json_object* bpf_obj = json_object_object_get(j, "bpf_path");
     if (bpf_obj) p.bpf_path = json_object_get_string(bpf_obj);
@@ -631,8 +607,8 @@ class CaptureProbe {
   bool system_wide = false;  // tracepoints: capture on all pids, propagated to the emitted Probe
   bool aggregate = false;    // accumulate count/duration, propagated to the emitted Probe
   bool hot = false;          // uprobes: route to bpftime userspace, propagated to the emitted Probe
-  bool capture_stack = false;  // tracepoints: grab the user call stack, propagated to the Probe
-  unsigned int sample_freq = 0;       // perf_event: samples/sec, propagated to the emitted Probe
+  bool capture_stack = false;    // tracepoints: grab the user call stack, propagated to the Probe
+  unsigned int sample_freq = 0;  // perf_event: samples/sec, propagated to the emitted Probe
   unsigned int stack_dump_ratio = 0;  // 1-in-N raw stack dumps, propagated to the emitted Probe
   std::string gate_tid_arg;  // system_wide tracepoints: captured arg naming a tid; the event is
                              // dropped unless that tid belongs to a traced process

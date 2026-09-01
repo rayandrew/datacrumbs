@@ -61,6 +61,26 @@ class RuntimeConfigurationManager {
   std::vector<std::string> uncore_events;
   unsigned int telemetry_interval_ms = 100;
 
+  // ":"-separated plugin .so paths. Empty means no plugins.
+  std::string plugins;
+
+  // Stack-sample sink path pieces; defaults ("/tmp", "x") are independent of log_dir/run_id above.
+  std::string stack_sample_log_dir = "/tmp";
+  std::string stack_sample_run_id = "x";
+
+  // On if DATACRUMBS_BPFTIME_HOT is set at all, even to an empty value.
+  bool bpftime_hot = false;
+  // Off (probes stay attached) only when explicitly set to "0".
+  bool autodetach = true;
+  // 0 disables the heartbeat stall check.
+  long heartbeat_s = 0;
+
+  long max_queue_events = 500000;
+  long stall_budget_ms = 30000;
+  // zlib's Z_DEFAULT_COMPRESSION.
+  int zlib_level = -1;
+  long writer_threads = 1;
+
   bool is_known_invalid_runtime_probe(const std::shared_ptr<Probe>& probe,
                                       const std::string& function_name) const;
   void record_invalid_runtime_probe(const std::shared_ptr<Probe>& probe,
@@ -69,10 +89,18 @@ class RuntimeConfigurationManager {
                                        const std::string& function_name);
   void persist_runtime_probe_state() const;
 
+  /// Name a record kind a plugin will emit, and return the id the writer labels it with.
+  ///
+  /// Ids come from above the built-in telemetry range, so a plugin cannot collide with a probe or
+  /// with a configured source however many of either there are.
+  uint64_t register_plugin_event(const char* category, const char* name, const char* type);
+
  private:
   void derive_configurations();
   void derive_telemetry_sources();
+  void load_env_settings();
   void register_telemetry_categories(uint64_t event_id_base);
+
   void load_runtime_system_configuration();
   void load_runtime_probe_file();
   void load_runtime_probe_state();

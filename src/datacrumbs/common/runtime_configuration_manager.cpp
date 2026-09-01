@@ -1,4 +1,5 @@
 #include <arpa/inet.h>
+#include <datacrumbs/common/constants.h>
 #include <datacrumbs/common/logging.h>
 #include <datacrumbs/common/probe_file.h>
 #include <datacrumbs/common/runtime_configuration_manager.h>
@@ -395,7 +396,10 @@ void ensure_directory_owned_by_install_user(const std::filesystem::path& directo
     return;
   }
 
-  chown(directory.c_str(), pwd->pw_uid, pwd->pw_gid);
+  if (chown(directory.c_str(), pwd->pw_uid, pwd->pw_gid) != 0) {
+    DC_LOG_WARN("[RuntimeConfigurationManager] Failed to chown %s to %s: %s", directory.c_str(),
+                DATACRUMBS_INSTALL_USER, strerror(errno));
+  }
   chmod(directory.c_str(), S_IRWXU | S_IRWXG);
 }
 
@@ -414,12 +418,12 @@ std::string expand_trace_dir_pattern(const std::string& pattern) {
   std::time_t now = std::time(nullptr);
   std::tm tm_now{};
   localtime_r(&now, &tm_now);
-  char yy[3];
-  char mm[3];
-  char dd[3];
+  char yy[4];
+  char mm[4];
+  char dd[4];
   std::snprintf(yy, sizeof(yy), "%02d", (tm_now.tm_year + 1900) % 100);
-  std::snprintf(mm, sizeof(mm), "%02d", tm_now.tm_mon + 1);
-  std::snprintf(dd, sizeof(dd), "%02d", tm_now.tm_mday);
+  std::snprintf(mm, sizeof(mm), "%02d", (tm_now.tm_mon + 1) % 100);
+  std::snprintf(dd, sizeof(dd), "%02d", tm_now.tm_mday % 100);
 
   std::string expanded = pattern;
   replace_all(&expanded, "%YY%", yy);
@@ -449,6 +453,16 @@ void remove_file_if_exists(const std::filesystem::path& path) {
   std::filesystem::remove(path, ec);
 }
 
+// Env override for a numeric config; keeps the default if unset or unparseable.
+long parse_env_num(const char* name, long dflt) {
+  if (const char* e = std::getenv(name)) {
+    char* end = nullptr;
+    long v = std::strtol(e, &end, 10);
+    if (end != e) return v;
+  }
+  return dflt;
+}
+
 void raise_limit_to_hard(int resource, const char* resource_name) {
   struct rlimit limits{};
   if (getrlimit(resource, &limits) != 0) {
@@ -464,14 +478,6 @@ void raise_limit_to_hard(int resource, const char* resource_name) {
 }
 
 }  // namespace
-
-template <>
-std::shared_ptr<datacrumbs::RuntimeConfigurationManager>
-    datacrumbs::Singleton<datacrumbs::RuntimeConfigurationManager>::instance = nullptr;
-
-template <>
-bool datacrumbs::Singleton<datacrumbs::RuntimeConfigurationManager>::stop_creating_instances =
-    false;
 
 RuntimeConfigurationManager::RuntimeConfigurationManager() {
   throw std::runtime_error(
@@ -493,6 +499,7 @@ RuntimeConfigurationManager::RuntimeConfigurationManager(
       trace_dir_pattern(DATACRUMBS_TRACE_DIR_PATTERN),
       inclusion_paths("") {
   load_runtime_system_configuration();
+  load_env_settings();
   raise_limit_to_hard(RLIMIT_NOFILE, "RLIMIT_NOFILE");
   raise_limit_to_hard(RLIMIT_AS, "RLIMIT_AS");
   raise_limit_to_hard(RLIMIT_MEMLOCK, "RLIMIT_MEMLOCK");
@@ -556,15 +563,19 @@ void RuntimeConfigurationManager::derive_configurations() {
 // perf-backed track); DATACRUMBS_NIC_DEVICES is a comma list of "<ibdev>[:port]" (port default 1),
 // each becoming an IB sysfs byte/packet track plus an RDMA hw_counters "why is it slow" track.
 void RuntimeConfigurationManager::derive_telemetry_sources() {
+  // Each name is a counter track keyed by (pid, name), and pid is 0 for all of these, so a name
+  // must be unique within a node: "traced" was both task_pmu and proc_task, and one device name
+  // served nic, nic_rdma and nic_vport. The node stays in args.hhash, per the dftracer record
+  // convention.
   telemetry_sources.clear();
   uncore_events.clear();
-  if (const char* ms = std::getenv("DATACRUMBS_TELEMETRY_INTERVAL_MS")) {
+  if (const char* ms = std::getenv(DATACRUMBS_ENV_TELEMETRY_INTERVAL_MS)) {
     const long v = std::strtol(ms, nullptr, 10);
     if (v > 0) telemetry_interval_ms = static_cast<unsigned int>(v);
   }
 
 #if defined(DATACRUMBS_ENABLE_HW_COUNTERS) && (DATACRUMBS_ENABLE_HW_COUNTERS == 1)
-  if (const char* ue = std::getenv("DATACRUMBS_UNCORE_EVENTS")) {
+  if (const char* ue = std::getenv(DATACRUMBS_ENV_UNCORE_EVENTS)) {
     std::stringstream us(ue);
     std::string ev;
     while (std::getline(us, ev, ',')) {
@@ -588,7 +599,7 @@ void RuntimeConfigurationManager::derive_telemetry_sources() {
   }
 #endif
 
-  const char* devs = std::getenv("DATACRUMBS_NIC_DEVICES");
+  const char* devs = std::getenv(DATACRUMBS_ENV_NIC_DEVICES);
   if (devs == nullptr || *devs == '\0') return;
   std::stringstream ss(devs);
   std::string token;
@@ -606,13 +617,14 @@ void RuntimeConfigurationManager::derive_telemetry_sources() {
     const std::string base = "/sys/class/infiniband/" + dev + "/ports/" + port;
     TelemetrySource src;
     src.cat = "nic";
-    src.name = dev;
+    src.trace_event_type = "nic";
+    src.name = dev + "/" + port + ".port";
     // IB data counters are in 4-octet units -> *4 for bytes.
-    src.counters.push_back({"rx_bytes", base + "/counters/port_rcv_data", 4.0});
-    src.counters.push_back({"tx_bytes", base + "/counters/port_xmit_data", 4.0});
-    src.counters.push_back({"rx_packets", base + "/counters/port_rcv_packets", 1.0});
-    src.counters.push_back({"tx_packets", base + "/counters/port_xmit_packets", 1.0});
-    src.counters.push_back({"out_of_buffer", base + "/hw_counters/out_of_buffer", 1.0});
+    src.counters.push_back({"rx_bytes", base + "/counters/port_rcv_data", 4.0, ""});
+    src.counters.push_back({"tx_bytes", base + "/counters/port_xmit_data", 4.0, ""});
+    src.counters.push_back({"rx_packets", base + "/counters/port_rcv_packets", 1.0, ""});
+    src.counters.push_back({"tx_packets", base + "/counters/port_xmit_packets", 1.0, ""});
+    src.counters.push_back({"out_of_buffer", base + "/hw_counters/out_of_buffer", 1.0, ""});
     telemetry_sources.push_back(std::move(src));
 
     // Firmware RDMA-engine request rates + retransmit/out-of-sequence/timeout/error health signals:
@@ -620,7 +632,8 @@ void RuntimeConfigurationManager::derive_telemetry_sources() {
     // is a missing sysfs file, skipped per-tick, so the list stays portable across HCAs.
     TelemetrySource rdma;
     rdma.cat = "nic_rdma";
-    rdma.name = dev;
+    rdma.trace_event_type = "nic";
+    rdma.name = dev + "/" + port + ".rdma";
     const std::string hw = base + "/hw_counters/";
     for (const char* c :
          {"rx_write_requests", "rx_read_requests", "rx_atomic_requests", "packet_seq_err",
@@ -628,7 +641,7 @@ void RuntimeConfigurationManager::derive_telemetry_sources() {
           "req_transport_retries_exceeded", "local_ack_timeout_err", "implied_nak_seq_err",
           "req_cqe_error", "resp_cqe_error", "req_remote_access_errors",
           "resp_remote_access_errors"})
-      rdma.counters.push_back({c, hw + c, 1.0});
+      rdma.counters.push_back({c, hw + c, 1.0, ""});
     telemetry_sources.push_back(std::move(rdma));
 
     // Same hw counter names as the port-wide set above, but scoped to the bound QPs rather than the
@@ -636,7 +649,8 @@ void RuntimeConfigurationManager::derive_telemetry_sources() {
     // mode; without it the dump returns nothing and the source is simply silent.
     TelemetrySource qp;
     qp.cat = "nic_qp";
-    qp.name = dev + "/" + port;
+    qp.trace_event_type = "nic";
+    qp.name = dev + "/" + port + ".qp";
     for (const char* c :
          {"rx_write_requests", "rx_read_requests", "rx_atomic_requests", "out_of_buffer",
           "packet_seq_err", "out_of_sequence", "duplicate_request", "rnr_nak_retry_err",
@@ -652,10 +666,12 @@ void RuntimeConfigurationManager::derive_telemetry_sources() {
   // miss. Counter `path` holds the ethtool stat name; `perf_event` marks the sampler to use.
   // Per-process hardware counters on a fixed interval. Separate from DATACRUMBS_HW_COUNTERS, which
   // feeds the BPF cpu-scope arrays: those are attributable to a core, not to the traced program.
-  if (const char* task = std::getenv("DATACRUMBS_TASK_COUNTERS"); task != nullptr && *task != '\0') {
+  if (const char* task = std::getenv(DATACRUMBS_ENV_TASK_COUNTERS);
+      task != nullptr && *task != '\0') {
     TelemetrySource tp;
     tp.cat = "task_pmu";
-    tp.name = "traced";
+    tp.trace_event_type = "pmu";
+    tp.name = "traced.pmu";
     std::stringstream ts_(task);
     std::string c;
     while (std::getline(ts_, c, ',')) {
@@ -667,7 +683,45 @@ void RuntimeConfigurationManager::derive_telemetry_sources() {
     if (!tp.counters.empty()) telemetry_sources.push_back(std::move(tp));
   }
 
-  const char* netdevs = std::getenv("DATACRUMBS_NIC_NETDEVS");
+  const char* netdevs = std::getenv(DATACRUMBS_ENV_NIC_NETDEVS);
+  // Utilisation from procfs, which no hardware counter provides. A PMU says how many cycles and
+  // instructions ran; it does not say how much of the node was busy, how much memory is resident,
+  // or how often a thread was preempted.
+  //
+  // This matters more on the DPU than on the host. BlueField-3 exposes only armv8_pmuv3_0 and no
+  // uncore PMU at all, so a system-wide perf_event there reads the same core events at a different
+  // scope rather than different counters. procfs is the only node-level source it has.
+  //
+  // `path` is the field name; the sampler resolves it against /proc. Counters are cumulative, so
+  // the sampler's existing delta-per-tick handling applies unchanged.
+  {
+    TelemetrySource node;
+    node.cat = "proc_node";
+    node.trace_event_type = "node";
+    node.name = "node";
+    // /proc/stat cpu jiffies, then its scalar lines.
+    for (const char* c : {"user", "nice", "system", "idle", "iowait", "irq", "softirq", "steal",
+                          "ctxt", "processes"})
+      node.counters.push_back({c, c, 1.0, "proc"});
+    // /proc/meminfo, in kB. Prefixed so the sampler knows which file to read.
+    for (const char* c : {"MemAvailable", "MemFree", "Cached", "Dirty"})
+      node.counters.push_back({c, std::string("mem.") + c, 1.0, "proc"});
+    telemetry_sources.push_back(std::move(node));
+
+    // Process scope, summed over the traced tgids like the task PMU source: how much CPU the
+    // workload itself used, how resident it is, and how hard it is faulting. Reported alongside
+    // the node figures so a process that is busy while the node is idle is distinguishable from
+    // one that is starved.
+    TelemetrySource proc;
+    proc.cat = "proc_task";
+    proc.trace_event_type = "process";
+    proc.name = "traced.proc";
+    for (const char* c : {"utime", "stime", "num_threads", "minflt", "majflt"})
+      proc.counters.push_back({c, c, 1.0, "proc"});
+    for (const char* c : {"VmRSS", "VmSize"}) proc.counters.push_back({c, c, 1.0, "proc"});
+    telemetry_sources.push_back(std::move(proc));
+  }
+
   if (netdevs == nullptr || *netdevs == '\0') return;
   std::stringstream ns(netdevs);
   while (std::getline(ns, token, ',')) {
@@ -677,7 +731,8 @@ void RuntimeConfigurationManager::derive_telemetry_sources() {
     const std::string dev = token.substr(begin, end - begin + 1);
     TelemetrySource vp;
     vp.cat = "nic_vport";
-    vp.name = dev;
+    vp.trace_event_type = "nic";
+    vp.name = dev + ".vport";
     for (const char* c :
          {"vport_rdma_unicast_bytes", "vport_rdma_unicast_packets", "rx_vport_rdma_unicast_bytes",
           "rx_vport_rdma_unicast_packets", "tx_vport_rdma_unicast_bytes",
@@ -688,13 +743,55 @@ void RuntimeConfigurationManager::derive_telemetry_sources() {
   }
 }
 
+// Process/writer/plugin knobs read once at startup, outside the telemetry-source env vars above.
+void RuntimeConfigurationManager::load_env_settings() {
+  if (const char* p = std::getenv(DATACRUMBS_ENV_PLUGINS)) plugins = p;
+
+  if (const char* ld = std::getenv(DATACRUMBS_ENV_LOG_DIR_NAME)) stack_sample_log_dir = ld;
+  if (const char* rid = std::getenv(DATACRUMBS_ENV_SERVICE_RUN_ID)) stack_sample_run_id = rid;
+
+  bpftime_hot = std::getenv(DATACRUMBS_ENV_BPFTIME_HOT) != nullptr;
+
+  const char* autodetach_env = std::getenv(DATACRUMBS_ENV_AUTODETACH);
+  autodetach = autodetach_env == nullptr || std::strcmp(autodetach_env, "0") != 0;
+
+  if (const char* hb = std::getenv(DATACRUMBS_ENV_HEARTBEAT_S))
+    heartbeat_s = std::strtol(hb, nullptr, 10);
+
+  max_queue_events = parse_env_num(DATACRUMBS_ENV_MAX_QUEUE_EVENTS, max_queue_events);
+  stall_budget_ms = parse_env_num(DATACRUMBS_ENV_STALL_BUDGET_MS, stall_budget_ms);
+  zlib_level = static_cast<int>(parse_env_num(DATACRUMBS_ENV_ZLIB_LEVEL, zlib_level));
+  writer_threads = parse_env_num(DATACRUMBS_ENV_WRITER_THREADS, writer_threads);
+}
+
 // Telemetry sources get event ids in a high, distinct range so they never collide with probe ids
 // (kRuntimeProbeEventIdBase). Called after load_runtime_probe_file populates category_map.
 void RuntimeConfigurationManager::register_telemetry_categories(uint64_t event_id_base) {
   for (auto& src : telemetry_sources) {
     src.event_id = event_id_base++;
     category_map[src.event_id] = std::make_pair(src.cat, src.name);
+    // Also register event metadata: the writer reads "type" from there, not from category_map, so a
+    // source present only in the latter emits type="unknown".
+    RuntimeEventMetadata meta;
+    meta.trace_event_type = src.trace_event_type;
+    meta.probe_name = src.cat;
+    meta.function_name = src.name;
+    runtime_event_metadata[src.event_id] = std::move(meta);
   }
+}
+
+uint64_t RuntimeConfigurationManager::register_plugin_event(const char* category, const char* name,
+                                                            const char* type) {
+  // Above the telemetry base by a margin no configuration reaches, so the two ranges cannot meet.
+  static uint64_t next = 0xE100000000000000ULL;
+  const uint64_t id = next++;
+  category_map[id] = std::make_pair(category ? category : "plugin", name ? name : "event");
+  RuntimeEventMetadata meta;
+  meta.trace_event_type = type ? type : "plugin";
+  meta.probe_name = category ? category : "plugin";
+  meta.function_name = name ? name : "event";
+  runtime_event_metadata[id] = std::move(meta);
+  return id;
 }
 
 void RuntimeConfigurationManager::load_runtime_system_configuration() {

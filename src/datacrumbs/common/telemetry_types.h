@@ -22,6 +22,7 @@ struct TelemetryCounter {
 // synthetic id registered in category_map by load_runtime_probe_file().
 struct TelemetrySource {
   std::string cat;
+  std::string trace_event_type;  // .pfw "type" domain string; see RuntimeEventMetadata
   std::string name;
   uint64_t event_id = 0;
   std::vector<TelemetryCounter> counters;

@@ -1,6 +1,7 @@
 #ifndef DATACRUMBS_COMMON_PROBE_FILE_H__
 #define DATACRUMBS_COMMON_PROBE_FILE_H__
 
+#include <datacrumbs/common/logging.h>
 #include <fcntl.h>
 #include <json-c/json.h>
 #include <openssl/evp.h>
@@ -10,6 +11,8 @@
 #include <unistd.h>
 #include <zlib.h>
 
+#include <cerrno>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -112,8 +115,9 @@ inline bool ensure_probe_secret(std::string* secret_out = nullptr) {
   const auto path = secret_path();
   std::string secret = read_text_file(path);
   if (!secret.empty()) {
-    if (geteuid() == 0) {
-      chown(path.c_str(), 0, 0);
+    if (geteuid() == 0 && chown(path.c_str(), 0, 0) != 0) {
+      DC_LOG_WARN("[probe_file] Failed to chown probe secret %s to root: %s", path.c_str(),
+                  strerror(errno));
     }
     chmod(path.c_str(), S_IRUSR);
     if (secret_out != nullptr) {
