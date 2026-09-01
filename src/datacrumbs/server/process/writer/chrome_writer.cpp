@@ -1,4 +1,7 @@
 #include <datacrumbs/server/process/writer/chrome_writer.h>
+#include <datacrumbs/server/process/writer/json_escape.h>
+
+#include <chrono>
 // internal headers
 #include <datacrumbs/common/constants.h>
 #include <datacrumbs/common/logging.h>
@@ -15,6 +18,7 @@
 #include <zlib.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -25,45 +29,7 @@
 #include <vector>
 
 namespace {
-
-std::string json_escape(const std::string& input) {
-  std::string escaped;
-  escaped.reserve(input.size() + 8);
-  for (unsigned char ch : input) {
-    switch (ch) {
-      case '\"':
-        escaped += "\\\"";
-        break;
-      case '\\':
-        escaped += "\\\\";
-        break;
-      case '\b':
-        escaped += "\\b";
-        break;
-      case '\f':
-        escaped += "\\f";
-        break;
-      case '\n':
-        escaped += "\\n";
-        break;
-      case '\r':
-        escaped += "\\r";
-        break;
-      case '\t':
-        escaped += "\\t";
-        break;
-      default:
-        if (ch < 0x20) {
-          char buffer[8];
-          std::snprintf(buffer, sizeof(buffer), "\\u%04x", ch);
-          escaped += buffer;
-        } else {
-          escaped += static_cast<char>(ch);
-        }
-    }
-  }
-  return escaped;
-}
+using datacrumbs::writer::json_escape;
 
 std::string bytes_to_hex(const std::vector<unsigned char>& bytes) {
   std::ostringstream oss;
@@ -191,47 +157,39 @@ std::string serialize_any_value(const std::any& value) {
   return "\"<unsupported>\"";
 }
 
-// env override for a numeric config; keeps the default if unset or unparseable.
-long env_num(const char* name, long dflt) {
-  if (const char* e = std::getenv(name)) {
-    char* end = nullptr;
-    long v = std::strtol(e, &end, 10);
-    if (end != e) return v;
-  }
-  return dflt;
-}
-
 }  // namespace
-
-// Specialization of the Singleton instance for KSymCapture.
-// This holds the shared pointer to the singleton instance.
-template <>
-std::shared_ptr<datacrumbs::ChromeWriter>
-    datacrumbs::Singleton<datacrumbs::ChromeWriter>::instance = nullptr;
-
-// Specialization of the flag to stop creating new instances of KSymCapture.
-template <>
-bool datacrumbs::Singleton<datacrumbs::ChromeWriter>::stop_creating_instances = false;
 
 namespace datacrumbs {
 ChromeWriter::ChromeWriter() : flush_bytes_(1 << 20) {
+  auto configManager_ =
+      datacrumbs::Singleton<datacrumbs::RuntimeConfigurationManager>::get_instance();
+
   // Env-overridable: MAX_QUEUE_EVENTS bounds the backpressure queue (0 = unbounded); ZLIB_LEVEL
   // sets the deflate level (gzip framing kept for Perfetto); WRITER_THREADS scales the
   // serialize+gzip pool (default 1 to keep the server off the traced cores; raise it when the
   // writer is a firehose bottleneck and backpressure would otherwise stall the ring drain).
-  max_queue_events_ = static_cast<size_t>(env_num("DATACRUMBS_MAX_QUEUE_EVENTS", 500000));
-  zlib_level_ = static_cast<int>(env_num("DATACRUMBS_ZLIB_LEVEL", Z_DEFAULT_COMPRESSION));
-  long nthreads = env_num("DATACRUMBS_WRITER_THREADS", 1);
+  max_queue_events_ = static_cast<size_t>(configManager_->max_queue_events);
+  // A guard against an unbounded hang, not a sampling policy. Blocking is the deliberate choice
+  // here and it has never been observed to fire on this cluster: the run that looked like writer
+  // backpressure was a clock-domain mistake elsewhere, and stall_count stayed zero throughout.
+  // Thirty seconds is far longer than any real burst, so the trace stays complete in practice while
+  // a wedged writer can no longer stop collection for the rest of a run. Lower it deliberately to
+  // trade completeness for coverage.
+  stall_budget_ = std::chrono::milliseconds(configManager_->stall_budget_ms);
+  zlib_level_ = configManager_->zlib_level;
+  long nthreads = configManager_->writer_threads;
   if (nthreads < 1) nthreads = 1;
 
-  auto configManager_ =
-      datacrumbs::Singleton<datacrumbs::RuntimeConfigurationManager>::get_instance();
   file_ = std::fopen(configManager_->trace_file_path.c_str(), "wb");
   if (!file_) throw std::runtime_error("Failed to open trace file for writing");
   auto pwd = getpwnam(configManager_->user.c_str());
   uid_t uid = pwd ? pwd->pw_uid : static_cast<uid_t>(-1);
   gid_t gid = pwd ? pwd->pw_gid : static_cast<gid_t>(-1);
-  chown(configManager_->trace_file_path.c_str(), uid, gid);
+  if (chown(configManager_->trace_file_path.c_str(), uid, gid) != 0) {
+    DC_LOG_WARN("[ChromeWriter] Failed to chown trace file %s to %s: %s",
+                configManager_->trace_file_path.c_str(), configManager_->user.c_str(),
+                strerror(errno));
+  }
   chmod(configManager_->trace_file_path.c_str(), 0660);
 
   char host[256] = {0};
@@ -243,6 +201,12 @@ ChromeWriter::ChromeWriter() : flush_bytes_(1 << 20) {
                std::to_string(static_cast<unsigned>(TracePhase::METADATA)) +
                ",\"args\":{\"hhash\":\"" + hhash_ + "\",\"name\":\"" + json_escape(hostname_) +
                "\",\"value\":\"" + hhash_ + "\"}}\n");
+  // The unit of ts and dur, chosen at build time. Stated rather than assumed, as dftracer states
+  // it, so a reader never has to guess and a change of unit cannot silently rescale a whole trace.
+  write_member("{\"name\":\"time_metric\",\"cat\":\"dftracer\",\"type\":\"metadata\",\"ph\":" +
+               std::to_string(static_cast<unsigned>(TracePhase::METADATA)) +
+               ",\"args\":{\"hhash\":\"" + hhash_ +
+               "\",\"name\":\"time_metric\",\"value\":\"" DATACRUMBS_TIME_UNIT "\"}}\n");
 
   for (long i = 0; i < nthreads; ++i) workers_.emplace_back([this]() { this->worker_loop(); });
 }
@@ -272,9 +236,28 @@ void ChromeWriter::finalize() {
 void ChromeWriter::push_event(EventWithId* event) {
   {
     std::unique_lock<std::mutex> lock(queue_mutex_);
-    if (max_queue_events_ > 0) {
-      not_full_cv_.wait(lock,
-                        [this] { return event_queue_.size() < max_queue_events_ || finalized_; });
+    if (max_queue_events_ > 0 && event_queue_.size() >= max_queue_events_ && !finalized_) {
+      // Wait, but not forever. Blocking absorbs a burst without losing anything, which is the
+      // point; blocking indefinitely would stop collection for as long as the writer stayed behind,
+      // and a trace that stops is not a slower trace, it is a shorter one. The budget is long
+      // enough that this only fires when the writer is genuinely wedged, where losing events at a
+      // counted rate beats losing the rest of the run.
+      const auto t0 = std::chrono::steady_clock::now();
+      const bool room = not_full_cv_.wait_for(lock, stall_budget_, [this] {
+        return event_queue_.size() < max_queue_events_ || finalized_;
+      });
+      stall_ns_.fetch_add(
+          static_cast<unsigned long long>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                              std::chrono::steady_clock::now() - t0)
+                                              .count()),
+          std::memory_order_relaxed);
+      stall_count_.fetch_add(1, std::memory_order_relaxed);
+      if (!room) {
+        dropped_.fetch_add(1, std::memory_order_relaxed);
+        delete event->args;
+        delete event;
+        return;
+      }
     }
     if (finalized_) {  // worker gone; free rather than enqueue into a dead queue
       delete event->args;
@@ -296,6 +279,54 @@ void ChromeWriter::write_member(const std::string& data) {
   }
 }
 
+// /proc/<pid>/comm, or "" when the process is already gone. Best effort: the server names a pid the
+// first time it observes one, which for a short-lived process can be after it exited.
+static std::string read_comm(unsigned int pid) {
+  char path[64];
+  std::snprintf(path, sizeof(path), "/proc/%u/comm", pid);
+  FILE* f = std::fopen(path, "r");
+  if (f == nullptr) return {};
+  char buf[64] = {0};
+  const char* got = std::fgets(buf, sizeof(buf), f);
+  std::fclose(f);
+  if (got == nullptr) return {};
+  buf[strcspn(buf, "\n")] = '\0';
+  return buf;
+}
+
+std::string ChromeWriter::name_process(unsigned int pid, unsigned int tid) {
+  const unsigned long long key = (static_cast<unsigned long long>(pid) << 32) | tid;
+  bool new_proc = false;
+  {
+    std::lock_guard<std::mutex> lock(named_mutex_);
+    if (!named_.insert(key).second) return {};
+    // 0xffffffff is not a valid tid (pid_max is at most 2^22), so it keys the process itself.
+    new_proc = named_.insert(static_cast<unsigned long long>(pid) << 32 | 0xffffffffULL).second;
+  }
+  const unsigned meta = static_cast<unsigned>(TracePhase::METADATA);
+  std::string out;
+  if (new_proc) {
+    // pid 0 is not a process: it is the lane the samplers use for node-level telemetry.
+    std::string comm = pid == 0 ? "node" : read_comm(pid);
+    if (comm.empty()) comm = "exited";
+    out += "{\"name\":\"process_name\",\"cat\":\"dftracer\",\"type\":\"metadata\",\"pid\":" +
+           std::to_string(pid) + ",\"tid\":" + std::to_string(tid) +
+           ",\"ph\":" + std::to_string(meta) + ",\"args\":{\"hhash\":\"" + hhash_ +
+           "\",\"name\":\"process_name\",\"value\":\"" + json_escape(hostname_) + ":" +
+           json_escape(comm) + " (" + std::to_string(pid) + ")\"}}\n";
+  }
+  {
+    std::string comm = tid == 0 ? "node" : read_comm(tid);
+    if (comm.empty()) comm = "exited";
+    out += "{\"name\":\"thread_name\",\"cat\":\"dftracer\",\"type\":\"metadata\",\"pid\":" +
+           std::to_string(pid) + ",\"tid\":" + std::to_string(tid) +
+           ",\"ph\":" + std::to_string(meta) + ",\"args\":{\"hhash\":\"" + hhash_ +
+           "\",\"name\":\"thread_name\",\"value\":\"" + json_escape(comm) + " (" +
+           std::to_string(tid) + ")\"}}\n";
+  }
+  return out;
+}
+
 // Serialize one event to a JSON line and free it (and its args). Returns "" for an event whose id
 // has no category mapping or whose type is not renderable.
 std::string ChromeWriter::serialize_event(EventWithId* event_with_id) {
@@ -303,8 +334,10 @@ std::string ChromeWriter::serialize_event(EventWithId* event_with_id) {
   auto configManager_ =
       datacrumbs::Singleton<datacrumbs::RuntimeConfigurationManager>::get_instance();
   auto args = event_with_id->args;
-  unsigned int pid = event_with_id->tgid_pid;
-  unsigned int tid = event_with_id->tgid_pid >> 32;
+  // bpf_get_current_pid_tgid packs (tgid << 32) | pid, where the kernel's pid is the thread and
+  // the tgid is the process. These were the other way round, which put a thread id in "pid".
+  unsigned int pid = event_with_id->tgid_pid >> 32;
+  unsigned int tid = static_cast<unsigned int>(event_with_id->tgid_pid);
   auto it = configManager_->category_map.find(event_with_id->event_id);
   if (it != configManager_->category_map.end()) {
     const unsigned long event_index = ++index_;
@@ -321,12 +354,14 @@ std::string ChromeWriter::serialize_event(EventWithId* event_with_id) {
       (*args)["duration"] = duration;
     }
     char buffer[1024];
-    // ns -> us by integer math: exact and overflow-free (a global-epoch ts exceeds double's 2^53
-    // exact range, and floor(ts/1e3) would lose ~256ns there). dur rounds up so sub-us stays
-    // nonzero.
-    const unsigned long long ts_us = event_with_id->ts / 1000;
+    // Captured in nanoseconds and divided by the unit the build chose, which the trace declares in
+    // its time_metric record. Integer math: exact and overflow-free, where a global-epoch ts
+    // exceeds double's 2^53 exact range and floor(ts/1e3) would lose ~256ns. dur rounds up so a
+    // sub-unit event stays nonzero rather than reading as instantaneous.
+    const unsigned long long ts_us = event_with_id->ts / DATACRUMBS_TIME_DIVISOR_NS;
     const unsigned long long dur_us =
-        event_with_id->dur / 1000 + (event_with_id->dur % 1000 != 0 ? 1 : 0);
+        event_with_id->dur / DATACRUMBS_TIME_DIVISOR_NS +
+        (event_with_id->dur % DATACRUMBS_TIME_DIVISOR_NS != 0 ? 1 : 0);
     // "id" and "dur" are complete-event only; "type" is the probe's config domain string ("unknown"
     // if unset -- a free-form string so a plugin can contribute its own domain without a core
     // change).
@@ -356,7 +391,10 @@ std::string ChromeWriter::serialize_event(EventWithId* event_with_id) {
     }
 
     if (len > 0) {
-      // hhash first, so every event carries this node's host key for the reader.
+      // hhash first: every event carries this node's host key, so a record stays attributable to
+      // its node after a split, a merge, or any other regrouping that separates it from the HH
+      // record at the head of its file. dftracer omits args entirely on an event that has none,
+      // which is 9% of a measured trace, but that saving costs per-event node attribution.
       std::string args_json = "{\"hhash\":\"" + hhash_ + "\"";
       if (args != nullptr && !args->empty()) {
         for (auto pair : *args) {
@@ -368,6 +406,7 @@ std::string ChromeWriter::serialize_event(EventWithId* event_with_id) {
       }
       args_json += "}";
       line = std::string(buffer, len) + ",\"args\":" + args_json + "}\n";
+      if (event_with_id->event_type != TracePhase::METADATA) line = name_process(pid, tid) + line;
     }
   }
   delete args;
