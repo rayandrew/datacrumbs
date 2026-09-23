@@ -5,15 +5,102 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 #include <bpf/usdt.bpf.h>
-// internal headers
 #include <datacrumbs/server/bpf/macros.bpf.h>
 #include <datacrumbs/server/bpf/shared.h>
 
 DATACRUMBS_MAP(pid_map, u32, u64, 1024);
-DATACRUMBS_MAP(fn_pid_map, struct fn_key_t, struct fn_value_t);
+// One entry per live sink worker; the client adds its tid on thread start and drops it on exit.
+DATACRUMBS_MAP(tracer_tid_map, u32, u8, 64);
+// Entry/exit pairing state per (thread, function). Nothing deletes an entry, so long runs fill it;
+// once full, every exit finds no entry and uprobe/kprobe events stop (tracepoints, which do not
+// pair, keep flowing). LRU so a full map evicts instead of refusing; sized for the probe count
+// times live threads.
+DATACRUMBS_LRU_MAP(fn_pid_map, struct fn_key_t, struct fn_value_t, 262144);
+DATACRUMBS_MAP(probe_guard, u64, struct probe_guard_t, DATACRUMBS_MAX_RUNTIME_FUNCTIONS);
+DATACRUMBS_MAP(event_arg_config_map, u64, struct runtime_event_config_t,
+               DATACRUMBS_MAX_RUNTIME_FUNCTIONS);
+struct {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, u32);
+  __type(value, struct fn_value_t);
+} scratch_fn_value_map SEC(".maps");
+
+// PMU: one PERF_EVENT_ARRAY per counter (indexed by cpu; populated by the pmu plugin), and a
+// 1-entry control array holding the active counter count. Reading pmu_ctl gates all perf reads (0
+// => off).
+#define DATACRUMBS_PMU_ARRAY(name)               \
+  struct {                                       \
+    __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY); \
+    __uint(key_size, sizeof(u32));               \
+    __uint(value_size, sizeof(u32));             \
+    __uint(max_entries, 256);                    \
+  } name SEC(".maps");
+DATACRUMBS_PMU_ARRAY(pmu_counter0)
+DATACRUMBS_PMU_ARRAY(pmu_counter1)
+DATACRUMBS_PMU_ARRAY(pmu_counter2)
+struct {
+  __uint(type, BPF_MAP_TYPE_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, u32);
+  __type(value, u32);
+} pmu_ctl SEC(".maps");
+
+// 1 when some function probe asked to be system-wide. Function probes gate on the traced-pid map
+// first, because a kprobe fires for every process and most hits are not ours. Checking a probe's
+// own config first would cost a map lookup on every hit, so this flag keeps the untraced-pid bail
+// immediate when nothing asked for system-wide behaviour.
+struct {
+  __uint(type, BPF_MAP_TYPE_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, u32);
+  __type(value, u32);
+} fn_gate_ctl SEC(".maps");
+
+// The tracer's own tgid. A system_wide probe fires for every process on the machine, including the
+// server writing the trace, so probing anything the writer itself does feeds the trace back into
+// itself.
+DATACRUMBS_MAP(self_ctl, u32, u32, 1);
+
+// Threads of traced processes, registered as they are seen on-CPU. Lets a system_wide tracepoint
+// gate on a tid it reads from an argument (the wakee), which the tgid-keyed pid_map cannot answer.
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, 16384);
+  __type(key, u32);
+  __type(value, u32);
+} traced_tid_map SEC(".maps");
+
+// Previous per-counter values on this cpu, so a sample can emit the delta since the last sample
+// rather than a running total. Per-cpu because the counters are opened cpu-scope: differencing
+// across cpus would mix in whatever else ran there.
+struct {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, u32);
+  __type(value, struct pmu_sample_prev_t);
+} pmu_sample_prev SEC(".maps");
+
+// User call stacks for capture_stack probes; the event holds the slot id, the writer reads +
+// symbolizes.
+struct {
+  __uint(type, BPF_MAP_TYPE_STACK_TRACE);
+  __uint(max_entries, 16384);
+  __uint(key_size, sizeof(u32));
+  __uint(value_size, DATACRUMBS_STACK_DEPTH * sizeof(u64));
+} stack_map SEC(".maps");
+
+// Per-cpu scratch for a stack sample (too big for the 512B BPF stack); filled then ringbuf-output.
+struct {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, u32);
+  __type(value, struct stack_sample_t);
+} stack_scratch SEC(".maps");
 
 #if defined(DATACRUMBS_MODE) && (DATACRUMBS_MODE == 1)
 DATACRUMBS_MAP(failed_request, u32, u32, 128);
+DATACRUMBS_MAP(agg_map, struct agg_key_t, struct agg_value_t, 4096);
 DATACRUMBS_RINGBUF(output, 1024 * 1024U * DATACRUMBS_TRACE_RINGBUF_SIZE_MB);
 #else
 DATACRUMBS_MAP(profile, struct profile_key_t, struct profile_value_t, 1024);

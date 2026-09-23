@@ -8,15 +8,75 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 #include <bpf/usdt.bpf.h>
-// internal headers
 #include <datacrumbs/server/bpf/macros.bpf.h>
 #include <datacrumbs/server/bpf/shared.h>
 
 DATACRUMBS_MAP_EXTERN(pid_map, u32, u64, 1024);
-DATACRUMBS_MAP_EXTERN(fn_pid_map, struct fn_key_t, struct fn_value_t);
+DATACRUMBS_MAP_EXTERN(self_ctl, u32, u32, 1);
+// Threads inside the client's own sink I/O. is_self() cannot catch these: the pid gate already
+// admitted the process. Keyed by tid, one entry per active sink worker.
+DATACRUMBS_MAP_EXTERN(tracer_tid_map, u32, u8, 64);
+DATACRUMBS_LRU_MAP_EXTERN(fn_pid_map, struct fn_key_t, struct fn_value_t, 262144);
+DATACRUMBS_MAP_EXTERN(probe_guard, u64, struct probe_guard_t, DATACRUMBS_MAX_RUNTIME_FUNCTIONS);
+DATACRUMBS_MAP_EXTERN(event_arg_config_map, u64, struct runtime_event_config_t,
+                      DATACRUMBS_MAX_RUNTIME_FUNCTIONS);
+extern struct {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, u32);
+  __type(value, struct fn_value_t);
+} scratch_fn_value_map SEC(".maps");
+
+#define DATACRUMBS_PMU_ARRAY_EXTERN(name)        \
+  extern struct {                                \
+    __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY); \
+    __uint(key_size, sizeof(u32));               \
+    __uint(value_size, sizeof(u32));             \
+    __uint(max_entries, 256);                    \
+  } name SEC(".maps");
+DATACRUMBS_PMU_ARRAY_EXTERN(pmu_counter0)
+DATACRUMBS_PMU_ARRAY_EXTERN(pmu_counter1)
+DATACRUMBS_PMU_ARRAY_EXTERN(pmu_counter2)
+extern struct {
+  __uint(type, BPF_MAP_TYPE_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, u32);
+  __type(value, u32);
+} pmu_ctl SEC(".maps");
+extern struct {
+  __uint(type, BPF_MAP_TYPE_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, u32);
+  __type(value, u32);
+} fn_gate_ctl SEC(".maps");
+extern struct {
+  __uint(type, BPF_MAP_TYPE_STACK_TRACE);
+  __uint(max_entries, 16384);
+  __uint(key_size, sizeof(u32));
+  __uint(value_size, DATACRUMBS_STACK_DEPTH * sizeof(u64));
+} stack_map SEC(".maps");
+extern struct {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, u32);
+  __type(value, struct stack_sample_t);
+} stack_scratch SEC(".maps");
+extern struct {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, u32);
+  __type(value, struct pmu_sample_prev_t);
+} pmu_sample_prev SEC(".maps");
+extern struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, 16384);
+  __type(key, u32);
+  __type(value, u32);
+} traced_tid_map SEC(".maps");
 
 #if defined(DATACRUMBS_MODE) && (DATACRUMBS_MODE == 1)
 DATACRUMBS_MAP_EXTERN(failed_request, u32, u32, 128);
+DATACRUMBS_MAP_EXTERN(agg_map, struct agg_key_t, struct agg_value_t, 4096);
 DATACRUMBS_RINGBUF_EXTERN(output, 1024 * 1024U * DATACRUMBS_TRACE_RINGBUF_SIZE_MB);
 #else
 DATACRUMBS_MAP_EXTERN(profile, struct profile_key_t, struct profile_value_t, 1024);
@@ -41,10 +101,9 @@ static inline __attribute__((always_inline)) u32 hash_str(const char* str, size_
 static inline __attribute__((always_inline)) u32 hash_and_store(struct string_t* str, size_t len) {
   u32* existing = bpf_map_lookup_elem(&file_map, str);
   if (existing) {
-    return *existing;  // Return existing hash
+    return *existing;
   }
   u32 hash = hash_str(str->str, len);
-  // Store new hash
   bpf_map_update_elem(&file_map, str, &hash, BPF_ANY);
   return hash;
 }
@@ -65,7 +124,6 @@ static inline __attribute__((always_inline)) int prefix_search(void* trie, struc
       prefix_len++;
     }
     if (is_prefix && prefix_len * 8 == found->len) {
-      // found->str is an exact prefix of key->str
       is_prefix = 1;
     } else {
       is_prefix = 0;
@@ -95,8 +153,7 @@ static inline __attribute__((always_inline)) int mark_failed_events() {
   if (failed_value == NULL) {
     u32 init_val = 0;
     bpf_map_update_elem(&failed_request, &key, &init_val, BPF_NOEXIST);
-    failed_value =
-        bpf_map_lookup_elem(&failed_request, &key);  // Lookup again to get the new value's address
+    failed_value = bpf_map_lookup_elem(&failed_request, &key);
   }
   if (failed_value != NULL) {
     (*failed_value)++;
@@ -119,83 +176,516 @@ static inline __attribute__((always_inline)) int need_tracing(struct fn_key_t* k
 }
 #else
 static inline __attribute__((always_inline)) int need_tracing(struct fn_key_t* key, u64* start_ts) {
-  key->id = bpf_get_current_pid_tgid();
-  u32 pid = key->id & 0xFFFFFFFF;
-  (void)pid;
-  start_ts = (u64*)bpf_map_lookup_elem(&pid_map, &pid);
+  key->id =
+      bpf_get_current_pid_tgid();  // full tgid|tid; fn_pid_map still pairs entry/exit per-thread
+  u32 tgid = key->id >> 32;        // gate by process so worker threads trace too, not just the
+                                   // thread that called datacrumbs_start
+  start_ts = (u64*)bpf_map_lookup_elem(&pid_map, &tgid);
   if (start_ts == 0 || key->id == 0) return 0;
   return 1;
 }
 #endif
 
+#ifndef DATACRUMBS_HOT_PROBE_WINDOW_NS
+#define DATACRUMBS_HOT_PROBE_WINDOW_NS 100000000ULL  // 100ms window
+#endif
+#ifndef DATACRUMBS_HOT_PROBE_MAX_PER_WINDOW
+#define DATACRUMBS_HOT_PROBE_MAX_PER_WINDOW 20000ULL  // ~200k events/s/probe cap
+#endif
+
+// Rate-limit a runaway (e.g. busy-poll) probe: returns 1 to drop this hit once a probe exceeds the
+// per-window cap, so one hot symbol cannot flood the ring. Per-event_id sliding window.
+static inline __attribute__((always_inline)) int hot_probe_drop(u64 event_id, u64 te) {
+  struct probe_guard_t* g = (struct probe_guard_t*)bpf_map_lookup_elem(&probe_guard, &event_id);
+  if (g == NULL) {
+    struct probe_guard_t init = {.win_ts = te, .count = 1, .dropped = 0};
+    bpf_map_update_elem(&probe_guard, &event_id, &init, BPF_ANY);
+    return 0;
+  }
+  if (te - g->win_ts >= DATACRUMBS_HOT_PROBE_WINDOW_NS) {
+    g->win_ts = te;
+    g->count = 0;
+  }
+  g->count += 1;
+  if (g->count > DATACRUMBS_HOT_PROBE_MAX_PER_WINDOW) {
+    g->dropped += 1;
+    return 1;
+  }
+  return 0;
+}
+
+static inline __attribute__((always_inline)) const struct runtime_event_config_t*
+resolve_event_config(u64 attach_cookie) {
+  return (const struct runtime_event_config_t*)bpf_map_lookup_elem(&event_arg_config_map,
+                                                                   &attach_cookie);
+}
+
+// need_tracing gates by traced process; a probe marked system_wide skips that gate.
+// True when the current task is the tracer itself. Only system_wide probes need this: a pid-gated
+// probe already answers no for the server, which never marks itself traced.
+static inline __attribute__((always_inline)) int is_self(void) {
+  const u32 zero = 0;
+  const u32* self = (u32*)bpf_map_lookup_elem(&self_ctl, &zero);
+  if (self != NULL && *self != 0 && (u32)(bpf_get_current_pid_tgid() >> 32) == *self) return 1;
+  // dc_timesync and datacrumbs_probe_manager both need excluding here, or a system_wide probe
+  // captures the tracing stack. Matched on comm, not pid: either daemon can restart mid-run and a
+  // pid captured at attach would stop excluding it.
+  // Byte by byte: __builtin_memcmp is not inlined here and the BPF link fails on the missing
+  // symbol.
+  char c[16] = {};
+  if (bpf_get_current_comm(&c, sizeof(c)) != 0) return 0;
+  if (c[0] != 'd') return 0;
+  // "datacrumbs" also matches datacrumbs_probe_manager, which comm truncates to 15 chars.
+  if (c[1] == 'a' && c[2] == 't' && c[3] == 'a' && c[4] == 'c' && c[5] == 'r' && c[6] == 'u' &&
+      c[7] == 'm' && c[8] == 'b' && c[9] == 's')
+    return 1;
+  if (c[1] == 'c' && c[2] == '_' && c[3] == 't' && c[4] == 'i' && c[5] == 'm' && c[6] == 'e' &&
+      c[7] == 's' && c[8] == 'y' && c[9] == 'n' && c[10] == 'c')
+    return 1;
+  return 0;
+}
+
+static inline __attribute__((always_inline)) int is_tracer_thread(void);
+
+static inline __attribute__((always_inline)) int fn_pid_gate(struct fn_key_t* key, u64* start_ts,
+                                                             u64 attach_cookie) {
+  // A traced pid still has to exclude the client's own sink threads: the sink writes from inside
+  // the traced process, so this gate has already said yes by the time is_self() would be consulted.
+  if (need_tracing(key, start_ts)) return is_tracer_thread() ? 0 : 1;
+  const u32 zero = 0;
+  const u32* any = (u32*)bpf_map_lookup_elem(&fn_gate_ctl, &zero);
+  if (any == NULL || *any == 0) return 0;
+  const struct runtime_event_config_t* c = resolve_event_config(attach_cookie);
+  if (c == NULL || c->system_wide == 0) return 0;
+  if (is_self()) return 0;  // tracing the writer's own work feeds the trace back into itself
+  key->id = bpf_get_current_pid_tgid();
+  if (key->id == 0) return 0;
+  return 1;
+}
+
+static inline __attribute__((always_inline)) struct fn_value_t* get_scratch_fn_value(void) {
+  u32 key = 0;
+  return (struct fn_value_t*)bpf_map_lookup_elem(&scratch_fn_value_map, &key);
+}
+
+// Active PMU counter count (0 = off); one cheap array lookup, so the off path stays lookup-only.
+static inline __attribute__((always_inline)) u32 pmu_active_count(void) {
+  u32 k = 0;
+  u32* n = (u32*)bpf_map_lookup_elem(&pmu_ctl, &k);
+  return n ? *n : 0;
+}
+
+// Read the current cpu's value for each active counter into out[]. n is pmu_active_count().
+static inline __attribute__((always_inline)) void pmu_read(u64* out, u32 n) {
+  struct bpf_perf_event_value v = {};
+  if (n > 0 && !bpf_perf_event_read_value(&pmu_counter0, BPF_F_CURRENT_CPU, &v, sizeof(v)))
+    out[0] = v.counter;
+  if (n > 1 && !bpf_perf_event_read_value(&pmu_counter1, BPF_F_CURRENT_CPU, &v, sizeof(v)))
+    out[1] = v.counter;
+  if (n > 2 && !bpf_perf_event_read_value(&pmu_counter2, BPF_F_CURRENT_CPU, &v, sizeof(v)))
+    out[2] = v.counter;
+}
+
+// Snapshot counters at entry into the scratch fn_value (no-op when PMU is off).
+static inline __attribute__((always_inline)) void pmu_snapshot_entry(struct fn_value_t* fn) {
+  u32 n = pmu_active_count();
+  fn->pmu_count = n;
+  if (n) pmu_read(fn->pmu_start, n);
+}
+
+// At exit, write per-counter (exit-entry) deltas into the event (no-op when PMU is off).
+static inline __attribute__((always_inline)) void pmu_delta_exit(const struct fn_value_t* fn,
+                                                                 struct generic_event_t* event) {
+  event->pmu_count = fn->pmu_count;
+  if (!fn->pmu_count) return;
+  u64 now[DATACRUMBS_MAX_PMU] = {};
+  pmu_read(now, fn->pmu_count);
+  // Clamp instead of subtracting blind: pmu_read is BPF_F_CURRENT_CPU, so a task that migrates
+  // between entry and exit reads two different CPUs' counters, and the difference is meaningless,
+  // not merely negative. Unsigned, it wraps to a huge value that swamps any sum a consumer takes.
+#pragma unroll
+  for (int i = 0; i < DATACRUMBS_MAX_PMU; ++i)
+    event->pmu[i] = now[i] >= fn->pmu_start[i] ? now[i] - fn->pmu_start[i] : 0;
+}
+
+#if defined(DATACRUMBS_MODE) && (DATACRUMBS_MODE == 1)
+// Accumulates a hit into agg_map for config->aggregate probes; the server drains this into
+// periodic COUNTER records. Plain (non-atomic) adds: BPF atomics (opcode 0xdb) are rejected by the
+// bpftime userspace VM (ubpf) that hosts hot uprobes, so a rare lost increment under contention is
+// accepted - the aggregate is a statistical summary, not an exact metric.
+// Largest duration whose square still fits in 64 bits, about 4.3s in nanoseconds.
+#define DC_SQ_MAX_OPERAND 4294967295ULL
+
+static inline __attribute__((always_inline)) void aggregate_hit(u64 event_id, u64 pid_tgid, u64 ts,
+                                                                u64 te) {
+  struct agg_key_t k = {.event_id = event_id, .time_interval = te / DATACRUMBS_TIME_INTERVAL_NS};
+  const u64 d = te - ts;
+  struct agg_value_t* v = bpf_map_lookup_elem(&agg_map, &k);
+  if (v != NULL) {
+    v->count += 1;
+    v->duration_ns += d;
+    if (d < v->min_ns) v->min_ns = d;
+    if (d > v->max_ns) v->max_ns = d;
+    // A millisecond squared is 1e12, so a million of them still fits; a second squared is 1e18 and
+    // eighteen of those would wrap. Saturating keeps a pathological outlier from reading as a tiny
+    // variance. Compared against the square root of the range rather than checked by dividing
+    // afterwards: the BPF backend turns that division into __multi3, which it then refuses.
+    const u64 sq = d > DC_SQ_MAX_OPERAND ? ~0ULL : d * d;
+    if (v->sum_sq_ns2 > ~0ULL - sq) {
+      v->sum_sq_ns2 = ~0ULL;
+    } else {
+      v->sum_sq_ns2 += sq;
+    }
+    return;
+  }
+  const u64 sq0 = d > DC_SQ_MAX_OPERAND ? ~0ULL : d * d;
+  struct agg_value_t nv = {.count = 1,
+                           .duration_ns = d,
+                           .pid_tgid = pid_tgid,
+                           .min_ns = d,
+                           .max_ns = d,
+                           .sum_sq_ns2 = sq0};
+  bpf_map_update_elem(&agg_map, &k, &nv, BPF_ANY);
+}
+#endif
+
+static inline __attribute__((always_inline)) int mark_current_pid_traced(void) {
+  const u64 tsp = bpf_ktime_get_ns();
+  const u64 current = bpf_get_current_pid_tgid();
+  const u32 tgid = current >> 32;  // mark the process; the gate is per-tgid
+  if (tgid == 0) return 0;
+  bpf_map_update_elem(&pid_map, &tgid, &tsp, BPF_ANY);
+  DBG_PRINTK("Marked tracing tgid=%u", tgid);
+  return 0;
+}
+
+static inline __attribute__((always_inline)) int unmark_current_pid_traced(void) {
+  const u64 current = bpf_get_current_pid_tgid();
+  const u32 tgid = current >> 32;
+  if (tgid == 0) return 0;
+  bpf_map_delete_elem(&pid_map, &tgid);
+  DBG_PRINTK("Unmarked tracing tgid=%u", tgid);
+  return 0;
+}
+
+static inline __attribute__((always_inline)) int mark_current_tid_tracer(void) {
+  const u32 tid = (u32)bpf_get_current_pid_tgid();
+  const u8 one = 1;
+  if (tid == 0) return 0;
+  bpf_map_update_elem(&tracer_tid_map, &tid, &one, BPF_ANY);
+  DBG_PRINTK("Marked tracer tid=%u", tid);
+  return 0;
+}
+
+static inline __attribute__((always_inline)) int unmark_current_tid_tracer(void) {
+  const u32 tid = (u32)bpf_get_current_pid_tgid();
+  if (tid == 0) return 0;
+  bpf_map_delete_elem(&tracer_tid_map, &tid);
+  return 0;
+}
+
+// True on a thread doing the client's own sink I/O. Its writes descend through vfs, ext4 and the
+// block layer, where no fd survives to gate on, so the thread is the only handle that works at
+// every level.
+static inline __attribute__((always_inline)) int is_tracer_thread(void) {
+  const u32 tid = (u32)bpf_get_current_pid_tgid();
+  return bpf_map_lookup_elem(&tracer_tid_map, &tid) != NULL;
+}
+
+static inline __attribute__((always_inline)) void reset_captured_args(struct fn_value_t* fn) {
+#pragma unroll
+  for (int index = 0; index < DATACRUMBS_MAX_CAPTURE_ARGS; ++index) {
+    fn->args[index] = 0;
+    fn->arg_data_len[index] = 0;
+    fn->arg_data_status[index] = 0;
+    __builtin_memset(fn->arg_data[index], 0, sizeof(fn->arg_data[index]));
+  }
+  fn->arg_count = 0;
+}
+
+static inline __attribute__((always_inline)) void copy_captured_args_to_event(
+    const struct fn_value_t* fn, struct generic_event_t* event) {
+  event->arg_count = fn->arg_count;
+#pragma unroll
+  for (int index = 0; index < DATACRUMBS_MAX_CAPTURE_ARGS; ++index) {
+    event->args[index] = fn->args[index];
+    event->arg_data_len[index] = fn->arg_data_len[index];
+    event->arg_data_status[index] = fn->arg_data_status[index];
+    __builtin_memcpy(event->arg_data[index], fn->arg_data[index], DATACRUMBS_MAX_CAPTURE_BYTES);
+  }
+}
+
+static inline __attribute__((always_inline)) void capture_runtime_args(
+    struct pt_regs* ctx, const struct runtime_event_config_t* config, struct fn_value_t* fn) {
+  unsigned int arg_index;
+  unsigned int num_bytes;
+  unsigned long long raw_value;
+  long err;
+  const unsigned long long raw_arg0 = PT_REGS_PARM1(ctx);
+  const unsigned long long raw_arg1 = PT_REGS_PARM2(ctx);
+  const unsigned long long raw_arg2 = PT_REGS_PARM3(ctx);
+  const unsigned long long raw_arg3 = PT_REGS_PARM4(ctx);
+  const unsigned long long raw_arg4 = PT_REGS_PARM5(ctx);
+
+  reset_captured_args(fn);
+  fn->arg_count = config->arg_count;
+#pragma unroll
+  for (int index = 0; index < DATACRUMBS_MAX_CAPTURE_ARGS; ++index) {
+    if ((unsigned int)index >= config->arg_count) break;
+    arg_index = config->arg_index[index];
+    raw_value = 0;
+    if (arg_index == 0) {
+      raw_value = raw_arg0;
+    } else if (arg_index == 1) {
+      raw_value = raw_arg1;
+    } else if (arg_index == 2) {
+      raw_value = raw_arg2;
+    } else if (arg_index == 3) {
+      raw_value = raw_arg3;
+    } else if (arg_index == 4) {
+      raw_value = raw_arg4;
+    }
+    fn->args[index] = raw_value;
+    fn->arg_data_status[index] = 0;
+    fn->arg_data_len[index] = 0;
+    __builtin_memset(fn->arg_data[index], 0, sizeof(fn->arg_data[index]));
+    num_bytes = config->arg_num_bytes[index];
+    if (num_bytes == 0) continue;
+    if (num_bytes > DATACRUMBS_MAX_CAPTURE_BYTES) {
+      num_bytes = DATACRUMBS_MAX_CAPTURE_BYTES;
+    }
+    if (config->arg_is_pointer[index] && raw_value != 0) {
+      fn->arg_data_len[index] = num_bytes;
+      if (config->probe_kind == DATACRUMBS_RUNTIME_PROBE_KIND_UPROBE) {
+        err = bpf_probe_read_user(fn->arg_data[index], num_bytes, (const void*)raw_value);
+      } else {
+        err = bpf_probe_read_kernel(fn->arg_data[index], num_bytes, (const void*)raw_value);
+      }
+      fn->arg_data_status[index] = err == 0 ? 2 : 3;
+      continue;
+    }
+    if (num_bytes > sizeof(raw_value)) {
+      num_bytes = sizeof(raw_value);
+    }
+    fn->arg_data_len[index] = num_bytes;
+    __builtin_memcpy(fn->arg_data[index], &raw_value, sizeof(raw_value));
+    fn->arg_data_status[index] = 1;
+  }
+}
+
+static inline __attribute__((always_inline)) void capture_runtime_raw_args(
+    const struct runtime_event_config_t* config, struct fn_value_t* fn, unsigned long long raw_arg0,
+    unsigned long long raw_arg1, unsigned long long raw_arg2, unsigned long long raw_arg3,
+    unsigned long long raw_arg4, bool read_user_pointers) {
+  unsigned int arg_index;
+  unsigned int num_bytes;
+  unsigned long long raw_value;
+  long err;
+
+  reset_captured_args(fn);
+  fn->arg_count = config->arg_count;
+#pragma unroll
+  for (int index = 0; index < DATACRUMBS_MAX_CAPTURE_ARGS; ++index) {
+    if ((unsigned int)index >= config->arg_count) break;
+    arg_index = config->arg_index[index];
+    raw_value = 0;
+    if (arg_index == 0) {
+      raw_value = raw_arg0;
+    } else if (arg_index == 1) {
+      raw_value = raw_arg1;
+    } else if (arg_index == 2) {
+      raw_value = raw_arg2;
+    } else if (arg_index == 3) {
+      raw_value = raw_arg3;
+    } else if (arg_index == 4) {
+      raw_value = raw_arg4;
+    }
+    fn->args[index] = raw_value;
+    fn->arg_data_status[index] = 0;
+    fn->arg_data_len[index] = 0;
+    __builtin_memset(fn->arg_data[index], 0, sizeof(fn->arg_data[index]));
+    num_bytes = config->arg_num_bytes[index];
+    if (num_bytes == 0) continue;
+    if (num_bytes > DATACRUMBS_MAX_CAPTURE_BYTES) {
+      num_bytes = DATACRUMBS_MAX_CAPTURE_BYTES;
+    }
+    if (config->arg_is_pointer[index] && raw_value != 0) {
+      fn->arg_data_len[index] = num_bytes;
+      if (read_user_pointers) {
+        err = bpf_probe_read_user(fn->arg_data[index], num_bytes, (const void*)raw_value);
+      } else {
+        err = bpf_probe_read_kernel(fn->arg_data[index], num_bytes, (const void*)raw_value);
+      }
+      fn->arg_data_status[index] = err == 0 ? 2 : 3;
+      continue;
+    }
+    if (num_bytes > sizeof(raw_value)) {
+      num_bytes = sizeof(raw_value);
+    }
+    fn->arg_data_len[index] = num_bytes;
+    __builtin_memcpy(fn->arg_data[index], &raw_value, sizeof(raw_value));
+    fn->arg_data_status[index] = 1;
+  }
+}
+
+static inline __attribute__((always_inline)) void capture_runtime_usdt_args(
+    struct pt_regs* ctx, const struct runtime_event_config_t* config, struct fn_value_t* fn) {
+  long raw_value = 0;
+  unsigned int num_bytes;
+  long err;
+  reset_captured_args(fn);
+  fn->arg_count = config->arg_count;
+#pragma unroll
+  for (int index = 0; index < DATACRUMBS_MAX_CAPTURE_ARGS; ++index) {
+    if ((unsigned int)index >= config->arg_count) break;
+    raw_value = 0;
+    if (bpf_usdt_arg(ctx, config->arg_index[index], &raw_value) != 0) {
+      raw_value = 0;
+    }
+    fn->args[index] = (unsigned long long)raw_value;
+    fn->arg_data_status[index] = 0;
+    fn->arg_data_len[index] = 0;
+    __builtin_memset(fn->arg_data[index], 0, sizeof(fn->arg_data[index]));
+    num_bytes = config->arg_num_bytes[index];
+    if (num_bytes == 0) continue;
+    if (num_bytes > DATACRUMBS_MAX_CAPTURE_BYTES) {
+      num_bytes = DATACRUMBS_MAX_CAPTURE_BYTES;
+    }
+    if (config->arg_is_pointer[index] && raw_value != 0) {
+      fn->arg_data_len[index] = num_bytes;
+      err = bpf_probe_read_user(fn->arg_data[index], num_bytes, (const void*)raw_value);
+      fn->arg_data_status[index] = err == 0 ? 2 : 3;
+      continue;
+    }
+    if (num_bytes > sizeof(raw_value)) {
+      num_bytes = sizeof(raw_value);
+    }
+    fn->arg_data_len[index] = num_bytes;
+    __builtin_memcpy(fn->arg_data[index], &raw_value, sizeof(raw_value));
+    fn->arg_data_status[index] = 1;
+  }
+}
+
 #if defined(DATACRUMBS_ENABLE) && (DATACRUMBS_ENABLE == 1)
 #if defined(DATACRUMBS_MODE) && (DATACRUMBS_MODE == 1)
-static inline __attribute__((always_inline)) int generic_entry(struct pt_regs* ctx, u64 event_id) {
+static inline __attribute__((always_inline)) int generic_entry(struct pt_regs* ctx,
+                                                               u64 attach_cookie) {
+  // pid gate first: kprobes fire system-wide, so most hits are untraced processes. Bail before the
+  // per-event config lookup to drop a map lookup on that path.
   struct fn_key_t key = {};
-  key.event_id = event_id;
   u64 start_ts = 0;
-  if (!need_tracing(&key, &start_ts)) {
+  if (!fn_pid_gate(&key, &start_ts, attach_cookie)) {
     return 0;  // not tracing this pid
   }
-  struct fn_value_t fn = {};
-  fn.ts = bpf_ktime_get_ns();
-  bpf_map_update_elem(&fn_pid_map, &key, &fn, BPF_ANY);
+  const struct runtime_event_config_t* config = resolve_event_config(attach_cookie);
+  if (config == NULL) return 0;
+  const u64 event_id = config->event_id;
+  key.event_id = event_id;
+  struct fn_value_t* fn = get_scratch_fn_value();
+  if (fn == NULL) return 0;
+  __builtin_memset(fn, 0, sizeof(*fn));
+  fn->ts = bpf_ktime_get_ns();
+  capture_runtime_args(ctx, config, fn);
+  pmu_snapshot_entry(fn);
+  bpf_map_update_elem(&fn_pid_map, &key, fn, BPF_ANY);
   DBG_PRINTK("Pushed pid:%d, event_id:%llu to map\n", (u32)key.id, event_id);
   return 0;
 }
 #else
-static inline __attribute__((always_inline)) int generic_entry(struct pt_regs* ctx, u64 event_id) {
+static inline __attribute__((always_inline)) int generic_entry(struct pt_regs* ctx,
+                                                               u64 attach_cookie) {
+  // pid gate first (see generic_entry above): bail before the config lookup.
   struct fn_key_t key = {};
-  key.event_id = event_id;
   u64 start_ts;
-  if (!need_tracing(&key, &start_ts)) {
+  if (!fn_pid_gate(&key, &start_ts, attach_cookie)) {
     return 0;  // not tracing this pid
   }
-  struct fn_value_t fn = {};
-  fn.ts = bpf_ktime_get_ns();
-  bpf_map_update_elem(&fn_pid_map, &key, &fn, BPF_ANY);
+  const struct runtime_event_config_t* config = resolve_event_config(attach_cookie);
+  if (config == NULL) return 0;
+  const u64 event_id = config->event_id;
+  key.event_id = event_id;
+  struct fn_value_t* fn = get_scratch_fn_value();
+  if (fn == NULL) return 0;
+  __builtin_memset(fn, 0, sizeof(*fn));
+  fn->ts = bpf_ktime_get_ns();
+  reset_captured_args(fn);
+  bpf_map_update_elem(&fn_pid_map, &key, fn, BPF_ANY);
   DBG_PRINTK("Pushed pid:%d, event_id:%llu to map\n", (u32)key.id, event_id);
   return 0;
 }
 #endif
 #else
-static inline __attribute__((always_inline)) int generic_entry(struct pt_regs* ctx, u64 event_id) {
+static inline __attribute__((always_inline)) int generic_entry(struct pt_regs* ctx,
+                                                               u64 attach_cookie) {
   return 0;
 }
 #endif
 #if defined(DATACRUMBS_ENABLE) && (DATACRUMBS_ENABLE == 1)
 #if defined(DATACRUMBS_MODE) && (DATACRUMBS_MODE == 1)
-static inline __attribute__((always_inline)) int generic_exit(struct pt_regs* ctx, u64 event_id) {
-  u64 te = bpf_ktime_get_ns();
+static inline __attribute__((always_inline)) int generic_exit(struct pt_regs* ctx,
+                                                              u64 attach_cookie) {
+  // pid gate first (see generic_entry): bail before the config + state lookups.
   struct fn_key_t key = {};
-  key.event_id = event_id;
   u64 start_ts = 0;
-  if (!need_tracing(&key, &start_ts)) {
+  if (!fn_pid_gate(&key, &start_ts, attach_cookie)) {
     return 0;  // not tracing this pid
   }
+  u64 te = bpf_ktime_get_ns();
+  const struct runtime_event_config_t* config = resolve_event_config(attach_cookie);
+  if (config == NULL) return 0;
+  const u64 event_id = config->event_id;
+  key.event_id = event_id;
   struct fn_value_t* fn = bpf_map_lookup_elem(&fn_pid_map, &key);
   if (fn == 0) return 0;  // missed entry
-  DATACRUMBS_SKIP_SMALL_EVENTS(fn, te);
-  struct general_event_t* event;
-  DATACRUMBS_RB_RESERVE(output, struct general_event_t, event);
-  event->type = 1;
+  // Stale pairing: bpftime's /dev/shm fn_pid_map entry outlives a crashed run.
+  if (fn->ts == 0 || fn->ts > te) {
+    bpf_map_delete_elem(&fn_pid_map, &key);  // garbage pairing; free the slot
+    return 0;
+  }
+  if (config->aggregate) {  // count+duration only, no per-event record
+    aggregate_hit(event_id, key.id, fn->ts, te);
+    bpf_map_delete_elem(&fn_pid_map, &key);  // pair consumed; nothing else frees it
+    return 0;
+  }
+  DATACRUMBS_SKIP_SMALL_EVENTS(fn, te, key);
+  if (hot_probe_drop(event_id, te)) {        // rate-limit a runaway (busy-poll) probe
+    bpf_map_delete_elem(&fn_pid_map, &key);  // pair consumed even though nothing is emitted
+    return 0;
+  }
+  struct generic_event_t* event;
+  DATACRUMBS_RB_RESERVE(output, struct generic_event_t, event);
+  event->type = config->probe_kind;
   event->id = key.id;
   event->event_id = event_id;
+  event->stack_id = -1;  // stacks are captured on tracepoints (generic_point), not entry/exit pairs
   DATACRUMBS_COLLECT_TIME(event);
+  copy_captured_args_to_event(fn, event);
+  pmu_delta_exit(fn, event);
   DATACRUMBS_EVENT_SUBMIT(event, key.id, event_id);
+  bpf_map_delete_elem(&fn_pid_map, &key);  // pair consumed; nothing else frees it
   return 0;
 }
 #else
-static inline __attribute__((always_inline)) int generic_exit(struct pt_regs* ctx, u64 event_id) {
-  u64 te = bpf_ktime_get_ns();
+static inline __attribute__((always_inline)) int generic_exit(struct pt_regs* ctx,
+                                                              u64 attach_cookie) {
+  // pid gate first (see generic_entry): bail before the config + state lookups.
   struct fn_key_t key = {};
-  key.event_id = event_id;
   u64 start_ts;
-  if (!need_tracing(&key, &start_ts)) {
+  if (!fn_pid_gate(&key, &start_ts, attach_cookie)) {
     return 0;  // not tracing this pid
   }
+  u64 te = bpf_ktime_get_ns();
+  const struct runtime_event_config_t* config = resolve_event_config(attach_cookie);
+  if (config == NULL) return 0;
+  const u64 event_id = config->event_id;
+  key.event_id = event_id;
   struct fn_value_t* fn = bpf_map_lookup_elem(&fn_pid_map, &key);
   if (fn == 0) return 0;  // missed entry
+  // Stale pairing: bpftime's /dev/shm fn_pid_map entry outlives a crashed run.
+  if (fn->ts == 0 || fn->ts > te) {
+    bpf_map_delete_elem(&fn_pid_map, &key);  // garbage pairing; free the slot
+    return 0;
+  }
   struct profile_key_t profile_key = {};
   profile_key.type = 1;
   profile_key.id = key.id;
@@ -203,13 +693,11 @@ static inline __attribute__((always_inline)) int generic_exit(struct pt_regs* ct
   profile_key.time_interval = fn->ts / DATACRUMBS_TIME_INTERVAL_NS;
   struct profile_value_t* profile_value = bpf_map_lookup_elem(&profile, &profile_key);
   if (profile_value == NULL) {
-    // Key not found, initialize a new value
     struct profile_value_t new_value;
     new_value.frequency = 0;
     new_value.duration = 0;
     bpf_map_update_elem(&profile, &profile_key, &new_value, BPF_NOEXIST);
-    profile_value =
-        bpf_map_lookup_elem(&profile, &profile_key);  // Lookup again to get the new value's address
+    profile_value = bpf_map_lookup_elem(&profile, &profile_key);
   }
   if (profile_value != NULL) {
     profile_value->frequency++;
@@ -222,86 +710,150 @@ static inline __attribute__((always_inline)) int generic_exit(struct pt_regs* ct
 }
 #endif
 #else
-static inline __attribute__((always_inline)) int generic_exit(struct pt_regs* ctx, u64 event_id) {
-  return 0;
-}
-#endif
-
-#if defined(DATACRUMBS_ENABLE) && (DATACRUMBS_ENABLE == 1)
-static inline __attribute__((always_inline)) int usdt_entry(struct pt_regs* ctx, u64 event_id) {
-  struct fn_key_t key = {};
-  key.event_id = event_id;
-  u64 start_ts;
-  if (!need_tracing(&key, &start_ts)) {
-    return 0;  // not tracing this pid
-  }
-  struct fn_value_t fn = {};
-  fn.ts = bpf_ktime_get_ns();
-  bpf_map_update_elem(&fn_pid_map, &key, &fn, BPF_ANY);
-  DBG_PRINTK("USDT  Pushed pid:%d, event_id:%llu to map\n", (u32)key.id, event_id);
-  return 0;
-}
-
-#else
-static inline __attribute__((always_inline)) int usdt_entry(struct pt_regs* ctx, u64 event_id) {
+static inline __attribute__((always_inline)) int generic_exit(struct pt_regs* ctx,
+                                                              u64 attach_cookie) {
   return 0;
 }
 #endif
 
 #if defined(DATACRUMBS_ENABLE) && (DATACRUMBS_ENABLE == 1)
 #if defined(DATACRUMBS_MODE) && (DATACRUMBS_MODE == 1)
-static inline __attribute__((always_inline)) int usdt_exit(struct pt_regs* ctx, u64 event_id,
-                                                           long clazz, long method) {
-  u64 te = bpf_ktime_get_ns();
+static inline __attribute__((always_inline)) int generic_syscall_entry(
+    struct pt_regs* ctx, u64 attach_cookie, unsigned long long arg0, unsigned long long arg1,
+    unsigned long long arg2, unsigned long long arg3, unsigned long long arg4) {
+  // pid gate first (see generic_entry): bail before the config lookup.
   struct fn_key_t key = {};
+  u64 start_ts = 0;
+  if (!fn_pid_gate(&key, &start_ts, attach_cookie)) {
+    return 0;
+  }
+  const struct runtime_event_config_t* config = resolve_event_config(attach_cookie);
+  if (config == NULL) return 0;
+  const u64 event_id = config->event_id;
   key.event_id = event_id;
-  u64 start_ts;
-  if (!need_tracing(&key, &start_ts)) {
-    return 0;  // not tracing this pid
-  }
-  struct fn_value_t* fn = bpf_map_lookup_elem(&fn_pid_map, &key);
-  if (fn == 0) return 0;  // missed entry
-  DATACRUMBS_SKIP_SMALL_EVENTS(fn, te);
-  struct string_t local_str = {};                                                      // 100
-  long len = bpf_probe_read_user_str(&local_str.str, MAX_STR_READ_LEN, (void*)clazz);  // 90
-  local_str.len = len * 8;
-#if defined(DATACRUMBS_ENABLE_INCLUSION_PATH) && (DATACRUMBS_ENABLE_INCLUSION_PATH == 1)
-  int found = prefix_search(&inclusion_path_trie, &local_str);
-  if (!found) {
-    DBG_PRINTK("Skipping usdt for %s as it is not in inclusion path trie\n", local_str.str);
-    return 0;  // Skip if not in inclusion path
-  }
-#endif
-
-  struct usdt_event_t* event;
-  DATACRUMBS_RB_RESERVE(output, struct usdt_event_t, event);
-  event->type = 3;
-  event->id = key.id;
-  event->event_id = event_id;
-  DATACRUMBS_COLLECT_TIME(event);
-
-  u32 class_hash = hash_and_store(&local_str, len);
-  event->class_hash = class_hash;                                                  // 100
-  len = bpf_probe_read_user_str(&local_str.str, MAX_STR_READ_LEN, (void*)method);  // 90
-
-  u32 method_hash = hash_and_store(&local_str, len);
-  event->method_hash = method_hash;  // 100
-  DATACRUMBS_EVENT_SUBMIT(event, key.id, event_id);
+  struct fn_value_t* fn = get_scratch_fn_value();
+  if (fn == NULL) return 0;
+  __builtin_memset(fn, 0, sizeof(*fn));
+  fn->ts = bpf_ktime_get_ns();
+  capture_runtime_raw_args(config, fn, arg0, arg1, arg2, arg3, arg4, true);
+  pmu_snapshot_entry(fn);
+  bpf_map_update_elem(&fn_pid_map, &key, fn, BPF_ANY);
+  DBG_PRINTK("Pushed syscall pid:%d, event_id:%llu to map\n", (u32)key.id, event_id);
   return 0;
 }
 #else
-static inline __attribute__((always_inline)) int usdt_exit(struct pt_regs* ctx, u64 event_id,
-                                                           long clazz, long method) {
-  u64 te = bpf_ktime_get_ns();
+static inline __attribute__((always_inline)) int generic_syscall_entry(
+    struct pt_regs* ctx, u64 attach_cookie, unsigned long long arg0, unsigned long long arg1,
+    unsigned long long arg2, unsigned long long arg3, unsigned long long arg4) {
+  return 0;
+}
+#endif
+#else
+static inline __attribute__((always_inline)) int generic_syscall_entry(
+    struct pt_regs* ctx, u64 attach_cookie, unsigned long long arg0, unsigned long long arg1,
+    unsigned long long arg2, unsigned long long arg3, unsigned long long arg4) {
+  return 0;
+}
+#endif
+
+#if defined(DATACRUMBS_ENABLE) && (DATACRUMBS_ENABLE == 1)
+static inline __attribute__((always_inline)) int usdt_entry(struct pt_regs* ctx,
+                                                            u64 attach_cookie) {
+  // pid gate first (see generic_entry): bail before the config lookup.
   struct fn_key_t key = {};
-  key.event_id = event_id;
   u64 start_ts;
-  if (!need_tracing(&key, &start_ts)) {
+  if (!fn_pid_gate(&key, &start_ts, attach_cookie)) {
     return 0;  // not tracing this pid
   }
+  const struct runtime_event_config_t* config = resolve_event_config(attach_cookie);
+  if (config == NULL) return 0;
+  const u64 event_id = config->event_id;
+  key.event_id = event_id;
+  struct fn_value_t* fn = get_scratch_fn_value();
+  if (fn == NULL) return 0;
+  __builtin_memset(fn, 0, sizeof(*fn));
+  fn->ts = bpf_ktime_get_ns();
+  capture_runtime_usdt_args(ctx, config, fn);
+  pmu_snapshot_entry(fn);
+  bpf_map_update_elem(&fn_pid_map, &key, fn, BPF_ANY);
+  DBG_PRINTK("USDT  Pushed pid:%d, event_id:%llu to map\n", (u32)key.id, event_id);
+  return 0;
+}
+
+#else
+static inline __attribute__((always_inline)) int usdt_entry(struct pt_regs* ctx,
+                                                            u64 attach_cookie) {
+  return 0;
+}
+#endif
+
+#if defined(DATACRUMBS_ENABLE) && (DATACRUMBS_ENABLE == 1)
+#if defined(DATACRUMBS_MODE) && (DATACRUMBS_MODE == 1)
+static inline __attribute__((always_inline)) int usdt_exit(struct pt_regs* ctx, u64 attach_cookie,
+                                                           long clazz, long method) {
+  // pid gate first (see generic_entry): bail before the config + state lookups.
+  struct fn_key_t key = {};
+  u64 start_ts;
+  if (!fn_pid_gate(&key, &start_ts, attach_cookie)) {
+    return 0;  // not tracing this pid
+  }
+  u64 te = bpf_ktime_get_ns();
+  const struct runtime_event_config_t* config = resolve_event_config(attach_cookie);
+  if (config == NULL) return 0;
+  const u64 event_id = config->event_id;
+  key.event_id = event_id;
   struct fn_value_t* fn = bpf_map_lookup_elem(&fn_pid_map, &key);
   if (fn == 0) return 0;  // missed entry
-  DATACRUMBS_SKIP_SMALL_EVENTS(fn, te);
+  // Stale pairing: bpftime's /dev/shm fn_pid_map entry outlives a crashed run.
+  if (fn->ts == 0 || fn->ts > te) {
+    bpf_map_delete_elem(&fn_pid_map, &key);  // garbage pairing; free the slot
+    return 0;
+  }
+  if (config->aggregate) {  // count+duration only, no per-event record
+    aggregate_hit(event_id, key.id, fn->ts, te);
+    bpf_map_delete_elem(&fn_pid_map, &key);  // pair consumed; nothing else frees it
+    return 0;
+  }
+  DATACRUMBS_SKIP_SMALL_EVENTS(fn, te, key);
+  if (hot_probe_drop(event_id, te)) {        // rate-limit a runaway (busy-poll) probe
+    bpf_map_delete_elem(&fn_pid_map, &key);  // pair consumed even though nothing is emitted
+    return 0;
+  }
+  struct generic_event_t* event;
+  DATACRUMBS_RB_RESERVE(output, struct generic_event_t, event);
+  event->type = config->probe_kind;
+  event->id = key.id;
+  event->event_id = event_id;
+  event->stack_id = -1;  // stacks are captured on tracepoints (generic_point), not entry/exit pairs
+  DATACRUMBS_COLLECT_TIME(event);
+  copy_captured_args_to_event(fn, event);
+  pmu_delta_exit(fn, event);
+  DATACRUMBS_EVENT_SUBMIT(event, key.id, event_id);
+  bpf_map_delete_elem(&fn_pid_map, &key);  // pair consumed; nothing else frees it
+  return 0;
+}
+#else
+static inline __attribute__((always_inline)) int usdt_exit(struct pt_regs* ctx, u64 attach_cookie,
+                                                           long clazz, long method) {
+  // pid gate first (see generic_entry): bail before the config + state lookups.
+  struct fn_key_t key = {};
+  u64 start_ts;
+  if (!fn_pid_gate(&key, &start_ts, attach_cookie)) {
+    return 0;  // not tracing this pid
+  }
+  u64 te = bpf_ktime_get_ns();
+  const struct runtime_event_config_t* config = resolve_event_config(attach_cookie);
+  if (config == NULL) return 0;
+  const u64 event_id = config->event_id;
+  key.event_id = event_id;
+  struct fn_value_t* fn = bpf_map_lookup_elem(&fn_pid_map, &key);
+  if (fn == 0) return 0;  // missed entry
+  // Stale pairing: bpftime's /dev/shm fn_pid_map entry outlives a crashed run.
+  if (fn->ts == 0 || fn->ts > te) {
+    bpf_map_delete_elem(&fn_pid_map, &key);  // garbage pairing; free the slot
+    return 0;
+  }
+  DATACRUMBS_SKIP_SMALL_EVENTS(fn, te, key);
   struct string_t local_str = {};                                                      // 100
   long len = bpf_probe_read_user_str(&local_str.str, MAX_STR_READ_LEN, (void*)clazz);  // 90
   local_str.len = len * 8;
@@ -325,11 +877,9 @@ static inline __attribute__((always_inline)) int usdt_exit(struct pt_regs* ctx, 
   profile_key.time_interval = fn->ts / DATACRUMBS_TIME_INTERVAL_NS;
   struct profile_value_t* profile_value = bpf_map_lookup_elem(&usdt_profile, &profile_key);
   if (profile_value == NULL) {
-    // Key not found, initialize a new value
     struct profile_value_t new_value;
     bpf_map_update_elem(&usdt_profile, &profile_key, &new_value, BPF_NOEXIST);
-    profile_value = bpf_map_lookup_elem(
-        &usdt_profile, &profile_key);  // Lookup again to get the new value's address
+    profile_value = bpf_map_lookup_elem(&usdt_profile, &profile_key);
   }
   if (profile_value != NULL) {
     profile_value->frequency++;
@@ -344,6 +894,197 @@ static inline __attribute__((always_inline)) int usdt_exit(struct pt_regs* ctx, 
 #else
 static inline __attribute__((always_inline)) int usdt_exit(struct pt_regs* ctx, u64 event_id,
                                                            long clazz, long method) {
+  return 0;
+}
+#endif
+
+#if defined(DATACRUMBS_ENABLE) && (DATACRUMBS_ENABLE == 1) && defined(DATACRUMBS_MODE) && \
+    (DATACRUMBS_MODE == 1)
+// Raw stack snapshot (regs + stack bytes from sp) for offline DWARF unwinding across
+// frame-pointer-less libs. Own ringbuf record tagged with a sentinel type. Each costs
+// DATACRUMBS_STACKDUMP_BYTES, so dump_mask subsamples 1-in-(mask+1) to bound volume.
+static inline __attribute__((always_inline)) void capture_stack_sample(u64 id, u64 event_id, u64 ts,
+                                                                       u32 dump_mask) {
+  if (dump_mask && (bpf_get_prandom_u32() & dump_mask) != 0) return;
+  u32 zero = 0;
+  struct stack_sample_t* ss = bpf_map_lookup_elem(&stack_scratch, &zero);
+  if (!ss) return;
+  struct pt_regs* r =
+      (struct pt_regs*)bpf_task_pt_regs((struct task_struct*)bpf_get_current_task_btf());
+  ss->type = DATACRUMBS_STACK_SAMPLE_TYPE;
+  ss->id = id;
+  ss->event_id = event_id;
+  ss->ts = ts;
+  // pc/sp/fp/ra come from bpf_tracing's CO-RE accessors: field names are per-arch (aarch64 pc and
+  // regs[29]/regs[30] do not exist on x86_64), and the server builds for both the DPU and the host.
+  // uregs[3] is the link register on aarch64 and the RA slot address on x86_64.
+  ss->uregs[0] = PT_REGS_IP_CORE(r);
+  ss->uregs[1] = PT_REGS_SP_CORE(r);
+  ss->uregs[2] = PT_REGS_FP_CORE(r);
+  ss->uregs[3] = PT_REGS_RET_CORE(r);
+  ss->cpu = bpf_get_smp_processor_id();
+  ss->pmu_count = pmu_active_count();
+  __builtin_memset(ss->pmu, 0, sizeof(ss->pmu));
+  if (ss->pmu_count) pmu_read(ss->pmu, ss->pmu_count);
+  long ok = bpf_probe_read_user(ss->stackdump, DATACRUMBS_STACKDUMP_BYTES, (void*)ss->uregs[1]);
+  ss->stackdump_len = ok == 0 ? DATACRUMBS_STACKDUMP_BYTES : 0;
+  bpf_ringbuf_output(&output, ss, sizeof(*ss), 0);
+}
+
+// Tracepoint handler: ctx is the raw tracepoint record. A tracepoint is a point event, so this
+// emits directly (no entry/exit pairing). Fields are read from ctx at offsets parsed from the
+// tracepoint's tracefs format at attach.
+static inline __attribute__((always_inline)) int generic_point(void* ctx, u64 attach_cookie) {
+  const u64 now = bpf_ktime_get_ns();
+  const struct runtime_event_config_t* config = resolve_event_config(attach_cookie);
+  if (config == NULL) return 0;
+  const u64 event_id = config->event_id;
+  struct fn_key_t key = {};
+  // neither branch below reaches fn_pid_gate, which is what excludes the client's sink threads
+  if (is_tracer_thread()) return 0;
+  if (config->system_wide) {
+    if (is_self()) return 0;              // as above: the tracer must not observe itself
+    key.id = bpf_get_current_pid_tgid();  // capture on all pids
+    // ... unless the probe names a tid argument to gate on: keep the wakes OF our threads (whoever
+    // the waker is, which is the point of system_wide) and drop every other task's.
+    if (config->gate_tid_arg) {
+      const u32 gi = config->gate_tid_arg - 1;
+      if (gi < DATACRUMBS_MAX_CAPTURE_ARGS) {
+        u32 tid = 0;
+        bpf_probe_read_kernel(&tid, sizeof(tid), (const char*)ctx + config->arg_offset[gi]);
+        if (bpf_map_lookup_elem(&traced_tid_map, &tid) == NULL) return 0;
+      }
+    }
+  } else {
+    u64 start_ts = 0;
+    if (!need_tracing(&key, &start_ts)) return 0;  // default: pid-gated like kprobes
+  }
+  if (hot_probe_drop(event_id, now))
+    return 0;  // rate-limit a runaway (esp. system-wide) tracepoint
+  struct generic_event_t* event;
+  DATACRUMBS_RB_RESERVE(output, struct generic_event_t, event);
+  event->type = config->probe_kind;
+  event->id = key.id;
+  event->event_id = event_id;
+  event->ts = now;
+  event->dur = 1;  // nominal: a tracepoint is instantaneous; writer emits 1us so the ph:"X" renders
+  // at sched_switch current is the blocking task (waker at sched_wakeup), so its stack is the edge.
+  // Prefer the user stack (needs frame pointers); fall back to the kernel stack if the walk fails.
+  event->stack_id = -1;
+  event->pmu_count = 0;  // no entry snapshot on a point event; leaving it unset ships stack garbage
+  if (config->capture_stack) {
+    event->stack_id = bpf_get_stackid(ctx, &stack_map, BPF_F_USER_STACK);
+    if (event->stack_id < 0) event->stack_id = bpf_get_stackid(ctx, &stack_map, 0);
+    capture_stack_sample(key.id, event_id, now, config->stack_dump_mask);
+  }
+  event->arg_count = config->arg_count;
+#pragma unroll
+  for (int i = 0; i < DATACRUMBS_MAX_CAPTURE_ARGS; ++i) {
+    if ((unsigned int)i >= config->arg_count) break;
+    event->args[i] = 0;
+    event->arg_data_len[i] = 0;
+    event->arg_data_status[i] = 0;
+    unsigned int nb = config->arg_num_bytes[i];
+    if (nb == 0) continue;
+    const void* src = (const char*)ctx + config->arg_offset[i];
+    if (config->arg_is_pointer[i]) {
+      if (config->arg_index[i] ==
+          1) {  // __data_loc dynamic string: field holds [len:16|rel_off:16]
+        unsigned int loc = 0;
+        bpf_probe_read_kernel(&loc, 4, src);
+        unsigned int dl_len = (loc >> 16) & 0xffff;
+        unsigned int dl_off = loc & 0xffff;
+        if (dl_len > DATACRUMBS_MAX_CAPTURE_BYTES) dl_len = DATACRUMBS_MAX_CAPTURE_BYTES;
+        if (dl_len > 0 &&
+            bpf_probe_read_kernel(event->arg_data[i], dl_len, (const char*)ctx + dl_off) == 0) {
+          event->arg_data_len[i] = dl_len;
+          event->arg_data_status[i] = 2;
+        }
+      } else {  // fixed char array (e.g. comm[16]) -> raw bytes
+        if (nb > DATACRUMBS_MAX_CAPTURE_BYTES) nb = DATACRUMBS_MAX_CAPTURE_BYTES;
+        if (bpf_probe_read_kernel(event->arg_data[i], nb, src) == 0) {
+          event->arg_data_len[i] = nb;
+          event->arg_data_status[i] = 2;
+        }
+      }
+    } else {  // scalar field
+      unsigned long long v = 0;
+      if (nb > 8) nb = 8;
+      bpf_probe_read_kernel(&v, nb, src);
+      event->args[i] = v;
+    }
+  }
+  DATACRUMBS_EVENT_SUBMIT(event, key.id, event_id);
+  bpf_map_delete_elem(&fn_pid_map, &key);  // pair consumed; nothing else frees it
+  return 0;
+}
+
+// Counters advanced on this cpu since the previous sample, written into out[]. Returns the count.
+// Valid only while on-CPU: an entry->exit delta across an off-CPU block spans the gap and is
+// meaningless, so this is the only correct PMU form for a workload whose slow band is off-CPU.
+static inline __attribute__((always_inline)) u32 pmu_sample_delta(u64* out) {
+  const u32 n = pmu_active_count();
+  if (n == 0) return 0;
+  u64 now[DATACRUMBS_MAX_PMU] = {};
+  pmu_read(now, n);
+  u32 k = 0;
+  struct pmu_sample_prev_t* prev =
+      (struct pmu_sample_prev_t*)bpf_map_lookup_elem(&pmu_sample_prev, &k);
+  if (prev == NULL) return 0;
+  const u32 was_valid = prev->valid;
+#pragma unroll
+  for (u32 i = 0; i < DATACRUMBS_MAX_PMU; ++i) {
+    if (i < n) {
+      out[i] = was_valid && now[i] >= prev->v[i] ? now[i] - prev->v[i] : 0;
+      prev->v[i] = now[i];
+    }
+  }
+  prev->valid = 1;
+  return was_valid ? n : 0;  // first sample on this cpu has no baseline
+}
+
+// Frequency-based on-CPU sampler. A busy-poll spin never blocks (no sched edge) and a uprobe on a
+// hot poll fn inflates its own frame, so sampling is the only unbiased attribution for it. Emits
+// the point event plus the raw stack snapshot. Not rate-limited: dropping samples skews the
+// profile, so bound volume with sample_freq instead.
+static inline __attribute__((always_inline)) int generic_sample(void* ctx, u64 attach_cookie) {
+  const u64 now = bpf_ktime_get_ns();
+  const struct runtime_event_config_t* config = resolve_event_config(attach_cookie);
+  if (config == NULL) return 0;
+  const u64 event_id = config->event_id;
+  struct fn_key_t key = {};
+  // neither branch below reaches fn_pid_gate, which is what excludes the client's sink threads
+  if (is_tracer_thread()) return 0;
+  if (config->system_wide) {
+    key.id = bpf_get_current_pid_tgid();
+  } else {
+    u64 start_ts = 0;
+    if (!need_tracing(&key, &start_ts)) return 0;  // the sampler is per-cpu; gate to traced pids
+  }
+  // Register this thread so a gated system_wide tracepoint can recognise a wake aimed at it.
+  const u32 self_tid = (u32)key.id;
+  const u32 one = 1;
+  bpf_map_update_elem(&traced_tid_map, &self_tid, &one, BPF_ANY);
+  struct generic_event_t* event;
+  DATACRUMBS_RB_RESERVE(output, struct generic_event_t, event);
+  event->type = config->probe_kind;
+  event->id = key.id;
+  event->event_id = event_id;
+  event->ts = now;
+  event->dur = 1;  // a sample is instantaneous; its weight is 1/sample_freq, applied offline
+  event->arg_count = 0;
+  event->pmu_count = pmu_sample_delta(event->pmu);
+  event->stack_id = bpf_get_stackid(ctx, &stack_map, BPF_F_USER_STACK);
+  if (event->stack_id < 0) event->stack_id = bpf_get_stackid(ctx, &stack_map, 0);
+  DATACRUMBS_EVENT_SUBMIT(event, key.id, event_id);
+  capture_stack_sample(key.id, event_id, now, config->stack_dump_mask);
+  return 0;
+}
+#else
+static inline __attribute__((always_inline)) int generic_point(void* ctx, u64 attach_cookie) {
+  return 0;
+}
+static inline __attribute__((always_inline)) int generic_sample(void* ctx, u64 attach_cookie) {
   return 0;
 }
 #endif

@@ -3,9 +3,6 @@
 
 #include <datacrumbs/server/bpf/shared.h>
 
-/**
- * Macros for defining BPF ring buffers
- */
 #define DATACRUMBS_BPF_RING_BUF_1_ARGS(name) \
   struct {                                   \
     __uint(type, BPF_MAP_TYPE_RINGBUF);      \
@@ -24,10 +21,6 @@
 
 #define DATACRUMBS_RINGBUF(...) DATACRUMBS_BPF_RING_BUF_MACRO_CHOOSER(__VA_ARGS__)(__VA_ARGS__)
 
-/**
- * Macro for defining a BPF map
- */
-
 #define DATACRUMBS_MAP_3_ARGS(name, map_key, map_value) \
   struct {                                              \
     __uint(type, BPF_MAP_TYPE_HASH);                    \
@@ -42,6 +35,16 @@
     __uint(max_entries, size);                                \
     __type(key, map_key);                                     \
     __type(value, map_value);                                 \
+  } name SEC(".maps");
+
+// A plain HASH map fails silently once full and strands later entry/exit pairs. This LRU map
+// self-evicts instead, so a leaked entry costs one stale slot, not the whole map.
+#define DATACRUMBS_LRU_MAP(name, map_key, map_value, size) \
+  struct {                                                 \
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);                   \
+    __uint(max_entries, size);                             \
+    __type(key, map_key);                                  \
+    __type(value, map_value);                              \
   } name SEC(".maps");
 
 #define GET_5TH_ARG(arg1, arg2, arg3, arg4, arg5, ...) arg5
@@ -75,9 +78,6 @@
 
 #define DATACRUMBS_TRIE(...) DATACRUMBS_TRIE_MACRO_CHOOSER(__VA_ARGS__)(__VA_ARGS__)
 
-/**
- * Macros for defining BPF ring buffers
- */
 #define DATACRUMBS_BPF_RING_BUF_EXTERN_1_ARGS(name) \
   extern struct {                                   \
     __uint(type, BPF_MAP_TYPE_RINGBUF);             \
@@ -96,9 +96,15 @@
 #define DATACRUMBS_RINGBUF_EXTERN(...) \
   DATACRUMBS_BPF_RING_BUF_EXTERN_MACRO_CHOOSER(__VA_ARGS__)(__VA_ARGS__)
 
-/**
- * Macro for defining a BPF map
- */
+// This must match DATACRUMBS_LRU_MAP exactly. bpftool's linker rejects a mismatched extern
+// declaration with only "Invalid argument (22)" to explain why.
+#define DATACRUMBS_LRU_MAP_EXTERN(name, map_key, map_value, size) \
+  extern struct {                                                 \
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);                          \
+    __uint(max_entries, size);                                    \
+    __type(key, map_key);                                         \
+    __type(value, map_value);                                     \
+  } name SEC(".maps");
 
 #define DATACRUMBS_MAP_EXTERN_3_ARGS(name, map_key, map_value) \
   extern struct {                                              \
@@ -144,9 +150,6 @@
 
 #define DATACRUMBS_TRIE_EXTERN(...) DATACRUMBS_TRIE_EXTERN_MACRO_CHOOSER(__VA_ARGS__)(__VA_ARGS__)
 
-/**
- * Helper Macros
- */
 #define STR_HELPER(x) #x
 #define STR(x) STR_HELPER(x)
 #ifndef ENABLE_BPF_PRINTK
@@ -171,11 +174,13 @@
     return 0;                                                                                   \
   }
 
-#define DATACRUMBS_SKIP_SMALL_EVENTS(fn, te)                                                     \
-  if (te - fn->ts <                                                                              \
-      DATACRUMBS_SKIP_SMALL_EVENTS_THRESHOLD_NS) { /* Skip events with duration less than 1ms */ \
-    DBG_PRINTK("Skipping small event with duration %llu ns", te - fn->ts);                       \
-    return 0;                                                                                    \
+// This frees the pairing slot before it returns. The pair is consumed either way, and a slot left
+// behind is lost until the same thread and function run again.
+#define DATACRUMBS_SKIP_SMALL_EVENTS(fn, te, key)                          \
+  if (te - fn->ts < DATACRUMBS_SKIP_SMALL_EVENTS_THRESHOLD_NS) {           \
+    DBG_PRINTK("Skipping small event with duration %llu ns", te - fn->ts); \
+    bpf_map_delete_elem(&fn_pid_map, &key);                                \
+    return 0;                                                              \
   }
 
 #define DATACRUMBS_COLLECT_TIME(event) \

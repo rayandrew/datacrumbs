@@ -1,11 +1,7 @@
 #ifndef DATACRUMBS_SERVER_BPF_COMPAT_H
 #define DATACRUMBS_SERVER_BPF_COMPAT_H
-// Configuration
-#include <datacrumbs/datacrumbs_config.h>
-
-// header
-
 #include <bpf/bpf.h>
+#include <datacrumbs/datacrumbs_config.h>
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,14 +9,13 @@
 
 #if DATACRUMBS_KERNEL_GET_VERSION(5, 6, 0) > DATACRUMBS_KERNEL_VERSION
 
-/* Forward declaration for the batch options struct. */
 struct bpf_map_batch_opts;
 
 inline static int bpf_map_lookup_and_delete_batch_compat(int fd, void* in_batch, void* out_batch,
                                                          void* keys, void* values,
                                                          unsigned int* count,
                                                          const struct bpf_map_batch_opts* opts) {
-  // The older syscalls don't support batch options, so this is unused.
+  // Older syscalls do not support batch options.
   (void)opts;
 
   unsigned int num_to_process = *count;
@@ -35,7 +30,6 @@ inline static int bpf_map_lookup_and_delete_batch_compat(int fd, void* in_batch,
     return -1;
   }
 
-  // Get the map info to determine key and value sizes
   struct bpf_map_info info;
   unsigned int info_len = sizeof(info);
   if (bpf_map_get_info_by_fd(fd, &info, &info_len)) {
@@ -43,12 +37,11 @@ inline static int bpf_map_lookup_and_delete_batch_compat(int fd, void* in_batch,
     return -1;
   }
 
-  // Loop through the map to find, get, and delete elements
   while (processed < num_to_process) {
     void* next_key_storage = NULL;
     void* next_key = NULL;
 
-    // bpf_map_get_next_key requires a non-const key pointer
+    // bpf_map_get_next_key needs a non-const key pointer.
     if (current_key) {
       next_key_storage = malloc(info.key_size);
       if (!next_key_storage) {
@@ -62,30 +55,25 @@ inline static int bpf_map_lookup_and_delete_batch_compat(int fd, void* in_batch,
     if (bpf_map_get_next_key(fd, next_key_storage, &next_key)) {
       if (next_key_storage) free(next_key_storage);
       if (errno == ENOENT) {
-        // End of map, cleanup and set the return count
         *count = processed;
         errno = ENOENT;
-        return -1;  // Return -1 for success/end-of-map
+        return -1;  // -1 marks end-of-map here, not failure.
       }
-      // Other error
       *count = processed;
       return -1;
     }
 
     if (next_key_storage) free(next_key_storage);
 
-    // Lookup the element and copy its value
     if (bpf_map_lookup_elem(fd, next_key, value_ptr)) {
-      // Element may have been deleted by another process; continue
+      // The element may already be deleted by another process.
       continue;
     }
 
-    // Copy key and value to output arrays
     memcpy(key_ptr, next_key, info.key_size);
     key_ptr += info.key_size;
     value_ptr += info.value_size;
 
-    // Delete the element
     bpf_map_delete_elem(fd, next_key);
 
     current_key = next_key;
@@ -95,9 +83,8 @@ inline static int bpf_map_lookup_and_delete_batch_compat(int fd, void* in_batch,
   *count = processed;
 
   if (out_batch && processed > 0) {
-    // Set out_batch to the last key processed to enable further batches
+    // out_batch is the last key processed, for the next batch call.
     memcpy(out_batch, current_key, info.key_size);
-    // We've processed the full batch, so more elements might be available
     return 1;
   } else {
     errno = ENOENT;
@@ -110,7 +97,7 @@ inline static int bpf_map_lookup_and_delete_batch_compat(int fd, void* in_batch,
 inline static int bpf_map_lookup_batch_compat(int fd, void* in_batch, void* out_batch, void* keys,
                                               void* values, unsigned int* count,
                                               const struct bpf_map_batch_opts* opts) {
-  // The older syscalls don't support batch options, so this is unused.
+  // Older syscalls do not support batch options.
   (void)opts;
 
   unsigned int num_to_process;
@@ -130,13 +117,11 @@ inline static int bpf_map_lookup_batch_compat(int fd, void* in_batch, void* out_
 
   num_to_process = *count;
 
-  // Get the map info to determine key and value sizes
   if (bpf_map_get_info_by_fd(fd, &info, &info_len)) {
     *count = 0;
     return -1;
   }
 
-  // Allocate storage for next key for safe iteration
   next_key_storage = malloc(info.key_size);
   if (!next_key_storage) {
     errno = ENOMEM;
@@ -146,22 +131,19 @@ inline static int bpf_map_lookup_batch_compat(int fd, void* in_batch, void* out_
 
   current_key = in_batch;
 
-  // Loop through the map to find and get elements
   while (processed < num_to_process) {
     void* next_key_out = NULL;
 
     if (bpf_map_get_next_key(fd, current_key, next_key_storage)) {
       if (errno == ENOENT) {
-        // End of map, cleanup and set the return count
         *count = processed;
         free(next_key_storage);
         if (out_batch && processed > 0) {
           memcpy(out_batch, current_key, info.key_size);
         }
         errno = ENOENT;
-        return -1;  // Return 0 for success/end-of-map
+        return -1;  // -1 marks end-of-map here, not failure.
       }
-      // Other error
       *count = processed;
       free(next_key_storage);
       return -1;
@@ -169,14 +151,12 @@ inline static int bpf_map_lookup_batch_compat(int fd, void* in_batch, void* out_
 
     next_key_out = next_key_storage;
 
-    // Lookup the element and copy its value
     if (bpf_map_lookup_elem(fd, next_key_out, value_ptr)) {
-      // Element may have been deleted by another process; continue
+      // The element may already be deleted by another process.
       current_key = next_key_out;
       continue;
     }
 
-    // Copy key and value to output arrays
     memcpy(key_ptr, next_key_out, info.key_size);
 
     key_ptr = (char*)key_ptr + info.key_size;
@@ -189,9 +169,8 @@ inline static int bpf_map_lookup_batch_compat(int fd, void* in_batch, void* out_
   *count = processed;
 
   if (out_batch && processed > 0) {
-    // Set out_batch to the last key processed to enable further batches
+    // out_batch is the last key processed, for the next batch call.
     memcpy(out_batch, current_key, info.key_size);
-    // We've processed the full batch, so more elements might be available
     free(next_key_storage);
     return 1;
   } else {

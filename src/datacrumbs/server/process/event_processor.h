@@ -1,20 +1,15 @@
 #ifndef DATACRUMBS_SERVER_PROCESS_DEF
 #define DATACRUMBS_SERVER_PROCESS_DEF
-// BPF Headers
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
-// Generated Headers
-#include <datacrumbs/common/logging.h>
-#include <datacrumbs/datacrumbs_config.h>
-// Internal Headers
-#include <datacrumbs/common/configuration_manager.h>
 #include <datacrumbs/common/data_structures.h>
+#include <datacrumbs/common/logging.h>
+#include <datacrumbs/common/runtime_configuration_manager.h>
 #include <datacrumbs/common/utils.h>
+#include <datacrumbs/datacrumbs_config.h>
 #include <datacrumbs/server/bpf/compat/map.h>
 #include <datacrumbs/server/bpf/shared.h>
 #include <datacrumbs/server/process/writer/chrome_writer.h>
-
-// std headers
 #include <errno.h>
 #include <fcntl.h>
 #include <grp.h>
@@ -39,7 +34,7 @@
 namespace datacrumbs {
 class EventProcessor {
  public:
-  EventProcessor(int argc, char** argv);
+  explicit EventProcessor(const std::filesystem::path& probe_file);
 
   ~EventProcessor() {}
 
@@ -47,24 +42,25 @@ class EventProcessor {
 
   int update_filename(const char* filename, unsigned int hash);
 
-  int capture_general_counter(struct profile_key_t* key, struct profile_value_t* value) {
-    return 0;
-  }
+  int capture_general_counter(struct profile_key_t*, struct profile_value_t*) { return 0; }
 
-  int capture_usdt_counter(struct usdt_profile_key_t* key, struct profile_value_t* value) {
-    return 0;
-  }
+  int capture_usdt_counter(struct usdt_profile_key_t*, struct profile_value_t*) { return 0; }
 
   int finalize();
 
  public:
-  std::shared_ptr<ConfigurationManager> configManager_;
+  std::shared_ptr<RuntimeConfigurationManager> configManager_;
   std::shared_ptr<datacrumbs::ChromeWriter> writer_;
-  int failed_events;  // Count of failed events
+  int failed_events;
+  int stack_map_fd_ = -1;     // BPF_MAP_TYPE_STACK_TRACE fd for capture_stack probes (-1 = off)
+  std::ofstream stack_sink_;  // raw stack_sample_t records for offline DWARF unwinding
   std::atomic<uint64_t> event_index{0};
+  // Probes fire as they attach, so without this flag a catch-all attach records the machine
+  // before the workload starts. Set true only once attach finishes.
+  std::atomic<bool> collecting{false};
 
- private:                                              // Atomic index for event processing
-  std::unordered_set<unsigned int> processed_hashes_;  // Set to track processed PIDs
+ private:
+  std::unordered_set<unsigned int> processed_hashes_;
 };
 
 }  // namespace datacrumbs

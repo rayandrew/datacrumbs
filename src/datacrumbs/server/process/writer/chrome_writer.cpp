@@ -1,220 +1,433 @@
-#include <datacrumbs/server/process/writer/chrome_writer.h>
-// internal headers
-#include <datacrumbs/common/configuration_manager.h>
 #include <datacrumbs/common/constants.h>
 #include <datacrumbs/common/logging.h>
+#include <datacrumbs/common/pfw_format.h>
+#include <datacrumbs/common/runtime_configuration_manager.h>
 #include <datacrumbs/common/singleton.h>
 #include <datacrumbs/common/typedefs.h>
 #include <datacrumbs/server/bpf/shared.h>
-#include <datacrumbs/server/process/compress/zlib_compressor.h>
+#include <datacrumbs/server/process/event_enrichment.h>
+#include <datacrumbs/server/process/writer/chrome_writer.h>
+#include <datacrumbs/server/process/writer/json_escape.h>
+#include <openssl/evp.h>
+#include <pwd.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <zlib.h>
 
-// Specialization of the Singleton instance for KSymCapture.
-// This holds the shared pointer to the singleton instance.
-template <>
-std::shared_ptr<datacrumbs::ChromeWriter>
-    datacrumbs::Singleton<datacrumbs::ChromeWriter>::instance = nullptr;
+#include <algorithm>
+#include <cerrno>
+#include <chrono>
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
+#include <iomanip>
+#include <limits>
+#include <sstream>
+#include <stdexcept>
+#include <vector>
 
-// Specialization of the flag to stop creating new instances of KSymCapture.
-template <>
-bool datacrumbs::Singleton<datacrumbs::ChromeWriter>::stop_creating_instances = false;
+namespace {
+using datacrumbs::writer::json_escape;
+
+std::string bytes_to_hex(const std::vector<unsigned char>& bytes) {
+  std::ostringstream oss;
+  oss << std::hex << std::setfill('0');
+  for (unsigned char byte : bytes) {
+    oss << std::setw(2) << static_cast<unsigned int>(byte);
+  }
+  return oss.str();
+}
+
+std::string pointer_json(unsigned long long raw_value) {
+  std::ostringstream oss;
+  oss << "\"0x" << std::hex << raw_value << "\"";
+  return oss.str();
+}
+
+bool is_char_pointer_type(const std::string& c_type) {
+  return c_type.find("char *") != std::string::npos ||
+         c_type.find("const char *") != std::string::npos;
+}
+bool is_float_type(const std::string& c_type) {
+  return c_type == "float";
+}
+bool is_double_type(const std::string& c_type) {
+  return c_type == "double";
+}
+bool is_signed_type(const std::string& c_type) {
+  if (c_type.empty()) return false;
+  if (c_type.find("unsigned") != std::string::npos) return false;
+  return c_type.find("int") != std::string::npos || c_type.find("long") != std::string::npos ||
+         c_type.find("short") != std::string::npos || c_type.find("ssize_t") != std::string::npos ||
+         c_type.find("pid_t") != std::string::npos || c_type == "char";
+}
+
+std::string decode_scalar_json(const CapturedArgumentValue& value) {
+  const unsigned int width = std::min<std::size_t>(value.bytes.size(), sizeof(unsigned long long));
+  unsigned long long raw = 0;
+  if (width > 0) {
+    std::memcpy(&raw, value.bytes.data(), width);
+  } else {
+    raw = value.raw_value;
+  }
+
+  if (is_float_type(value.c_type) && width >= sizeof(float)) {
+    float number = 0.0f;
+    std::memcpy(&number, value.bytes.data(), sizeof(float));
+    return std::to_string(number);
+  }
+  if (is_double_type(value.c_type) && width >= sizeof(double)) {
+    double number = 0.0;
+    std::memcpy(&number, value.bytes.data(), sizeof(double));
+    return std::to_string(number);
+  }
+  if (is_signed_type(value.c_type)) {
+    long long signed_value = 0;
+    switch (width) {
+      case 1:
+        signed_value = static_cast<signed char>(raw & 0xff);
+        break;
+      case 2:
+        signed_value = static_cast<short>(raw & 0xffff);
+        break;
+      case 4:
+        signed_value = static_cast<int>(raw & 0xffffffffu);
+        break;
+      default:
+        signed_value = static_cast<long long>(raw);
+        break;
+    }
+    return std::to_string(signed_value);
+  }
+  return std::to_string(raw);
+}
+
+std::string serialize_captured_argument(const CapturedArgumentValue& value) {
+  if (value.is_pointer) {
+    if (value.data_status == 2 && !value.bytes.empty()) {
+      if (is_char_pointer_type(value.c_type)) {
+        std::string text;
+        for (unsigned char ch : value.bytes) {
+          if (ch == '\0') break;
+          text.push_back(static_cast<char>(ch));
+        }
+        return "\"" + json_escape(text) + "\"";
+      }
+      std::ostringstream oss;
+      oss << "{\"value\":" << decode_scalar_json(value)
+          << ",\"address\":" << pointer_json(value.raw_value) << "}";
+      return oss.str();
+    }
+    return pointer_json(value.raw_value);
+  }
+
+  if ((value.data_status == 1 || value.data_status == 2) && !value.bytes.empty()) {
+    return decode_scalar_json(value);
+  }
+
+  if (!value.bytes.empty()) {
+    return "\"0x" + bytes_to_hex(value.bytes) + "\"";
+  }
+
+  return std::to_string(value.raw_value);
+}
+
+std::string serialize_any_value(const std::any& value) {
+  if (value.type() == typeid(int)) {
+    return std::to_string(std::any_cast<int>(value));
+  } else if (value.type() == typeid(unsigned long long)) {
+    return std::to_string(std::any_cast<unsigned long long>(value));
+  } else if (value.type() == typeid(unsigned int)) {
+    return std::to_string(std::any_cast<unsigned int>(value));
+  } else if (value.type() == typeid(uint64_t)) {
+    return std::to_string(std::any_cast<uint64_t>(value));
+  } else if (value.type() == typeid(float)) {
+    return std::to_string(std::any_cast<float>(value));
+  } else if (value.type() == typeid(double)) {
+    return std::to_string(std::any_cast<double>(value));
+  } else if (value.type() == typeid(const char*)) {
+    return "\"" + json_escape(std::any_cast<const char*>(value)) + "\"";
+  } else if (value.type() == typeid(std::string)) {
+    return "\"" + json_escape(std::any_cast<std::string>(value)) + "\"";
+  } else if (value.type() == typeid(CapturedArgumentValue)) {
+    return serialize_captured_argument(std::any_cast<CapturedArgumentValue>(value));
+  }
+  return "\"<unsupported>\"";
+}
+
+}  // namespace
 
 namespace datacrumbs {
-ChromeWriter::ChromeWriter() : stop_flag_(false), chunk_size_(16 * 1024 * 1024) {
-  auto configManager_ = datacrumbs::Singleton<datacrumbs::ConfigurationManager>::get_instance();
-  compressor_ = new ZlibCompression(configManager_->trace_file_path, chunk_size_);
-  // file_ = std::fopen(configManager_->trace_file_path.c_str(), "a+");
+ChromeWriter::ChromeWriter() : flush_bytes_(1 << 20) {
+  auto configManager_ =
+      datacrumbs::Singleton<datacrumbs::RuntimeConfigurationManager>::get_instance();
+
+  // MAX_QUEUE_EVENTS bounds the backpressure queue (0 = unbounded). WRITER_THREADS defaults to 1
+  // to keep the server off the traced cores.
+  max_queue_events_ = static_cast<size_t>(configManager_->max_queue_events);
+  // Guards against an unbounded hang, not a sampling policy. push_event blocks up to this budget,
+  // then drops, so a wedged writer cannot stop collection for the rest of the run.
+  stall_budget_ = std::chrono::milliseconds(configManager_->stall_budget_ms);
+  zlib_level_ = configManager_->zlib_level;
+  long nthreads = configManager_->writer_threads;
+  if (nthreads < 1) nthreads = 1;
+
+  file_ = std::fopen(configManager_->trace_file_path.c_str(), "wb");
+  if (!file_) throw std::runtime_error("Failed to open trace file for writing");
   auto pwd = getpwnam(configManager_->user.c_str());
   uid_t uid = pwd ? pwd->pw_uid : static_cast<uid_t>(-1);
   gid_t gid = pwd ? pwd->pw_gid : static_cast<gid_t>(-1);
-  // Set file ownership to configManager_->user
-  chown(configManager_->trace_file_path.c_str(), uid, gid);
-  // Optionally set permissions (e.g., rw-r-----)
+  if (chown(configManager_->trace_file_path.c_str(), uid, gid) != 0) {
+    DC_LOG_WARN("[ChromeWriter] Failed to chown trace file %s to %s: %s",
+                configManager_->trace_file_path.c_str(), configManager_->user.c_str(),
+                strerror(errno));
+  }
   chmod(configManager_->trace_file_path.c_str(), 0660);
-  compressor_->compress("[\n");
-  first_event_ = true;
-  worker_ = std::thread([this]() { this->worker_loop(); });
+
+  char host[256] = {0};
+  gethostname(host, sizeof(host) - 1);
+  hostname_ = host;
+  hhash_ = datacrumbs::pfw::hhash(hostname_);
+  // dftracer "HH" record: lets the reader resolve this hhash back to the hostname.
+  write_member("{\"name\":\"HH\",\"cat\":\"dftracer\",\"type\":\"metadata\",\"ph\":" +
+               std::to_string(static_cast<unsigned>(TracePhase::METADATA)) +
+               ",\"args\":{\"hhash\":\"" + hhash_ + "\",\"name\":\"" + json_escape(hostname_) +
+               "\",\"value\":\"" + hhash_ + "\"}}\n");
+  // The unit of ts and dur, chosen at build time and declared so a reader never has to guess it.
+  write_member("{\"name\":\"time_metric\",\"cat\":\"dftracer\",\"type\":\"metadata\",\"ph\":" +
+               std::to_string(static_cast<unsigned>(TracePhase::METADATA)) +
+               ",\"args\":{\"hhash\":\"" + hhash_ +
+               "\",\"name\":\"time_metric\",\"value\":\"" DATACRUMBS_TIME_UNIT "\"}}\n");
+
+  for (long i = 0; i < nthreads; ++i) workers_.emplace_back([this]() { this->worker_loop(); });
 }
 
-// Destructor flushes and closes the file, and joins the worker thread.
-ChromeWriter::~ChromeWriter() {}
+ChromeWriter::~ChromeWriter() {
+  finalize();
+}
+
 void ChromeWriter::finalize() {
-  DC_LOG_DEBUG("ChromeWriter worker loop exiting");
   {
     std::lock_guard<std::mutex> lock(queue_mutex_);
+    if (finalized_) return;
     stop_flag_ = true;
+    finalized_ = true;
   }
-  queue_cv_.notify_one();
-  if (worker_.joinable()) worker_.join();
-  compressor_->compress("]");
-  compressor_->finalize();
+  queue_cv_.notify_all();
+  not_full_cv_.notify_all();  // release any producer blocked on backpressure
+  for (auto& w : workers_)
+    if (w.joinable()) w.join();
+  if (file_) {
+    std::fclose(file_);
+    file_ = nullptr;
+  }
   DC_LOG_DEBUG("ChromeWriter finalized");
 }
 
 void ChromeWriter::push_event(EventWithId* event) {
   {
-    std::lock_guard<std::mutex> lock(queue_mutex_);
+    std::unique_lock<std::mutex> lock(queue_mutex_);
+    if (max_queue_events_ > 0 && event_queue_.size() >= max_queue_events_ && !finalized_) {
+      // Wait, but not forever: absorb a burst without losing anything, but do not stall
+      // collection indefinitely if the writer is wedged.
+      const auto t0 = std::chrono::steady_clock::now();
+      const bool room = not_full_cv_.wait_for(lock, stall_budget_, [this] {
+        return event_queue_.size() < max_queue_events_ || finalized_;
+      });
+      stall_ns_.fetch_add(
+          static_cast<unsigned long long>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                              std::chrono::steady_clock::now() - t0)
+                                              .count()),
+          std::memory_order_relaxed);
+      stall_count_.fetch_add(1, std::memory_order_relaxed);
+      if (!room) {
+        dropped_.fetch_add(1, std::memory_order_relaxed);
+        delete event->args;
+        delete event;
+        return;
+      }
+    }
+    if (finalized_) {  // worker gone; free rather than enqueue into a dead queue
+      delete event->args;
+      delete event;
+      return;
+    }
     event_queue_.emplace_back(event);
   }
   queue_cv_.notify_one();
 }
 
-// Serialize and write a single event to the file, including event_id as "id".
-void ChromeWriter::write_event(EventWithId* event_with_id) {
-  index_++;
-  auto configManager_ = datacrumbs::Singleton<datacrumbs::ConfigurationManager>::get_instance();
-  uint64_t index = event_with_id->index;
-  auto args = event_with_id->args;
+void ChromeWriter::write_member(const std::string& data) {
+  if (data.empty()) return;
+  std::vector<uint8_t> member = datacrumbs::pfw::gzip_block(data, zlib_level_);
+  std::lock_guard<std::mutex> lock(file_mutex_);  // append is serial; members are self-contained
+  if (!file_) return;
+  if (std::fwrite(member.data(), 1, member.size(), file_) != member.size()) {
+    perror("Failed to write gzip member to trace file");
+  }
+}
 
-  unsigned int pid = event_with_id->tgid_pid;
-  unsigned int tid = event_with_id->tgid_pid >> 32;
+// /proc/<pid>/comm, or "" when the process is already gone.
+static std::string read_comm(unsigned int pid) {
+  char path[64];
+  std::snprintf(path, sizeof(path), "/proc/%u/comm", pid);
+  FILE* f = std::fopen(path, "r");
+  if (f == nullptr) return {};
+  char buf[64] = {0};
+  const char* got = std::fgets(buf, sizeof(buf), f);
+  std::fclose(f);
+  if (got == nullptr) return {};
+  buf[strcspn(buf, "\n")] = '\0';
+  return buf;
+}
+
+std::string ChromeWriter::name_process(unsigned int pid, unsigned int tid) {
+  const unsigned long long key = (static_cast<unsigned long long>(pid) << 32) | tid;
+  bool new_proc = false;
+  {
+    std::lock_guard<std::mutex> lock(named_mutex_);
+    if (!named_.insert(key).second) return {};
+    // 0xffffffff is not a valid tid (pid_max is at most 2^22), so it keys the process itself.
+    new_proc = named_.insert(static_cast<unsigned long long>(pid) << 32 | 0xffffffffULL).second;
+  }
+  const unsigned meta = static_cast<unsigned>(TracePhase::METADATA);
+  std::string out;
+  if (new_proc) {
+    // pid 0 is not a process: it is the lane the samplers use for node-level telemetry.
+    std::string comm = pid == 0 ? "node" : read_comm(pid);
+    if (comm.empty()) comm = "exited";
+    out += "{\"name\":\"process_name\",\"cat\":\"dftracer\",\"type\":\"metadata\",\"pid\":" +
+           std::to_string(pid) + ",\"tid\":" + std::to_string(tid) +
+           ",\"ph\":" + std::to_string(meta) + ",\"args\":{\"hhash\":\"" + hhash_ +
+           "\",\"name\":\"process_name\",\"value\":\"" + json_escape(hostname_) + ":" +
+           json_escape(comm) + " (" + std::to_string(pid) + ")\"}}\n";
+  }
+  {
+    std::string comm = tid == 0 ? "node" : read_comm(tid);
+    if (comm.empty()) comm = "exited";
+    out += "{\"name\":\"thread_name\",\"cat\":\"dftracer\",\"type\":\"metadata\",\"pid\":" +
+           std::to_string(pid) + ",\"tid\":" + std::to_string(tid) +
+           ",\"ph\":" + std::to_string(meta) + ",\"args\":{\"hhash\":\"" + hhash_ +
+           "\",\"name\":\"thread_name\",\"value\":\"" + json_escape(comm) + " (" +
+           std::to_string(tid) + ")\"}}\n";
+  }
+  return out;
+}
+
+// Serializes one event to a JSON line and frees it (and its args). Returns "" if the event's id
+// has no category mapping.
+std::string ChromeWriter::serialize_event(EventWithId* event_with_id) {
+  std::string line;
+  auto configManager_ =
+      datacrumbs::Singleton<datacrumbs::RuntimeConfigurationManager>::get_instance();
+  auto args = event_with_id->args;
+  // bpf_get_current_pid_tgid packs (tgid << 32) | pid. The kernel's pid is the thread; the tgid
+  // is the process.
+  unsigned int pid = event_with_id->tgid_pid >> 32;
+  unsigned int tid = static_cast<unsigned int>(event_with_id->tgid_pid);
   auto it = configManager_->category_map.find(event_with_id->event_id);
   if (it != configManager_->category_map.end()) {
-    std::string probe_name;
-    std::string function_name;
-    if (event_with_id->type == 3) {
-      probe_name = "usdt";
-      unsigned int method = 0, clazz = 0;
-
-      if (args != nullptr) {
-        if (event_with_id->event_type == COUNTER_EVENT) {
-          // Handle COUNTER_EVENT specific logic
-          unsigned long long duration = std::any_cast<unsigned int>((*args)["duration"]);
-          if (duration > std::numeric_limits<unsigned long long>::max() / 1000) {
-            duration = std::numeric_limits<unsigned long long>::max();
-          } else {
-            duration = static_cast<unsigned long long>(std::floor(duration / 1000.0));
-          }
-          (*args)["duration"] = duration;
-        }
-        method = std::any_cast<unsigned int>((*args)["method"]);
-        clazz = std::any_cast<unsigned int>((*args)["clazz"]);
-        function_name = std::to_string(clazz) + "." + std::to_string(method);
-        args->erase("clazz");
-        args->erase("method");
+    const unsigned long event_index = ++index_;
+    std::string probe_name = it->second.first;
+    std::string function_name = it->second.second;
+    if (args != nullptr && event_with_id->event_type == TracePhase::COUNTER &&
+        args->find("duration") != args->end()) {
+      unsigned long long duration = std::any_cast<unsigned int>((*args)["duration"]);
+      if (duration > std::numeric_limits<unsigned long long>::max() / 1000) {
+        duration = std::numeric_limits<unsigned long long>::max();
       } else {
-        function_name = "unknown";
+        duration = static_cast<unsigned long long>(std::floor(duration / 1000.0));
       }
-    } else {
-      probe_name = it->second.first;
-      function_name = it->second.second;
+      (*args)["duration"] = duration;
     }
     char buffer[1024];
-    unsigned long long ts_us = 0;
-    if (event_with_id->ts > std::numeric_limits<unsigned long long>::max() / 1000) {
-      ts_us = std::numeric_limits<unsigned long long>::max();
-    } else {
-      ts_us = static_cast<unsigned long long>(std::floor(event_with_id->ts / 1000.0));
-    }
-    unsigned long long dur_us = 0;
-    if (event_with_id->dur > std::numeric_limits<unsigned long long>::max() / 1000) {
-      dur_us = std::numeric_limits<unsigned long long>::max();
-    } else {
-      dur_us = static_cast<unsigned long long>(std::ceil(event_with_id->dur / 1000.0));
-    }
+    // Captured in nanoseconds and divided by the build's time unit using integer math, since a
+    // global-epoch ts exceeds double's exact 2^53 range. dur rounds up so a sub-unit event stays
+    // nonzero.
+    const unsigned long long ts_us = event_with_id->ts / DATACRUMBS_TIME_DIVISOR_NS;
+    const unsigned long long dur_us =
+        event_with_id->dur / DATACRUMBS_TIME_DIVISOR_NS +
+        (event_with_id->dur % DATACRUMBS_TIME_DIVISOR_NS != 0 ? 1 : 0);
+    // "id" and "dur" are complete-event only. "type" is the probe's config domain string, free-form
+    // so a plugin can add its own domain, or "unknown" if unset.
+    const auto* rmeta = configManager_->get_runtime_event_metadata(event_with_id->event_id);
+    const char* type =
+        (rmeta && !rmeta->trace_event_type.empty()) ? rmeta->trace_event_type.c_str() : "unknown";
+    const unsigned ph = static_cast<unsigned>(event_with_id->event_type);
     int len = 0;
-    if (event_with_id->event_type == COUNTER_EVENT) {
-      len = std::snprintf(
-          buffer, sizeof(buffer), R"({"id":%lu,"name":"%s","cat":"%s","ph":"%c","ts":%llu)", index_,
-          function_name.c_str(), probe_name.c_str(), event_with_id->event_type, ts_us);
-    } else if (event_with_id->event_type == METADATA_EVENT) {
-      len = std::snprintf(buffer, sizeof(buffer), R"({"id":%lu,"name":"%s","cat":"%s","ph":"%c")",
-                          index_, function_name.c_str(), probe_name.c_str(),
-                          event_with_id->event_type);
-    } else if (event_with_id->event_type == NORMAL_EVENT) {
-      // Normal even
+    if (event_with_id->event_type == TracePhase::COUNTER ||
+        event_with_id->event_type == TracePhase::AGGREGATED) {
+      // COUNTER and AGGREGATED share dftracer's series schema; only the phase differs.
       len = std::snprintf(
           buffer, sizeof(buffer),
-          R"({"id":%lu,"name":"%s","cat":"%s","ph":"%c","ts":%llu,"dur":%llu,"pid":%d,"tid":%d)",
-          index_, function_name.c_str(), probe_name.c_str(), event_with_id->event_type, ts_us,
-          dur_us, pid, tid);
-    } else {
-      return;
+          R"({"name":"%s","cat":"%s","type":"%s","pid":%d,"tid":%d,"ts":%llu,"ph":%u)",
+          function_name.c_str(), probe_name.c_str(), type, pid, tid, ts_us, ph);
+    } else if (event_with_id->event_type == TracePhase::METADATA) {
+      // Metadata records are self-typed; the probe-domain lookup does not apply to them.
+      len = std::snprintf(buffer, sizeof(buffer),
+                          R"({"name":"%s","cat":"%s","type":"metadata","ph":%u)",
+                          function_name.c_str(), probe_name.c_str(), ph);
+    } else if (event_with_id->event_type == TracePhase::COMPLETE) {
+      len = std::snprintf(
+          buffer, sizeof(buffer),
+          R"({"id":%lu,"name":"%s","cat":"%s","type":"%s","pid":%d,"tid":%d,"ts":%llu,"dur":%llu,"ph":%u)",
+          event_index, function_name.c_str(), probe_name.c_str(), type, pid, tid, ts_us, dur_us,
+          ph);
     }
 
-    std::string args_json = "{";
-
-    bool first = true;
-    if (args != nullptr && !args->empty()) {
-      for (auto pair : *args) {
-        const std::string& key = pair.first;
-        const std::any& value = pair.second;
-        if (!first) args_json += ",";
-        args_json += "\"";
-        args_json += key;
-        args_json += "\":";
-        if (value.type() == typeid(int)) {
-          args_json += std::to_string(std::any_cast<int>(value));
-        } else if (value.type() == typeid(unsigned long long)) {
-          args_json += std::to_string(std::any_cast<unsigned long long>(value));
-        } else if (value.type() == typeid(unsigned int)) {
-          args_json += std::to_string(std::any_cast<unsigned int>(value));
-        } else if (value.type() == typeid(uint64_t)) {
-          args_json += std::to_string(std::any_cast<uint64_t>(value));
-        } else if (value.type() == typeid(float)) {
-          args_json += std::to_string(std::any_cast<float>(value));
-        } else if (value.type() == typeid(double)) {
-          args_json += std::to_string(std::any_cast<double>(value));
-        } else if (value.type() == typeid(const char*)) {
-          args_json += "\"";
-          args_json += std::any_cast<const char*>(value);
-          args_json += "\"";
-        } else if (value.type() == typeid(std::string)) {
-          args_json += "\"";
-          args_json += std::any_cast<std::string>(value);
-          args_json += "\"";
-        } else {
-          args_json += "\"<unsupported>\"";
+    if (len > 0) {
+      // hhash first: every event carries its node's host key, so it stays attributable after a
+      // split or merge separates it from the HH record at the head of its file.
+      std::string args_json = "{\"hhash\":\"" + hhash_ + "\"";
+      if (args != nullptr && !args->empty()) {
+        for (auto pair : *args) {
+          args_json += ",\"";
+          args_json += pair.first;
+          args_json += "\":";
+          args_json += serialize_any_value(pair.second);
         }
-        first = false;
       }
-    }
-    args_json += "}";
-
-    {
-      std::lock_guard<std::mutex> lock(file_mutex_);
-      std::string event_json;
-      if (first) {
-        event_json = std::string(buffer, len) + "}\n";
-      } else {
-        event_json = std::string(buffer, len) + ",\"args\":" + args_json + "}\n";
-      }
-      DC_LOG_DEBUG("Writing event: %s", event_json.c_str());
-      compressor_->compress(event_json);
+      args_json += "}";
+      line = std::string(buffer, len) + ",\"args\":" + args_json + "}\n";
+      if (event_with_id->event_type != TracePhase::METADATA) line = name_process(pid, tid) + line;
     }
   }
-  if (args != nullptr) {
-    delete args;  // Clean up args after use
-  }
-  if (event_with_id != nullptr) {
-    delete event_with_id;  // Clean up event after writing
-  }
+  delete args;
+  delete event_with_id;
+  return line;
 }
 
 void ChromeWriter::worker_loop() {
   DC_LOG_DEBUG("ChromeWriter worker loop started");
-  int count = 0;
+  static constexpr size_t kDrainSlice = 8192;  // bounded grab so a pool shares the queue fairly
+  std::string member;
+  member.reserve(flush_bytes_ + 4096);
+  std::vector<EventWithId*> batch;
+  batch.reserve(kDrainSlice);
   while (true) {
-    EventWithId* event_with_id = nullptr;
     {
       std::unique_lock<std::mutex> lock(queue_mutex_);
       queue_cv_.wait(lock, [this] { return !event_queue_.empty() || stop_flag_; });
-      if (event_queue_.empty() && stop_flag_) {
-        break;
-      }
-      if (!event_queue_.empty()) {
-        event_with_id = event_queue_.front();
+      if (event_queue_.empty() && stop_flag_) break;
+      const size_t n = std::min(event_queue_.size(), kDrainSlice);
+      for (size_t i = 0; i < n; ++i) {
+        batch.push_back(event_queue_.front());
         event_queue_.pop_front();
-        DC_LOG_DEBUG("Processing event with ID: %d and %d left", event_with_id->event_id,
-                     event_queue_.size());
-      } else {
-        continue;
+      }
+      if (!event_queue_.empty()) queue_cv_.notify_one();  // more left -> wake a peer worker
+    }
+    not_full_cv_.notify_all();  // queue drained below bound -> release backpressured producers
+    for (EventWithId* event : batch) {
+      run_event_enrichers(event);
+      member += serialize_event(event);
+      if (member.size() >= flush_bytes_) {
+        write_member(member);
+        member.clear();
       }
     }
-    if (event_with_id != nullptr) {
-      write_event(event_with_id);
-    }
-    count++;
+    batch.clear();
   }
+  if (!member.empty()) write_member(member);  // trailing partial member
   DC_LOG_DEBUG("ChromeWriter worker loop exiting");
 }
 }  // namespace datacrumbs

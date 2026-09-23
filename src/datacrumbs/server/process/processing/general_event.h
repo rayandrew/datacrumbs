@@ -1,21 +1,16 @@
 #pragma once
 
-// BPF Headers
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
-// Generated Headers
-#include <datacrumbs/datacrumbs_config.h>
-// other headers
-#include <datacrumbs/common/configuration_manager.h>
 #include <datacrumbs/common/constants.h>
 #include <datacrumbs/common/data_structures.h>
-#include <datacrumbs/common/logging.h>  // Logging header
+#include <datacrumbs/common/logging.h>
 #include <datacrumbs/common/singleton.h>
 #include <datacrumbs/common/typedefs.h>
 #include <datacrumbs/common/utils.h>
+#include <datacrumbs/datacrumbs_config.h>
 #include <datacrumbs/server/bpf/shared.h>
 #include <datacrumbs/server/process/writer/chrome_writer.h>
-// std headers
 #include <errno.h>
 #include <grp.h>
 #include <json-c/json.h>
@@ -60,7 +55,6 @@ inline static int lookup_1(int map_fd, unsigned long long latest_timestamp,
   }
   struct profile_key_t delete_keys[batch_size];
   unsigned int j = 0;
-  // Process the retrieved keys and values
   for (int i = 0; i < batch_size; ++i) {
     if (latest_timestamp == 0 || keys[i].time_interval <= latest_timestamp) {
       struct counter_event_t event;
@@ -74,7 +68,7 @@ inline static int lookup_1(int map_fd, unsigned long long latest_timestamp,
   if (ret < 0) {
     perror("bpf_map_delete_batch general");
   }
-  // Check if the end of the map has been reached
+  // ENOENT means the map has no more entries; not an error.
   if (ret < 0 && errno == ENOENT) {
     return -1;
   }
@@ -82,19 +76,15 @@ inline static int lookup_1(int map_fd, unsigned long long latest_timestamp,
 }
 
 #endif
+#if !defined(DATACRUMBS_MODE) || (DATACRUMBS_MODE != 1)
 static datacrumbs::EventWithId* get_data_1(void* data, uint64_t index) {
-#if defined(DATACRUMBS_MODE) && (DATACRUMBS_MODE == 1)
-  struct general_event_t* base = (general_event_t*)data;
-
-  auto event = new datacrumbs::EventWithId(NORMAL_EVENT, index, base->type, base->id,
-                                           base->event_id, base->ts, base->dur, nullptr);
-#else
   struct counter_event_t* base = (counter_event_t*)data;
   auto args = new DataCrumbsArgs();
   args->emplace("duration", base->value->duration);
   args->emplace("frequency", base->value->frequency);
-  auto event = new datacrumbs::EventWithId(COUNTER_EVENT, index, base->key->type, base->key->id,
-                                           base->key->event_id, base->key->time_interval, 0, args);
-#endif
+  auto event = new datacrumbs::EventWithId(datacrumbs::TracePhase::COUNTER, index, base->key->type,
+                                           base->key->id, base->key->event_id,
+                                           base->key->time_interval, 0, args);
   return event;
 }
+#endif
