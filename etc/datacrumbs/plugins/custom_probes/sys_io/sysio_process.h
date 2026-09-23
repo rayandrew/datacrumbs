@@ -78,7 +78,6 @@ inline static int lookup_2(int map_fd, unsigned long long latest_timestamp,
   }
   struct sysio_counter_key_t delete_keys[batch_size];
   unsigned int j = 0;
-  // Process the retrieved keys and values
   for (int i = 0; i < batch_size; ++i) {
     if (latest_timestamp == 0 || keys[i].time_interval <= latest_timestamp) {
       struct sysio_counter_event_t event;
@@ -92,7 +91,6 @@ inline static int lookup_2(int map_fd, unsigned long long latest_timestamp,
   if (ret < 0) {
     perror("bpf_map_delete_batch sysio");
   }
-  // Check if the end of the map has been reached
   if (ret < 0 && errno == ENOENT) {
     return -1;
   }
