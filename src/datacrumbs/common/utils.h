@@ -1,22 +1,19 @@
 #pragma once
-// include first
+#include <datacrumbs/common/logging.h>
 #include <datacrumbs/datacrumbs_config.h>
-// other headers
-#include <datacrumbs/common/logging.h>  // Include logging header
-// std headers
+
 #include <string>
 #include <vector>
 
 namespace datacrumbs {
 namespace utils {
 
-// Base64 encoding table (URL-safe, no special characters)
+// URL-safe base64 alphabet
 static const std::string base64_chars =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
     "abcdefghijklmnopqrstuvwxyz"
     "0123456789-_";
 
-// Check if a character is base64 (URL-safe)
 inline bool is_base64(unsigned char c) {
   DC_LOG_TRACE("Entering is_base64 with char: %c", c);
   bool result = (isalnum(c) || (c == '-') || (c == '_'));
@@ -25,7 +22,7 @@ inline bool is_base64(unsigned char c) {
   return result;
 }
 
-// Encode a byte vector to base64 string (URL-safe, no special chars)
+// URL-safe base64, no padding
 inline std::string base64_encode(const std::vector<unsigned char>& bytes_to_encode) {
   DC_LOG_TRACE("Start base64_encode, input size: %zu", bytes_to_encode.size());
   std::string ret;
@@ -57,9 +54,6 @@ inline std::string base64_encode(const std::vector<unsigned char>& bytes_to_enco
     char_array_4[3] = char_array_3[2] & 0x3f;
 
     for (int j = 0; j < i + 1; j++) ret += base64_chars[char_array_4[j]];
-
-    // No padding for URL-safe base64
-    // while ((i++ < 3)) ret += '=';
   }
 
   DC_LOG_DEBUG("base64_encode completed, output size: %zu", ret.size());
@@ -67,7 +61,7 @@ inline std::string base64_encode(const std::vector<unsigned char>& bytes_to_enco
   return ret;
 }
 
-// Decode a base64 string to byte vector (URL-safe, no special chars)
+// URL-safe base64 decode
 inline std::vector<unsigned char> base64_decode(const std::string& encoded_string) {
   DC_LOG_TRACE("Start base64_decode, input size: %zu", encoded_string.size());
   int in_len = encoded_string.size();
@@ -112,22 +106,16 @@ inline std::vector<unsigned char> base64_decode(const std::string& encoded_strin
   return ret;
 }
 
-// Timer class for measuring elapsed time between code segments
 class Timer {
  public:
-  Timer() : elapsed_time(0) {
-    // Trace constructor entry
-    DC_LOG_TRACE("Timer constructed, elapsed_time initialized to 0");
-  }
+  Timer() : elapsed_time(0) { DC_LOG_TRACE("Timer constructed, elapsed_time initialized to 0"); }
 
-  // Resume or start the timer
   void resumeTime() {
     DC_LOG_TRACE("Timer::resumeTime called");
     t1 = std::chrono::high_resolution_clock::now();
     DC_LOG_DEBUG("Timer resumed at current time point");
   }
 
-  // Pause the timer and accumulate elapsed time
   double pauseTime() {
     DC_LOG_TRACE("Timer::pauseTime called");
     auto t2 = std::chrono::high_resolution_clock::now();
@@ -138,7 +126,6 @@ class Timer {
     return elapsed_time;
   }
 
-  // Get the total elapsed time
   double getElapsedTime() {
     DC_LOG_TRACE("Timer::getElapsedTime called");
     DC_LOG_DEBUG("Returning elapsed_time: %f seconds", elapsed_time);
@@ -146,11 +133,10 @@ class Timer {
   }
 
  private:
-  std::chrono::high_resolution_clock::time_point t1;  // Last start/resume time
-  double elapsed_time;                                // Accumulated elapsed time in seconds
+  std::chrono::high_resolution_clock::time_point t1;
+  double elapsed_time;  // accumulated elapsed time, in seconds
 };
 
-// Function to remove non-UTF8 characters from a string
 inline std::string remove_non_utf8(const std::string& input) {
   DC_LOG_TRACE("Start remove_non_utf8, input size: %zu", input.size());
   std::string result;
@@ -159,9 +145,9 @@ inline std::string remove_non_utf8(const std::string& input) {
   for (size_t i = 0; i < input.size();) {
     unsigned char byte = static_cast<unsigned char>(input[i]);
 
-    // Single-byte UTF-8 character (0xxxxxxx)
+    // single-byte UTF-8 (0xxxxxxx)
     if (byte <= 0x7F) {
-      // Only keep characters valid for filenames/paths
+      // keep only characters valid for filenames/paths
       if ((byte >= 'A' && byte <= 'Z') || (byte >= 'a' && byte <= 'z') ||
           (byte >= '0' && byte <= '9') || byte == '_' || byte == '-' || byte == '.' ||
           byte == '/') {
@@ -170,9 +156,7 @@ inline std::string remove_non_utf8(const std::string& input) {
         DC_LOG_DEBUG("Skipping invalid filename character 0x%02X at position %zu", byte, i);
       }
       i++;
-    }
-    // Multi-byte UTF-8 character
-    else if ((byte & 0xE0) == 0xC0) {  // 2-byte (110xxxxx)
+    } else if ((byte & 0xE0) == 0xC0) {  // 2-byte (110xxxxx)
       if (i + 1 < input.size() && (static_cast<unsigned char>(input[i + 1]) & 0xC0) == 0x80) {
         result += input.substr(i, 2);
         i += 2;
@@ -200,7 +184,6 @@ inline std::string remove_non_utf8(const std::string& input) {
         i++;
       }
     } else {
-      // Invalid UTF-8 start byte
       DC_LOG_DEBUG("Invalid UTF-8 start byte 0x%02X at position %zu", byte, i);
       i++;
     }
@@ -209,6 +192,78 @@ inline std::string remove_non_utf8(const std::string& input) {
   DC_LOG_DEBUG("remove_non_utf8 completed, output size: %zu", result.size());
   DC_LOG_TRACE("End remove_non_utf8");
   return result;
+}
+
+/**
+ * Translates a shell-style glob into an anchored regex. Supports `*`, `?`, `[...]` (with `!`
+ * or `^` negation) and `{a,b}` alternation. It escapes every other character, so a symbol like
+ * `std::vector<int>::push_back` matches literally. The regex is anchored, for use with both
+ * std::regex_match and std::regex_search.
+ */
+inline std::string glob_to_regex(const std::string& glob) {
+  std::string re = "^";
+  int brace_depth = 0;
+  for (size_t i = 0; i < glob.size(); ++i) {
+    const char c = glob[i];
+    switch (c) {
+      case '*':
+        re += ".*";
+        break;
+      case '?':
+        re += '.';
+        break;
+      case '[': {
+        const size_t close = glob.find(']', i + 1);
+        if (close == std::string::npos) {
+          re += "\\[";  // unterminated class: literal, as the shell treats it
+          break;
+        }
+        re += '[';
+        size_t j = i + 1;
+        if (glob[j] == '!' || glob[j] == '^') {
+          re += '^';
+          ++j;
+        }
+        for (; j < close; ++j) {
+          if (glob[j] == '\\' || glob[j] == '[') re += '\\';
+          re += glob[j];
+        }
+        re += ']';
+        i = close;
+        break;
+      }
+      case '{':
+        re += '(';
+        ++brace_depth;
+        break;
+      case '}':
+        if (brace_depth > 0) {
+          re += ')';
+          --brace_depth;
+        } else {
+          re += "\\}";
+        }
+        break;
+      case ',':
+        re += brace_depth > 0 ? "|" : "\\,";
+        break;
+      case '\\':
+        if (i + 1 < glob.size()) {
+          re += '\\';
+          re += glob[++i];
+        } else {
+          re += "\\\\";
+        }
+        break;
+      default:
+        if (std::string("^$.|+()").find(c) != std::string::npos) re += '\\';
+        re += c;
+        break;
+    }
+  }
+  while (brace_depth-- > 0) re += ')';  // unterminated brace: close it rather than fail to compile
+  re += '$';
+  return re;
 }
 
 }  // namespace utils

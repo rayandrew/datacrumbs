@@ -1,22 +1,63 @@
 #ifndef DATACRUMBS_COMMON_DATA_STRUCTURES_H__
 #define DATACRUMBS_COMMON_DATA_STRUCTURES_H__
-// include first
-#include <datacrumbs/datacrumbs_config.h>
-// other headers
 #include <datacrumbs/common/constants.h>
 #include <datacrumbs/common/enumerations.h>
 #include <datacrumbs/common/logging.h>
 #include <datacrumbs/common/typedefs.h>
-#include <datacrumbs/server/bpf/shared.h>
-// dependency headers
+#include <datacrumbs/datacrumbs_config.h>
 #include <json-c/json.h>
-// std headers
+
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace datacrumbs {
+struct ProbeArgCaptureSpec {
+  unsigned int index = 0;
+  unsigned int num_bytes = 0;
+  unsigned int offset = 0;  // byte offset of a struct field / tracepoint record field
+  bool is_pointer = false;
+  std::string label;
+  std::string c_type;
+
+  json_object* toJson() const {
+    json_object* j = json_object_new_object();
+    json_object_object_add(j, "index", json_object_new_int(index));
+    json_object_object_add(j, "num_bytes", json_object_new_int(num_bytes));
+    json_object_object_add(j, "offset", json_object_new_int(offset));
+    json_object_object_add(j, "is_pointer", json_object_new_boolean(is_pointer));
+    json_object_object_add(j, "label", json_object_new_string(label.c_str()));
+    json_object_object_add(j, "c_type", json_object_new_string(c_type.c_str()));
+    return j;
+  }
+
+  static ProbeArgCaptureSpec fromJson(const json_object* j) {
+    ProbeArgCaptureSpec spec;
+    json_object* obj = nullptr;
+    if (json_object_object_get_ex(j, "index", &obj)) spec.index = json_object_get_int(obj);
+    if (json_object_object_get_ex(j, "num_bytes", &obj)) spec.num_bytes = json_object_get_int(obj);
+    if (json_object_object_get_ex(j, "offset", &obj)) spec.offset = json_object_get_int(obj);
+    if (json_object_object_get_ex(j, "is_pointer", &obj)) {
+      spec.is_pointer = json_object_get_boolean(obj);
+    }
+    if (json_object_object_get_ex(j, "label", &obj) && obj)
+      spec.label = json_object_get_string(obj);
+    if (json_object_object_get_ex(j, "c_type", &obj) && obj)
+      spec.c_type = json_object_get_string(obj);
+    return spec;
+  }
+};
+
+struct RuntimeEventMetadata {
+  ProbeType probe_type = ProbeType::KPROBE;
+  std::string trace_event_type;  // .pfw "type" domain string (empty = unset)
+  std::string probe_name;
+  std::string function_name;
+  std::vector<ProbeArgCaptureSpec> arg_specs;
+};
+
 struct EventWithId {
-  char event_type;
+  TracePhase event_type;  // the trace phase (COMPLETE/COUNTER/AGGREGATED/METADATA). ph in the .pfw
   unsigned long long index;
   unsigned int type;
   unsigned long long tgid_pid;
@@ -24,7 +65,10 @@ struct EventWithId {
   unsigned long long ts;
   unsigned long long dur;
   DataCrumbsArgs* args;
-  EventWithId(char _event_type, unsigned long long _index, unsigned int _type,
+  unsigned int pmu_count = 0;  // hardware counters captured (0 = none)
+  unsigned long long pmu[DATACRUMBS_MAX_PMU] =
+      {};  // per-counter entry->exit delta. Named by a plugin
+  EventWithId(TracePhase _event_type, unsigned long long _index, unsigned int _type,
               unsigned long long _tgid_pid, unsigned long long _event_id, unsigned long long _ts,
               unsigned long long _dur, DataCrumbsArgs* _args)
       : event_type(_event_type),
@@ -35,7 +79,6 @@ struct EventWithId {
         ts(_ts),
         dur(_dur),
         args(_args) {}
-  // Copy constructor
   EventWithId(const EventWithId& other)
       : event_type(other.event_type),
         index(other.index),
@@ -44,9 +87,11 @@ struct EventWithId {
         event_id(other.event_id),
         ts(other.ts),
         dur(other.dur),
-        args(other.args) {}
+        args(other.args),
+        pmu_count(other.pmu_count) {
+    for (unsigned int i = 0; i < DATACRUMBS_MAX_PMU; ++i) pmu[i] = other.pmu[i];
+  }
 
-  // Move constructor
   EventWithId(EventWithId&& other) noexcept
       : event_type(other.event_type),
         index(other.index),
@@ -55,32 +100,81 @@ struct EventWithId {
         event_id(other.event_id),
         ts(other.ts),
         dur(other.dur),
-        args(other.args) {}
+        args(other.args),
+        pmu_count(other.pmu_count) {
+    for (unsigned int i = 0; i < DATACRUMBS_MAX_PMU; ++i) pmu[i] = other.pmu[i];
+  }
 };
 
-// Base class representing a generic probe
 class Probe {
  public:
-  // Default constructor
   Probe() {}
-  // Copy constructor
-  Probe(const Probe& other) : type(other.type), name(other.name), functions(other.functions) {
+  Probe(const Probe& other)
+      : type(other.type),
+        trace_event_type(other.trace_event_type),
+        system_wide(other.system_wide),
+        aggregate(other.aggregate),
+        hot(other.hot),
+        capture_stack(other.capture_stack),
+        sample_freq(other.sample_freq),
+        stack_dump_ratio(other.stack_dump_ratio),
+        gate_tid_arg(other.gate_tid_arg),
+        name(other.name),
+        functions(other.functions),
+        function_arguments(other.function_arguments) {
     DC_LOG_TRACE("Probe copy constructor called");
   }
 
-  // Move constructor
   Probe(Probe&& other) noexcept
-      : type(other.type), name(std::move(other.name)), functions(std::move(other.functions)) {
+      : type(other.type),
+        trace_event_type(std::move(other.trace_event_type)),
+        system_wide(other.system_wide),
+        aggregate(other.aggregate),
+        hot(other.hot),
+        capture_stack(other.capture_stack),
+        sample_freq(other.sample_freq),
+        stack_dump_ratio(other.stack_dump_ratio),
+        gate_tid_arg(other.gate_tid_arg),
+        name(std::move(other.name)),
+        functions(std::move(other.functions)),
+        function_arguments(std::move(other.function_arguments)) {
     DC_LOG_TRACE("Probe move constructor called");
   }
-  // Constructor initializing the probe type
   Probe(ProbeType _type) : type(_type) { DC_LOG_TRACE("Probe constructor called"); }
 
-  ProbeType type;                      // The type of probe (e.g., SYSCALLS, KPROBE, etc.)
-  std::string name;                    // Name of the probe
-  std::vector<std::string> functions;  // List of functions or arguments for the probe
+  ProbeType type;
+  std::string trace_event_type;  // .pfw "type" domain string, from config (empty = unset)
+  bool system_wide = false;      // tracepoints: capture on all pids (skip the pid gate)
+  bool aggregate = false;        // accumulate count/duration instead of emitting per-event records
+  bool hot = false;              // uprobes: route to bpftime userspace, no kernel trap
+  bool capture_stack = false;    // tracepoints: grab the user call stack at the event
+  unsigned int sample_freq = 0;  // perf_event: samples/sec (0 = the attach-side default)
+  unsigned int stack_dump_ratio = 0;  // 1-in-N raw regs+stack dumps (0 = the per-type default).
+                                      // Must be a power of two. It becomes a prandom mask
+  std::string gate_tid_arg;  // system_wide tracepoints: captured arg naming a tid. Drop the event
+                             // unless that tid belongs to a traced process
+  std::string name;
+  std::vector<std::string> functions;
+  std::unordered_map<std::string, std::vector<ProbeArgCaptureSpec>>
+      function_arguments;  // optional per-function runtime arg capture spec
 
-  // Validates the probe's configuration
+  // Copies every base field onto a subclass instance. Add any new base field here too, or a
+  // subclass fromJson silently drops it.
+  static void copy_base(Probe& p, const Probe& base) {
+    p.type = base.type;
+    p.trace_event_type = base.trace_event_type;
+    p.system_wide = base.system_wide;
+    p.aggregate = base.aggregate;
+    p.hot = base.hot;
+    p.capture_stack = base.capture_stack;
+    p.sample_freq = base.sample_freq;
+    p.stack_dump_ratio = base.stack_dump_ratio;
+    p.gate_tid_arg = base.gate_tid_arg;
+    p.name = base.name;
+    p.functions = base.functions;
+    p.function_arguments = base.function_arguments;
+  }
+
   virtual bool validate() const {
     DC_LOG_TRACE("Probe::validate called");
     if (name.empty()) {
@@ -94,11 +188,20 @@ class Probe {
     return true;
   }
 
-  // Serializes the probe to a JSON object
   virtual json_object* toJson(bool include_functions = true) const {
     DC_LOG_TRACE("Probe::toJson called");
     json_object* j = json_object_new_object();
     json_object_object_add(j, "type", json_object_new_int(static_cast<int>(type)));
+    json_object_object_add(j, "trace_event_type", json_object_new_string(trace_event_type.c_str()));
+    if (system_wide) json_object_object_add(j, "system_wide", json_object_new_boolean(true));
+    if (aggregate) json_object_object_add(j, "aggregate", json_object_new_boolean(true));
+    if (hot) json_object_object_add(j, "hot", json_object_new_boolean(true));
+    if (capture_stack) json_object_object_add(j, "capture_stack", json_object_new_boolean(true));
+    if (sample_freq) json_object_object_add(j, "sample_freq", json_object_new_int(sample_freq));
+    if (stack_dump_ratio)
+      json_object_object_add(j, "stack_dump_ratio", json_object_new_int(stack_dump_ratio));
+    if (!gate_tid_arg.empty())
+      json_object_object_add(j, "gate_tid_arg", json_object_new_string(gate_tid_arg.c_str()));
     json_object_object_add(j, "name", json_object_new_string(name.c_str()));
 
     json_object* funcs = json_object_new_array();
@@ -112,13 +215,48 @@ class Probe {
 
     json_object_object_add(j, "functions", funcs);
 
+    if (!function_arguments.empty()) {
+      json_object* jfunction_arguments = json_object_new_object();
+      for (const auto& [function_name, arg_specs] : function_arguments) {
+        json_object* jarg_specs = json_object_new_array();
+        for (const auto& arg_spec : arg_specs) {
+          json_object_array_add(jarg_specs, arg_spec.toJson());
+        }
+        json_object_object_add(jfunction_arguments, function_name.c_str(), jarg_specs);
+      }
+      json_object_object_add(j, "function_arguments", jfunction_arguments);
+    }
+
     return j;
   }
 
-  // Deserializes a probe from a JSON object
   static Probe fromJson(const json_object* j) {
     DC_LOG_TRACE("Probe::fromJson called");
     Probe p(static_cast<ProbeType>(json_object_get_int(json_object_object_get(j, "type"))));
+    if (json_object* et = json_object_object_get(j, "trace_event_type")) {
+      p.trace_event_type = json_object_get_string(et);
+    }
+    if (json_object* sw = json_object_object_get(j, "system_wide")) {
+      p.system_wide = json_object_get_boolean(sw);
+    }
+    if (json_object* ag = json_object_object_get(j, "aggregate")) {
+      p.aggregate = json_object_get_boolean(ag);
+    }
+    if (json_object* cs = json_object_object_get(j, "capture_stack")) {
+      p.capture_stack = json_object_get_boolean(cs);
+    }
+    if (json_object* h = json_object_object_get(j, "hot")) {
+      p.hot = json_object_get_boolean(h);
+    }
+    if (json_object* sf = json_object_object_get(j, "sample_freq")) {
+      p.sample_freq = json_object_get_int(sf);
+    }
+    if (json_object* gt = json_object_object_get(j, "gate_tid_arg")) {
+      p.gate_tid_arg = json_object_get_string(gt);
+    }
+    if (json_object* sd = json_object_object_get(j, "stack_dump_ratio")) {
+      p.stack_dump_ratio = json_object_get_int(sd);
+    }
     json_object* name_obj = json_object_object_get(j, "name");
     if (name_obj) p.name = json_object_get_string(name_obj);
 
@@ -130,75 +268,99 @@ class Probe {
         if (func) p.functions.push_back(json_object_get_string(func));
       }
     }
+
+    json_object* function_arguments_obj = json_object_object_get(j, "function_arguments");
+    if (function_arguments_obj &&
+        json_object_get_type(function_arguments_obj) == json_type_object) {
+      json_object_object_foreach(function_arguments_obj, function_name, arg_specs_obj) {
+        if (!arg_specs_obj || json_object_get_type(arg_specs_obj) != json_type_array) {
+          continue;
+        }
+        std::vector<ProbeArgCaptureSpec> arg_specs;
+        const int spec_len = json_object_array_length(arg_specs_obj);
+        for (int i = 0; i < spec_len; ++i) {
+          json_object* arg_spec_obj = json_object_array_get_idx(arg_specs_obj, i);
+          if (!arg_spec_obj || json_object_get_type(arg_spec_obj) != json_type_object) {
+            continue;
+          }
+          arg_specs.push_back(ProbeArgCaptureSpec::fromJson(arg_spec_obj));
+        }
+        p.function_arguments[function_name] = std::move(arg_specs);
+      }
+    }
     return p;
+  }
+
+  /// A probe's function list holds the resolved spelling: `symbol:0xoffset` for a binary probe,
+  /// `sys_x` for a syscall. The yaml keys arguments by the plain name, so lookup must fall back
+  /// to the base name and, for syscalls, the `sys_`/`__x64_sys_` prefix.
+  const std::vector<ProbeArgCaptureSpec>* getArgSpecs(const std::string& function_name) const {
+    auto lookup = [this](const std::string& key) -> const std::vector<ProbeArgCaptureSpec>* {
+      const auto it = function_arguments.find(key);
+      return it == function_arguments.end() ? nullptr : &it->second;
+    };
+    if (const auto* exact = lookup(function_name)) return exact;
+    const auto colon = function_name.rfind(":0x");
+    if (colon != std::string::npos)
+      if (const auto* base = lookup(function_name.substr(0, colon))) return base;
+    if (type == ProbeType::SYSCALLS) {
+      const std::string bare = function_name.substr(0, function_name.find(':'));
+      if (const auto* p = lookup("sys_" + bare)) return p;
+      if (const auto* p = lookup("__x64_sys_" + bare)) return p;
+    }
+    return nullptr;
   }
 };
 
-// Probe for system calls
 struct SysCallProbe : public Probe {
  public:
   SysCallProbe(const SysCallProbe& other) : Probe(other) {
     DC_LOG_TRACE("SysCallProbe copy constructor called");
   }
   SysCallProbe() : Probe(ProbeType::SYSCALLS) { DC_LOG_TRACE("SysCallProbe constructor called"); }
-  // Validates the syscall probe's configuration
   bool validate() const override {
     DC_LOG_TRACE("SysCallProbe::validate called");
     return Probe::validate();
   }
 
-  // Serializes the syscall probe to a JSON object
   json_object* toJson(bool include_functions = true) const override {
     DC_LOG_TRACE("SysCallProbe::toJson called");
-    // No extra fields, just use base
     return Probe::toJson(include_functions);
   }
 
-  // Deserializes a syscall probe from a JSON object
   static SysCallProbe fromJson(const json_object* j) {
     DC_LOG_TRACE("SysCallProbe::fromJson called");
     SysCallProbe p;
     Probe base = Probe::fromJson(j);
-    p.type = base.type;
-    p.name = base.name;
-    p.functions = base.functions;
+    copy_base(p, base);
     return p;
   }
 };
 
-// Probe for kernel functions (kprobes)
 struct KProbe : public Probe {
  public:
   KProbe(const KProbe& other) : Probe(other) { DC_LOG_TRACE("KProbe copy constructor called"); }
   KProbe() : Probe(ProbeType::KPROBE) { DC_LOG_TRACE("KProbe constructor called"); }
-  // No extra fields for KProbe, just use base class serialization/deserialization
 
-  // Validates the kprobe's configuration
   bool validate() const override {
     DC_LOG_TRACE("KProbe::validate called");
     return Probe::validate();
   }
 
-  // Serializes the kprobe to a JSON object
   json_object* toJson(bool include_functions = true) const override {
     DC_LOG_TRACE("KProbe::toJson called");
-    // No extra fields, just use base
     return Probe::toJson(include_functions);
   }
 
-  // Deserializes a kprobe from a JSON object
   static KProbe fromJson(const json_object* j) {
     DC_LOG_TRACE("KProbe::fromJson called");
     KProbe p;
     Probe base = Probe::fromJson(j);
-    p.type = base.type;
-    p.name = base.name;
-    p.functions = base.functions;
+    copy_base(p, base);
     return p;
   }
 };
 
-// Probe for user-space functions (uprobes)
 struct UProbe : public Probe {
  public:
   UProbe(const UProbe& other)
@@ -208,9 +370,8 @@ struct UProbe : public Probe {
   UProbe() : Probe(ProbeType::UPROBE), binary_path(), include_offsets(false) {
     DC_LOG_TRACE("UProbe constructor called");
   }
-  std::string binary_path;  // Path to the binary being probed
+  std::string binary_path;
   bool include_offsets;
-  // Validates the uprobe's configuration
   bool validate() const override {
     DC_LOG_TRACE("UProbe::validate called");
     if (!Probe::validate()) return false;
@@ -221,7 +382,6 @@ struct UProbe : public Probe {
     return true;
   }
 
-  // Serializes the uprobe to a JSON object
   json_object* toJson(bool include_functions = true) const override {
     DC_LOG_TRACE("UProbe::toJson called");
     json_object* j = Probe::toJson(include_functions);
@@ -230,14 +390,11 @@ struct UProbe : public Probe {
     return j;
   }
 
-  // Deserializes a uprobe from a JSON object
   static UProbe fromJson(const json_object* j) {
     DC_LOG_TRACE("UProbe::fromJson called");
     UProbe p;
     Probe base = Probe::fromJson(j);
-    p.type = base.type;
-    p.name = base.name;
-    p.functions = base.functions;
+    copy_base(p, base);
     json_object* bin_obj = json_object_object_get(j, "binary_path");
     if (bin_obj) p.binary_path = json_object_get_string(bin_obj);
 
@@ -248,7 +405,7 @@ struct UProbe : public Probe {
   }
 };
 
-// Probe for USDT (User-level Statically Defined Tracing) probes
+// USDT: User-level Statically Defined Tracing
 struct USDTProbe : public Probe {
  public:
   USDTProbe(const USDTProbe& other)
@@ -258,10 +415,9 @@ struct USDTProbe : public Probe {
   USDTProbe() : Probe(ProbeType::USDT), binary_path(), provider() {
     DC_LOG_TRACE("USDTProbe constructor called");
   }
-  std::string binary_path;  // Path to the binary being probed
-  std::string provider;     // USDT provider name
+  std::string binary_path;
+  std::string provider;
 
-  // Validates the USDT probe's configuration
   bool validate() const override {
     DC_LOG_TRACE("USDTProbe::validate called");
     if (!Probe::validate()) return false;
@@ -276,7 +432,6 @@ struct USDTProbe : public Probe {
     return true;
   }
 
-  // Serializes the USDT probe to a JSON object
   json_object* toJson(bool include_functions = true) const override {
     DC_LOG_TRACE("USDTProbe::toJson called");
     json_object* j = Probe::toJson(include_functions);
@@ -285,14 +440,11 @@ struct USDTProbe : public Probe {
     return j;
   }
 
-  // Deserializes a USDT probe from a JSON object
   static USDTProbe fromJson(const json_object* j) {
     DC_LOG_TRACE("USDTProbe::fromJson called");
     USDTProbe p;
     Probe base = Probe::fromJson(j);
-    p.type = base.type;
-    p.name = base.name;
-    p.functions = base.functions;
+    copy_base(p, base);
 
     json_object* bin_obj = json_object_object_get(j, "binary_path");
     if (bin_obj) p.binary_path = json_object_get_string(bin_obj);
@@ -304,7 +456,42 @@ struct USDTProbe : public Probe {
   }
 };
 
-// Probe for USDT (User-level Statically Defined Tracing) probes
+// Probe for kernel tracepoints. functions hold "category:name" (e.g. "sched:sched_switch").
+// Fields are decoded from the tracepoint's tracefs format at attach.
+struct TracepointProbe : public Probe {
+ public:
+  TracepointProbe() : Probe(ProbeType::TRACEPOINT) {}
+  TracepointProbe(const TracepointProbe& other) : Probe(other) {}
+  bool validate() const override { return Probe::validate(); }
+  json_object* toJson(bool include_functions = true) const override {
+    return Probe::toJson(include_functions);
+  }
+  static TracepointProbe fromJson(const json_object* j) {
+    TracepointProbe p;
+    Probe base = Probe::fromJson(j);
+    copy_base(p, base);
+    return p;
+  }
+};
+
+// Frequency-based on-CPU sampler. functions hold the perf event to sample on ("cpu-clock",
+// "task-clock", "cycles", "instructions"). Each becomes one per-cpu perf_event_open at sample_freq.
+struct PerfEventProbe : public Probe {
+ public:
+  PerfEventProbe() : Probe(ProbeType::PERF_EVENT) {}
+  PerfEventProbe(const PerfEventProbe& other) : Probe(other) {}
+  bool validate() const override { return Probe::validate(); }
+  json_object* toJson(bool include_functions = true) const override {
+    return Probe::toJson(include_functions);
+  }
+  static PerfEventProbe fromJson(const json_object* j) {
+    PerfEventProbe p;
+    Probe base = Probe::fromJson(j);
+    copy_base(p, base);
+    return p;
+  }
+};
+
 struct CustomProbe : public Probe {
  public:
   CustomProbe(const CustomProbe& other)
@@ -319,12 +506,11 @@ struct CustomProbe : public Probe {
       : Probe(ProbeType::CUSTOM), bpf_path(), start_event_id(), process_header(), event_type(1) {
     DC_LOG_TRACE("CustomProbe constructor called");
   }
-  std::string bpf_path;        // Path to the BPF program
-  uint64_t start_event_id;     // Starting event ID for the probe
-  std::string process_header;  // Header file for the process
-  uint64_t event_type;         // Event type for the probe
+  std::string bpf_path;
+  uint64_t start_event_id;
+  std::string process_header;
+  uint64_t event_type;
 
-  // Validates the Custom probe's configuration
   bool validate() const override {
     DC_LOG_TRACE("CustomProbe::validate called");
     if (!Probe::validate()) return false;
@@ -348,7 +534,6 @@ struct CustomProbe : public Probe {
     return true;
   }
 
-  // Serializes the USDT probe to a JSON object
   json_object* toJson(bool include_functions = true) const override {
     DC_LOG_TRACE("CustomProbe::toJson called");
     json_object* j = Probe::toJson(include_functions);
@@ -359,14 +544,11 @@ struct CustomProbe : public Probe {
     return j;
   }
 
-  // Deserializes a Custom probe from a JSON object
   static CustomProbe fromJson(const json_object* j) {
     DC_LOG_TRACE("CustomProbe::fromJson called");
     CustomProbe p;
     Probe base = Probe::fromJson(j);
-    p.type = base.type;
-    p.name = base.name;
-    p.functions = base.functions;
+    copy_base(p, base);
 
     json_object* bpf_obj = json_object_object_get(j, "bpf_path");
     if (bpf_obj) p.bpf_path = json_object_get_string(bpf_obj);
@@ -383,54 +565,104 @@ struct CustomProbe : public Probe {
   }
 };
 
-// Base class for capture probes (used for capturing symbols, headers, binaries, etc.)
+// Capture probes discover symbols, headers, or binaries and emit a matching Probe.
 class CaptureProbe {
  public:
-  // Constructor initializing the capture type
   CaptureProbe(CaptureType _type) : type(_type) { DC_LOG_TRACE("CaptureProbe constructor called"); }
 
-  CaptureType type;      // The type of capture (e.g., KSYM, HEADER, BINARY, USDT)
-  std::string regex;     // Regex pattern for matching
-  std::string name;      // Name of the capture probe
-  ProbeType probe_type;  // Type of probe associated with the capture
-  bool enable_explorer;  // Flag to enable explorer for this capture probe
+  CaptureType type;
+  std::string regex;
+  std::string name;
+  ProbeType probe_type;
+  bool enable_explorer;
+  std::string trace_event_type;  // .pfw "type" domain, propagated to the emitted Probe
+  bool system_wide = false;  // tracepoints: capture on all pids, propagated to the emitted Probe
+  bool aggregate = false;    // accumulate count/duration, propagated to the emitted Probe
+  bool hot = false;          // uprobes: route to bpftime userspace, propagated to the emitted Probe
+  bool capture_stack = false;    // tracepoints: grab the user call stack, propagated to the Probe
+  unsigned int sample_freq = 0;  // perf_event: samples/sec, propagated to the emitted Probe
+  unsigned int stack_dump_ratio = 0;  // 1-in-N raw stack dumps, propagated to the emitted Probe
+  std::string gate_tid_arg;  // system_wide tracepoints: captured arg naming a tid. The event is
+                             // dropped unless that tid belongs to a traced process
+  std::string hot_exclude;   // hot uprobe layers: functions matching this regex split off to a
+                             // kernel uprobe (frida-unsafe fns, e.g. ones that corrupt a DOCA send)
+  std::vector<std::string>
+      hot_sensitive;  // hot uprobe layers: functions that call a symbol matching any of these
+                      // are auto-demoted like hot_exclude
+  std::unordered_map<std::string, std::vector<ProbeArgCaptureSpec>>
+      function_arguments;  // optional per-function arg capture spec from YAML
+
+  const std::vector<ProbeArgCaptureSpec>* getArgSpecs(const std::string& function_name) const {
+    auto lookup = [this](const std::string& key) -> const std::vector<ProbeArgCaptureSpec>* {
+      const auto it = function_arguments.find(key);
+      if (it == function_arguments.end()) {
+        return nullptr;
+      }
+      return &it->second;
+    };
+
+    if (const auto* exact = lookup(function_name)) {
+      return exact;
+    }
+
+    const auto offset_pos = function_name.find(':');
+    const std::string base_name =
+        (offset_pos == std::string::npos) ? function_name : function_name.substr(0, offset_pos);
+    if (base_name != function_name) {
+      if (const auto* base = lookup(base_name)) {
+        return base;
+      }
+    }
+
+    if (probe_type == ProbeType::SYSCALLS) {
+      if (const auto* prefixed = lookup("sys_" + base_name)) {
+        return prefixed;
+      }
+      if (const auto* x64_prefixed = lookup("__x64_sys_" + base_name)) {
+        return x64_prefixed;
+      }
+    }
+
+    if (const auto* wildcard = lookup("*")) {
+      return wildcard;
+    }
+    return lookup("default");
+  }
 };
 
-// Capture probe for kernel symbols
+// Regex-matched kernel-side capture: KSYM (kallsyms to kprobe) or TRACEPOINT (tracefs).
+// Same shape, so one class tagged by capture type instead of a near-empty subclass each.
 class KernelCaptureProbe : public CaptureProbe {
  public:
-  KernelCaptureProbe() : CaptureProbe(CaptureType::KSYM) {
+  explicit KernelCaptureProbe(CaptureType capture = CaptureType::KSYM) : CaptureProbe(capture) {
     DC_LOG_TRACE("KernelCaptureProbe constructor called");
   }
 };
 
-// Capture probe for header files
 class HeaderCaptureProbe : public CaptureProbe {
  public:
   HeaderCaptureProbe() : CaptureProbe(CaptureType::HEADER), file() {
     DC_LOG_TRACE("HeaderCaptureProbe constructor called");
   }
-  std::string file;  // Name of the header to capture
+  std::string file;
 };
 
-// Capture probe for binaries
 class BinaryCaptureProbe : public CaptureProbe {
  public:
   BinaryCaptureProbe() : CaptureProbe(CaptureType::BINARY), file(), include_offsets(false) {
     DC_LOG_TRACE("BinaryCaptureProbe constructor called");
   }
-  std::string file;  // Path to the binary
+  std::string file;
   bool include_offsets;
 };
 
-// Capture probe for USDT probes
 class USDTCaptureProbe : public CaptureProbe {
  public:
   USDTCaptureProbe() : CaptureProbe(CaptureType::USDT), binary_path(), provider() {
     DC_LOG_TRACE("USDTCaptureProbe constructor called");
   }
-  std::string binary_path;  // Path to the binary
-  std::string provider;     // USDT provider name
+  std::string binary_path;
+  std::string provider;
 };
 
 class CustomCaptureProbe : public CaptureProbe {
@@ -444,11 +676,11 @@ class CustomCaptureProbe : public CaptureProbe {
         event_type(1) {
     DC_LOG_TRACE("CustomCaptureProbe constructor called");
   }
-  std::string bpf_file;        // Path to the custom bpf file
-  std::string probe_file;      // Path to the custom probe file
-  uint64_t start_event_id;     // Starting event ID for the probe
-  std::string process_header;  // Header file for the process
-  uint64_t event_type;         // Event type for the probe
+  std::string bpf_file;
+  std::string probe_file;
+  uint64_t start_event_id;
+  std::string process_header;
+  uint64_t event_type;
 };
 
 }  // namespace datacrumbs
