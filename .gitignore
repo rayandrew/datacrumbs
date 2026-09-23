@@ -83,3 +83,6 @@ deps
 # Sphinx documentation builds
 docs/_build/
 docs/_static/__pycache__/
+.vscode
+build*
+scratch/
